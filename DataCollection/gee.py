@@ -1,11 +1,9 @@
 import csv
-import json
 import subprocess
 import time
 from pathlib import Path
 
 import ee
-import rasterio
 
 ee.Authenticate()
 ee.Initialize(project="symbolic-base-346316")
@@ -16,7 +14,6 @@ tilePixels = 128
 scale = 10
 tileMeters = tilePixels * scale
 
-# ── Config ────────────────────────────────────────────────────────────────────
 DRIVE_FOLDER = "forest_gain_wales"
 DRIVE_REMOTE = "gdrive"
 HPC_REMOTE = (
@@ -28,7 +25,6 @@ POLL_INTERVAL = 30
 
 LOCAL_STAGING.mkdir(exist_ok=True)
 
-# ── Snap AOI to tile grid ─────────────────────────────────────────────────────
 rawCoords = ee.List(AOI.coordinates().get(0))
 rawMinLon = ee.Number(ee.List(rawCoords.get(0)).get(0))
 rawMinLat = ee.Number(ee.List(rawCoords.get(0)).get(1))
@@ -47,7 +43,6 @@ maxLat = rawMaxLat.divide(tileDegLat).ceil().multiply(tileDegLat)
 
 AOI = ee.Geometry.Rectangle([minLon, minLat, maxLon, maxLat])
 
-# ── Forest gain ───────────────────────────────────────────────────────────────
 worldcover = ee.Image("ESA/WorldCover/v100/2020").clip(AOI)
 isForest2020 = worldcover.eq(10)
 
@@ -66,28 +61,28 @@ gainValidated = cleanGain.And(isForest2020)
 gainBinary = gainValidated.unmask(0).rename("gain")
 
 
-# ── S2 validity mask ──────────────────────────────────────────────────────────
-def s2ValidMask(year):
+def s2AvailabilityAllBands(year):
     start = "2015-01-01" if year == 2016 else f"{year}-01-01"
     end = "2016-12-31" if year == 2016 else f"{year}-12-31"
-    return (
+    bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8"]
+    ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(AOI)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
-        .median()
-        .select(["B2", "B3", "B4", "B5", "B6", "B7", "B8"])
-        .mask()
-        .reduce(ee.Reducer.min())
+        .select(bands)
     )
+    per_image_valid = ic.map(lambda img: img.mask().reduce(ee.Reducer.min()))
+    return per_image_valid.reduce(ee.Reducer.max())
 
 
 fullValid = (
-    s2ValidMask(2016).And(s2ValidMask(2020)).And(s2ValidMask(2025)).rename("valid")
+    s2AvailabilityAllBands(2016)
+    .And(s2AvailabilityAllBands(2020))
+    .And(s2AvailabilityAllBands(2025))
+    .selfMask()
 )
 
 
-# ── Grid ──────────────────────────────────────────────────────────────────────
 def make_tiles(lon):
     lon = ee.Number(lon)
 
@@ -104,49 +99,73 @@ grid = ee.FeatureCollection(
     ee.List.sequence(minLon, maxLon, tileDegLon).map(make_tiles).flatten()
 )
 
-# ── Tile filtering ────────────────────────────────────────────────────────────
 tileAreaPixels = ee.Number(tileMeters).divide(scale).pow(2)
 
 gainCount = gainBinary.reduceRegions(
     collection=grid, reducer=ee.Reducer.sum(), scale=scale, tileScale=4
 )
-tilesWithStats = fullValid.reduceRegions(
-    collection=gainCount, reducer=ee.Reducer.min(), scale=scale, tileScale=4
-)
-filteredTiles = tilesWithStats.filter(ee.Filter.eq("min", 1)).filter(
-    ee.Filter.gte("sum", tileAreaPixels.multiply(0.02))
-)
 
-# ── Enrich with country, biome, bounds ───────────────────────────────────────
+
 countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
 biomes = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
+
+fabdem = (
+    ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
+    .filterBounds(AOI)
+    .mosaic()
+    .clip(AOI)
+)
+slope = ee.Terrain.slope(fabdem)
+canopyHeight = (
+    ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1")
+    .clip(AOI)
+    .rename("canopy_height")
+    .updateMask(ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1").gte(0))
+)
+
+gainHeight = canopyHeight.updateMask(gainValidated)
 
 
 def enrich_tile(tile):
     centroid = tile.geometry().centroid()
-    country = countries.filterBounds(centroid).first().get("country_na")
-    biome = biomes.filterBounds(centroid).first().get("BIOME_NAME")
     coords = tile.geometry().bounds().coordinates().get(0)
-    tMinLon = ee.List(ee.List(coords).get(0)).get(0)
-    tMinLat = ee.List(ee.List(coords).get(0)).get(1)
-    tMaxLon = ee.List(ee.List(coords).get(2)).get(0)
-    tMaxLat = ee.List(ee.List(coords).get(2)).get(1)
+    gain_pct = ee.Number(tile.get("sum")).divide(tileAreaPixels).multiply(100)
+
+    # Per-tile canopy height stats over gain pixels only
+    height_stats = gainHeight.reduceRegion(
+        reducer=ee.Reducer.mean().combine(ee.Reducer.max(), sharedInputs=True),
+        geometry=tile.geometry(),
+        scale=scale,
+        tileScale=4,
+        maxPixels=1e9,
+    )
+    mean_height = height_stats.get("canopy_height_mean")
+    max_height = height_stats.get("canopy_height_max")
+
     return tile.set(
         {
-            "country": country,
-            "biome": biome,
-            "minLon": tMinLon,
-            "minLat": tMinLat,
-            "maxLon": tMaxLon,
-            "maxLat": tMaxLat,
+            "country": countries.filterBounds(centroid).first().get("country_na"),
+            "biome": biomes.filterBounds(centroid).first().get("BIOME_NAME"),
+            "minLon": ee.List(ee.List(coords).get(0)).get(0),
+            "minLat": ee.List(ee.List(coords).get(0)).get(1),
+            "maxLon": ee.List(ee.List(coords).get(2)).get(0),
+            "maxLat": ee.List(ee.List(coords).get(2)).get(1),
+            "gainPct": gain_pct,
+            "valid": ee.Number(tile.get("sum")).gt(0),
+            "gainHeight_mean_m": mean_height,
+            "gainHeight_max_m": max_height,
         }
     )
 
 
-filteredTiles = filteredTiles.map(enrich_tile)
+fullGridIndex = gainCount.map(enrich_tile)
 
 
-# ── Composites ────────────────────────────────────────────────────────────────
+filteredTiles = fullGridIndex.filter(
+    ee.Filter.And(ee.Filter.eq("valid", 1), ee.Filter.gte("gainPct", 1.0))
+)
+
+
 def addIndices(img):
     ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
     evi = img.expression(
@@ -233,22 +252,6 @@ def buildStack(s2, s1, dw, prefix):
     )
 
 
-fabdem = (
-    ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
-    .filterBounds(AOI)
-    .mosaic()
-    .clip(AOI)
-)
-slope = ee.Terrain.slope(fabdem)
-canopyHeight = (
-    ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1")
-    .clip(AOI)
-    .rename("canopy_height")
-    .updateMask(ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1").gte(0))
-)
-
-
-# ── Index CSV ─────────────────────────────────────────────────────────────────
 def append_to_index(props):
     write_header = not INDEX_FILE.exists()
     with open(INDEX_FILE, "a", newline="") as f:
@@ -259,6 +262,8 @@ def append_to_index(props):
                 "country",
                 "biome",
                 "gain_pct",
+                "gainHeight_mean_m",
+                "gainHeight_max_m",
                 "minLon",
                 "minLat",
                 "maxLon",
@@ -272,7 +277,9 @@ def append_to_index(props):
                 "tile_id": props.get("tile_id"),
                 "country": props.get("country", "unknown"),
                 "biome": props.get("biome", "unknown"),
-                "gain_pct": round(props.get("sum", 0) / (tilePixels**2), 4),
+                "gain_pct": round(props.get("gainPct", 0), 4),
+                "gainHeight_mean_m": props.get("gainHeight_mean_m"),
+                "gainHeight_max_m": props.get("gainHeight_max_m"),
                 "minLon": props.get("minLon"),
                 "minLat": props.get("minLat"),
                 "maxLon": props.get("maxLon"),
@@ -281,42 +288,19 @@ def append_to_index(props):
         )
 
 
-# ── Tag GeoTIFF and transfer ──────────────────────────────────────────────────
-def tag_and_transfer(tile_id, props, local_path):
-    # Embed metadata into GeoTIFF
-    with rasterio.open(local_path, "r+") as dst:
-        dst.update_tags(
-            tile_id=tile_id,
-            country=props.get("country", "unknown"),
-            biome=props.get("biome", "unknown"),
-            gain_pct=round(props.get("sum", 0) / (tilePixels**2), 4),
-            minLon=props.get("minLon"),
-            minLat=props.get("minLat"),
-            maxLon=props.get("maxLon"),
-            maxLat=props.get("maxLat"),
-        )
+ee.batch.Export.table.toDrive(
+    collection=fullGridIndex,
+    description="full_grid_index_all_tiles",
+    folder=DRIVE_FOLDER,
+    fileNamePrefix="full_grid_index_all_tiles",
+    fileFormat="CSV",
+).start()
 
-    # Stream to HPC and delete locally
-    result = subprocess.run(
-        ["rclone", "moveto", str(local_path), f"{HPC_REMOTE}/{tile_id}.tif"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        print(f"  Transferred {tile_id} to HPC")
-        append_to_index({**props, "tile_id": tile_id})
-        return True
-    else:
-        print(f"  rclone error for {tile_id}: {result.stderr}")
-        return False
-
-
-# ── Submit exports to Drive ───────────────────────────────────────────────────
 tile_list = filteredTiles.toList(filteredTiles.size())
 n = filteredTiles.size().getInfo()
 print(f"Submitting {n} export tasks to Drive...")
 
-tasks = {}  # task -> (tile_id, props)
+tasks = {}
 for i in range(n):
     tile = ee.Feature(tile_list.get(i))
     geom = tile.geometry()
@@ -366,7 +350,6 @@ for i in range(n):
     tasks[task] = (tile_id, props)
     print(f"  Submitted {tile_id}")
 
-# ── Monitor, download, tag, transfer, delete ──────────────────────────────────
 uploaded = set()
 failed = set()
 
@@ -380,7 +363,6 @@ while True:
 
         if state == "COMPLETED":
             print(f"  {tile_id} complete — moving Drive -> HPC...")
-
             result = subprocess.run(
                 [
                     "rclone",
@@ -391,7 +373,6 @@ while True:
                 capture_output=True,
                 text=True,
             )
-
             if result.returncode == 0:
                 print(f"  {tile_id} on HPC")
                 append_to_index({**props, "tile_id": tile_id})
@@ -405,7 +386,9 @@ while True:
             failed.add(tile_id)
 
     print(
-        f"  Uploaded: {len(uploaded)}/{n} | Failed: {len(failed)} | Pending: {n - len(uploaded) - len(failed)}"
+        f"  Uploaded: {len(uploaded)}/{n} | "
+        f"Failed: {len(failed)} | "
+        f"Pending: {n - len(uploaded) - len(failed)}"
     )
 
     if len(uploaded) + len(failed) == n:
@@ -415,4 +398,4 @@ while True:
 
 print(f"Done. {len(uploaded)} tiles on HPC, {len(failed)} failed.")
 if failed:
-    print(f"Failed: {failed}")
+    print(f"Failed tiles: {failed}")
