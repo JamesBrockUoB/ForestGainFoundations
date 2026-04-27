@@ -1,0 +1,15 @@
+brew install rclone
+
+(1st time Google Drive)
+rclone config
+
+(2nd time Isambard)
+rclone config
+
+rclone ls gdrive:
+
+rclone ls isambard:/projects/b6be/jamesbrock.b6be/
+
+echo "test" > test.txt
+rclone copy test.txt gdrive:forest_gain_wales/
+rclone moveto gdrive:forest_gain_wales/test.txt isambard:/projects/b6be/jamesbrock.b6be/ForestGrowthFoundations/forest_gain_wales/

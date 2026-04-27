@@ -1,0 +1,5 @@
+earthengine-api
+requests
+rasterio
+python-dotenv
+matplotlib
