@@ -80,6 +80,7 @@ fullValid = (
     .And(s2AvailabilityAllBands(2020))
     .And(s2AvailabilityAllBands(2025))
     .selfMask()
+    .rename("valid")
 )
 
 
@@ -88,8 +89,15 @@ def make_tiles(lon):
 
     def inner(lat):
         lat = ee.Number(lat)
+        t_tile_id = (
+            ee.String("tile_")
+            .cat(lon.multiply(1e6).round().format("%d"))
+            .cat("_")
+            .cat(lat.multiply(1e6).round().format("%d"))
+        )
         return ee.Feature(
-            ee.Geometry.Rectangle([lon, lat, lon.add(tileDegLon), lat.add(tileDegLat)])
+            ee.Geometry.Rectangle([lon, lat, lon.add(tileDegLon), lat.add(tileDegLat)]),
+            {"tile_id": t_tile_id},
         )
 
     return ee.List.sequence(minLat, maxLat, tileDegLat).map(inner)
@@ -105,6 +113,13 @@ gainCount = gainBinary.reduceRegions(
     collection=grid, reducer=ee.Reducer.sum(), scale=scale, tileScale=4
 )
 
+validTiles = (
+    fullValid.unmask(0)
+    .reduceRegions(
+        collection=gainCount, reducer=ee.Reducer.min(), scale=scale, tileScale=4
+    )
+    .filter(ee.Filter.eq("min", 1))
+)
 
 countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
 biomes = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
@@ -122,28 +137,29 @@ canopyHeight = (
     .rename("canopy_height")
     .updateMask(ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1").gte(0))
 )
+gainHeight = canopyHeight.updateMask(gainValidated).rename("canopy_gain_height")
 
-gainHeight = canopyHeight.updateMask(gainValidated)
+jrcForestTypes = ee.Image("JRC/GFC2020_subtypes/V1").clip(AOI).rename("jrc_forest_type")
+naturalForestProb = (
+    ee.ImageCollection(
+        "projects/nature-trace/assets/forest_typology/natural_forest_2020_v1_0_collection"
+    )
+    .mosaic()
+    .select("B0")
+    .divide(250)
+    .clip(AOI)
+    .unmask(0)
+    .rename("natural_forest_prob")
+)
 
 
 def enrich_tile(tile):
     centroid = tile.geometry().centroid()
     coords = tile.geometry().bounds().coordinates().get(0)
     gain_pct = ee.Number(tile.get("sum")).divide(tileAreaPixels).multiply(100)
-
-    # Per-tile canopy height stats over gain pixels only
-    height_stats = gainHeight.reduceRegion(
-        reducer=ee.Reducer.mean().combine(ee.Reducer.max(), sharedInputs=True),
-        geometry=tile.geometry(),
-        scale=scale,
-        tileScale=4,
-        maxPixels=1e9,
-    )
-    mean_height = height_stats.get("canopy_height_mean")
-    max_height = height_stats.get("canopy_height_max")
-
     return tile.set(
         {
+            "tile_id": tile.get("tile_id"),
             "country": countries.filterBounds(centroid).first().get("country_na"),
             "biome": biomes.filterBounds(centroid).first().get("BIOME_NAME"),
             "minLon": ee.List(ee.List(coords).get(0)).get(0),
@@ -151,19 +167,13 @@ def enrich_tile(tile):
             "maxLon": ee.List(ee.List(coords).get(2)).get(0),
             "maxLat": ee.List(ee.List(coords).get(2)).get(1),
             "gainPct": gain_pct,
-            "valid": ee.Number(tile.get("sum")).gt(0),
-            "gainHeight_mean_m": mean_height,
-            "gainHeight_max_m": max_height,
+            "is_selected": gain_pct.gte(1.0),
         }
     )
 
 
-fullGridIndex = gainCount.map(enrich_tile)
-
-
-filteredTiles = fullGridIndex.filter(
-    ee.Filter.And(ee.Filter.eq("valid", 1), ee.Filter.gte("gainPct", 1.0))
-)
+fullGridIndex = validTiles.map(enrich_tile)
+filteredTiles = validTiles.filter(ee.Filter.gte("sum", tileAreaPixels.multiply(0.01)))
 
 
 def addIndices(img):
@@ -262,12 +272,11 @@ def append_to_index(props):
                 "country",
                 "biome",
                 "gain_pct",
-                "gainHeight_mean_m",
-                "gainHeight_max_m",
                 "minLon",
                 "minLat",
                 "maxLon",
                 "maxLat",
+                "is_selected",
             ],
         )
         if write_header:
@@ -278,12 +287,11 @@ def append_to_index(props):
                 "country": props.get("country", "unknown"),
                 "biome": props.get("biome", "unknown"),
                 "gain_pct": round(props.get("gainPct", 0), 4),
-                "gainHeight_mean_m": props.get("gainHeight_mean_m"),
-                "gainHeight_max_m": props.get("gainHeight_max_m"),
                 "minLon": props.get("minLon"),
                 "minLat": props.get("minLat"),
                 "maxLon": props.get("maxLon"),
                 "maxLat": props.get("maxLat"),
+                "is_selected": props.get("is_selected"),
             }
         )
 
@@ -304,8 +312,7 @@ tasks = {}
 for i in range(n):
     tile = ee.Feature(tile_list.get(i))
     geom = tile.geometry()
-    tile_id = f"tile_{i}"
-    props = tile.getInfo()["properties"]
+    tile_id = tile.get("tile_id").getInfo()
 
     fullStack = (
         buildStack(
@@ -332,8 +339,11 @@ for i in range(n):
         )
         .addBands(fabdem.rename("DEM"))
         .addBands(slope.rename("slope"))
-        .addBands(canopyHeight)
-        .updateMask(gainValidated)
+        .addBands(gainHeight)
+        .addBands(jrcForestTypes)
+        .addBands(naturalForestProb)
+        .addBands(gainValidated.rename("gain_mask"))
+        .updateMask(fullValid)
     )
 
     task = ee.batch.Export.image.toDrive(
@@ -347,7 +357,7 @@ for i in range(n):
         fileFormat="GeoTIFF",
     )
     task.start()
-    tasks[task] = (tile_id, props)
+    tasks[task] = tile_id
     print(f"  Submitted {tile_id}")
 
 uploaded = set()
@@ -355,14 +365,14 @@ failed = set()
 
 print("Monitoring tasks...")
 while True:
-    for task, (tile_id, props) in tasks.items():
+    for task, tile_id in tasks.items():
         if tile_id in uploaded or tile_id in failed:
             continue
 
         state = task.status()["state"]
 
         if state == "COMPLETED":
-            print(f"  {tile_id} complete — moving Drive -> HPC...")
+            print(f"{tile_id} complete — moving Drive -> HPC...")
             result = subprocess.run(
                 [
                     "rclone",
@@ -374,21 +384,18 @@ while True:
                 text=True,
             )
             if result.returncode == 0:
-                print(f"  {tile_id} on HPC")
-                append_to_index({**props, "tile_id": tile_id})
+                print(f"{tile_id} on HPC")
                 uploaded.add(tile_id)
             else:
-                print(f"  rclone error for {tile_id}: {result.stderr}")
+                print(f"rclone error for {tile_id}: {result.stderr}")
                 failed.add(tile_id)
 
         elif state == "FAILED":
-            print(f'  {tile_id} FAILED: {task.status().get("error_message")}')
+            print(f"{tile_id} FAILED: {task.status().get('error_message')}")
             failed.add(tile_id)
 
     print(
-        f"  Uploaded: {len(uploaded)}/{n} | "
-        f"Failed: {len(failed)} | "
-        f"Pending: {n - len(uploaded) - len(failed)}"
+        f"Uploaded: {len(uploaded)}/{n} | Failed: {len(failed)} | Pending: {n - len(uploaded) - len(failed)}"
     )
 
     if len(uploaded) + len(failed) == n:
