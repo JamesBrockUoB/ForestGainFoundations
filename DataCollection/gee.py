@@ -1,162 +1,172 @@
-import csv
+import json
+import os
 import subprocess
 import time
 from pathlib import Path
 
 import ee
+from dotenv import load_dotenv
+from tqdm import tqdm
 
-ee.Authenticate()
-ee.Initialize(project="symbolic-base-346316")
+load_dotenv()
 
-AOI = ee.Geometry.Rectangle([-4.04, 51.54, -3.32, 51.75])
-
-tilePixels = 128
-scale = 10
-tileMeters = tilePixels * scale
-
-DRIVE_FOLDER = "forest_gain_wales"
-DRIVE_REMOTE = "gdrive"
-HPC_REMOTE = (
-    "isambard:/projects/b6be/jamesbrock.b6be/ForestGrowthFoundations/forest_gain_wales"
-)
-LOCAL_STAGING = Path("./staging")
-INDEX_FILE = Path("tile_index.csv")
+GEE_PROJECT = os.getenv("GEE_PROJECT")
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/"))
+DRIVE_REMOTE = os.getenv("DRIVE_REMOTE", "gdrive")
+HPC_BASE = os.getenv("HPC_BASE")
 POLL_INTERVAL = 30
 
-LOCAL_STAGING.mkdir(exist_ok=True)
+TILE_PIXELS = 128
+SCALE = 10
+TILE_METERS = TILE_PIXELS * SCALE
 
-rawCoords = ee.List(AOI.coordinates().get(0))
-rawMinLon = ee.Number(ee.List(rawCoords.get(0)).get(0))
-rawMinLat = ee.Number(ee.List(rawCoords.get(0)).get(1))
-rawMaxLon = ee.Number(ee.List(rawCoords.get(2)).get(0))
-rawMaxLat = ee.Number(ee.List(rawCoords.get(2)).get(1))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-tileDegLat = ee.Number(tileMeters).divide(111320)
-centerLat = rawMinLat.add(rawMaxLat).divide(2)
-latCos = centerLat.multiply(3.141592653589793 / 180).cos()
-tileDegLon = ee.Number(tileMeters).divide(111320).divide(latCos)
-
-minLon = rawMinLon.divide(tileDegLon).floor().multiply(tileDegLon)
-minLat = rawMinLat.divide(tileDegLat).floor().multiply(tileDegLat)
-maxLon = rawMaxLon.divide(tileDegLon).ceil().multiply(tileDegLon)
-maxLat = rawMaxLat.divide(tileDegLat).ceil().multiply(tileDegLat)
-
-AOI = ee.Geometry.Rectangle([minLon, minLat, maxLon, maxLat])
-
-worldcover = ee.Image("ESA/WorldCover/v100/2020").clip(AOI)
-isForest2020 = worldcover.eq(10)
-
-m15 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2015").clip(AOI)
-m20 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2020").clip(AOI)
-
-treeClasses = ee.List.sequence(25, 96).cat(ee.List.sequence(125, 196))
-ones = ee.List.repeat(1, treeClasses.length())
-
-tree2015 = m15.remap(treeClasses, ones, 0)
-tree2020 = m20.remap(treeClasses, ones, 0)
-
-forestGain = tree2020.And(tree2015.Not())
-cleanGain = forestGain.updateMask(forestGain).focal_max(1).focal_min(1)
-gainValidated = cleanGain.And(isForest2020)
-gainBinary = gainValidated.unmask(0).rename("gain")
+ee.Authenticate()
+ee.Initialize(project=GEE_PROJECT)
 
 
-def s2AvailabilityAllBands(year):
+def aoi_to_folder(aoi_id: str) -> str:
+    return f"forest_gain_{aoi_id.replace(' ', '_').lower()}"
+
+
+def build_aoi(bounds):
+    raw = ee.Geometry.Rectangle(bounds)
+    coords = ee.List(raw.coordinates().get(0))
+
+    raw_min_lon = ee.Number(ee.List(coords.get(0)).get(0))
+    raw_min_lat = ee.Number(ee.List(coords.get(0)).get(1))
+    raw_max_lon = ee.Number(ee.List(coords.get(2)).get(0))
+    raw_max_lat = ee.Number(ee.List(coords.get(2)).get(1))
+
+    tile_deg_lat = ee.Number(TILE_METERS).divide(111320)
+    center_lat = raw_min_lat.add(raw_max_lat).divide(2)
+    lat_cos = center_lat.multiply(3.141592653589793 / 180).cos()
+    tile_deg_lon = ee.Number(TILE_METERS).divide(111320).divide(lat_cos)
+
+    min_lon = raw_min_lon.divide(tile_deg_lon).floor().multiply(tile_deg_lon)
+    min_lat = raw_min_lat.divide(tile_deg_lat).floor().multiply(tile_deg_lat)
+    max_lon = raw_max_lon.divide(tile_deg_lon).ceil().multiply(tile_deg_lon)
+    max_lat = raw_max_lat.divide(tile_deg_lat).ceil().multiply(tile_deg_lat)
+
+    aoi = ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat])
+    return aoi, min_lon, min_lat, max_lon, max_lat, tile_deg_lon, tile_deg_lat
+
+
+def build_gain_layer(aoi):
+    worldcover = ee.Image("ESA/WorldCover/v100/2020").clip(aoi)
+    is_forest = worldcover.eq(10)
+    m15 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2015").clip(aoi)
+    m20 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2020").clip(aoi)
+    tree_classes = ee.List.sequence(25, 96).cat(ee.List.sequence(125, 196))
+    ones = ee.List.repeat(1, tree_classes.length())
+    tree2015 = m15.remap(tree_classes, ones, 0)
+    tree2020 = m20.remap(tree_classes, ones, 0)
+    forest_gain = tree2020.And(tree2015.Not())
+    clean_gain = forest_gain.updateMask(forest_gain).focal_max(1).focal_min(1)
+    gain_validated = clean_gain.And(is_forest)
+    gain_binary = gain_validated.unmask(0).rename("gain")
+    return gain_validated, gain_binary
+
+
+def s2_availability(aoi, year):
     start = "2015-01-01" if year == 2016 else f"{year}-01-01"
     end = "2016-12-31" if year == 2016 else f"{year}-12-31"
     bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8"]
     ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
-        .filterBounds(AOI)
+        .filterBounds(aoi)
         .select(bands)
     )
-    per_image_valid = ic.map(lambda img: img.mask().reduce(ee.Reducer.min()))
-    return per_image_valid.reduce(ee.Reducer.max())
-
-
-fullValid = (
-    s2AvailabilityAllBands(2016)
-    .And(s2AvailabilityAllBands(2020))
-    .And(s2AvailabilityAllBands(2025))
-    .selfMask()
-    .rename("valid")
-)
-
-
-def make_tiles(lon):
-    lon = ee.Number(lon)
-
-    def inner(lat):
-        lat = ee.Number(lat)
-        t_tile_id = (
-            ee.String("tile_")
-            .cat(lon.multiply(1e6).round().format("%d"))
-            .cat("_")
-            .cat(lat.multiply(1e6).round().format("%d"))
-        )
-        return ee.Feature(
-            ee.Geometry.Rectangle([lon, lat, lon.add(tileDegLon), lat.add(tileDegLat)]),
-            {"tile_id": t_tile_id},
-        )
-
-    return ee.List.sequence(minLat, maxLat, tileDegLat).map(inner)
-
-
-grid = ee.FeatureCollection(
-    ee.List.sequence(minLon, maxLon, tileDegLon).map(make_tiles).flatten()
-)
-
-tileAreaPixels = ee.Number(tileMeters).divide(scale).pow(2)
-
-gainCount = gainBinary.reduceRegions(
-    collection=grid, reducer=ee.Reducer.sum(), scale=scale, tileScale=4
-)
-
-validTiles = (
-    fullValid.unmask(0)
-    .reduceRegions(
-        collection=gainCount, reducer=ee.Reducer.min(), scale=scale, tileScale=4
+    return ic.map(lambda img: img.mask().reduce(ee.Reducer.min())).reduce(
+        ee.Reducer.max()
     )
-    .filter(ee.Filter.eq("min", 1))
-)
 
-countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
-biomes = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
 
-fabdem = (
-    ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
-    .filterBounds(AOI)
-    .mosaic()
-    .clip(AOI)
-)
-slope = ee.Terrain.slope(fabdem)
-canopyHeight = (
-    ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1")
-    .clip(AOI)
-    .rename("canopy_height")
-    .updateMask(ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1").gte(0))
-)
-gainHeight = canopyHeight.updateMask(gainValidated).rename("canopy_gain_height")
-
-jrcForestTypes = ee.Image("JRC/GFC2020_subtypes/V1").clip(AOI).rename("jrc_forest_type")
-naturalForestProb = (
-    ee.ImageCollection(
-        "projects/nature-trace/assets/forest_typology/natural_forest_2020_v1_0_collection"
+def build_full_valid(aoi):
+    return (
+        s2_availability(aoi, 2016)
+        .And(s2_availability(aoi, 2020))
+        .And(s2_availability(aoi, 2025))
+        .selfMask()
+        .rename("valid")
     )
-    .mosaic()
-    .select("B0")
-    .divide(250)
-    .clip(AOI)
-    .unmask(0)
-    .rename("natural_forest_prob")
-)
 
 
-def enrich_tile(tile):
+def build_grid(min_lon, min_lat, max_lon, max_lat, tile_deg_lon, tile_deg_lat):
+    def make_tiles(lon):
+        lon = ee.Number(lon)
+
+        def inner(lat):
+            lat = ee.Number(lat)
+            tile_id = (
+                ee.String("tile_")
+                .cat(lon.multiply(1e6).round().format("%d"))
+                .cat("_")
+                .cat(lat.multiply(1e6).round().format("%d"))
+            )
+            return ee.Feature(
+                ee.Geometry.Rectangle(
+                    [lon, lat, lon.add(tile_deg_lon), lat.add(tile_deg_lat)]
+                ),
+                {"tile_id": tile_id},
+            )
+
+        return ee.List.sequence(min_lat, max_lat, tile_deg_lat).map(inner)
+
+    return ee.FeatureCollection(
+        ee.List.sequence(min_lon, max_lon, tile_deg_lon).map(make_tiles).flatten()
+    )
+
+
+def build_valid_tiles(gain_binary, full_valid, grid):
+    tile_area_pixels = ee.Number(TILE_METERS).divide(SCALE).pow(2)
+    gain_count = gain_binary.reduceRegions(
+        collection=grid, reducer=ee.Reducer.sum(), scale=SCALE, tileScale=4
+    )
+    valid_tiles = (
+        full_valid.unmask(0)
+        .reduceRegions(
+            collection=gain_count, reducer=ee.Reducer.min(), scale=SCALE, tileScale=4
+        )
+        .filter(ee.Filter.eq("min", 1))
+    )
+    return valid_tiles, tile_area_pixels
+
+
+def build_ancillary(aoi, gain_validated):
+    fabdem = (
+        ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
+        .filterBounds(aoi)
+        .mosaic()
+        .clip(aoi)
+    )
+    slope = ee.Terrain.slope(fabdem)
+    canopy_raw = ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1")
+    canopy = canopy_raw.clip(aoi).rename("canopy_height").updateMask(canopy_raw.gte(0))
+    gain_height = canopy.updateMask(gain_validated).rename("canopy_gain_height")
+    jrc = ee.Image("JRC/GFC2020_subtypes/V1").clip(aoi).rename("jrc_forest_type")
+    nat_forest = (
+        ee.ImageCollection(
+            "projects/nature-trace/assets/forest_typology/natural_forest_2020_v1_0_collection"
+        )
+        .mosaic()
+        .select("B0")
+        .divide(250)
+        .clip(aoi)
+        .unmask(0)
+        .rename("natural_forest_prob")
+    )
+    return fabdem, slope, gain_height, jrc, nat_forest
+
+
+def enrich_tile(tile, tile_area_pixels):
+    countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+    biomes = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
     centroid = tile.geometry().centroid()
     coords = tile.geometry().bounds().coordinates().get(0)
-    gain_pct = ee.Number(tile.get("sum")).divide(tileAreaPixels).multiply(100)
+    gain_pct = ee.Number(tile.get("sum")).divide(tile_area_pixels).multiply(100)
     return tile.set(
         {
             "tile_id": tile.get("tile_id"),
@@ -172,11 +182,7 @@ def enrich_tile(tile):
     )
 
 
-fullGridIndex = validTiles.map(enrich_tile)
-filteredTiles = validTiles.filter(ee.Filter.gte("sum", tileAreaPixels.multiply(0.01)))
-
-
-def addIndices(img):
+def add_indices(img):
     ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
     evi = img.expression(
         "2.5 * ((NIR - RED) / (NIR + 6.0 * RED - 7.5 * BLUE + 1.0))",
@@ -185,7 +191,7 @@ def addIndices(img):
     return img.select(["B2", "B3", "B4", "B5", "B6", "B7", "B8"]).addBands([ndvi, evi])
 
 
-def s2Composite(year, geom):
+def s2_composite(geom, year):
     start = "2015-01-01" if year == 2016 else f"{year}-01-01"
     end = "2016-12-31" if year == 2016 else f"{year}-12-31"
     reduced = (
@@ -193,7 +199,7 @@ def s2Composite(year, geom):
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
-        .map(addIndices)
+        .map(add_indices)
         .reduce(ee.Reducer.percentile([25]))
     )
     return reduced.select(
@@ -212,7 +218,7 @@ def s2Composite(year, geom):
     )
 
 
-def s1Composite(year, geom):
+def s1_composite(geom, year):
     med = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
         .filterDate(f"{year}-01-01", f"{year}-12-31")
@@ -226,7 +232,7 @@ def s1Composite(year, geom):
     return med.addBands(med.select("VV").divide(med.select("VH")).rename("VVVH"))
 
 
-def dwComposite(year, geom):
+def dw_composite(geom, year):
     return (
         ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
         .filterDate(f"{year}-01-01", f"{year}-12-31")
@@ -236,7 +242,7 @@ def dwComposite(year, geom):
     )
 
 
-def buildStack(s2, s1, dw, prefix):
+def build_stack(s2, s1, dw, prefix):
     return (
         s2.addBands(s1)
         .addBands(dw)
@@ -262,147 +268,207 @@ def buildStack(s2, s1, dw, prefix):
     )
 
 
-def append_to_index(props):
-    write_header = not INDEX_FILE.exists()
-    with open(INDEX_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "tile_id",
-                "country",
-                "biome",
-                "gain_pct",
-                "minLon",
-                "minLat",
-                "maxLon",
-                "maxLat",
-                "is_selected",
-            ],
-        )
-        if write_header:
-            writer.writeheader()
-        writer.writerow(
-            {
-                "tile_id": props.get("tile_id"),
-                "country": props.get("country", "unknown"),
-                "biome": props.get("biome", "unknown"),
-                "gain_pct": round(props.get("gainPct", 0), 4),
-                "minLon": props.get("minLon"),
-                "minLat": props.get("minLat"),
-                "maxLon": props.get("maxLon"),
-                "maxLat": props.get("maxLat"),
-                "is_selected": props.get("is_selected"),
-            }
-        )
-
-
-ee.batch.Export.table.toDrive(
-    collection=fullGridIndex,
-    description="full_grid_index_all_tiles",
-    folder=DRIVE_FOLDER,
-    fileNamePrefix="full_grid_index_all_tiles",
-    fileFormat="CSV",
-).start()
-
-tile_list = filteredTiles.toList(filteredTiles.size())
-n = filteredTiles.size().getInfo()
-print(f"Submitting {n} export tasks to Drive...")
-
-tasks = {}
-for i in range(n):
-    tile = ee.Feature(tile_list.get(i))
-    geom = tile.geometry()
-    tile_id = tile.get("tile_id").getInfo()
-
-    fullStack = (
-        buildStack(
-            s2Composite(2016, geom),
-            s1Composite(2016, geom),
-            dwComposite(2016, geom),
+def build_full_stack(
+    geom, fabdem, slope, gain_height, jrc, nat_forest, gain_validated, full_valid
+):
+    return (
+        build_stack(
+            s2_composite(geom, 2016),
+            s1_composite(geom, 2016),
+            dw_composite(geom, 2016),
             "T0",
         )
         .addBands(
-            buildStack(
-                s2Composite(2020, geom),
-                s1Composite(2020, geom),
-                dwComposite(2020, geom),
+            build_stack(
+                s2_composite(geom, 2020),
+                s1_composite(geom, 2020),
+                dw_composite(geom, 2020),
                 "T1",
             )
         )
         .addBands(
-            buildStack(
-                s2Composite(2025, geom),
-                s1Composite(2025, geom),
-                dwComposite(2025, geom),
+            build_stack(
+                s2_composite(geom, 2025),
+                s1_composite(geom, 2025),
+                dw_composite(geom, 2025),
                 "T2",
             )
         )
         .addBands(fabdem.rename("DEM"))
         .addBands(slope.rename("slope"))
-        .addBands(gainHeight)
-        .addBands(jrcForestTypes)
-        .addBands(naturalForestProb)
-        .addBands(gainValidated.rename("gain_mask"))
-        .updateMask(fullValid)
+        .addBands(gain_height)
+        .addBands(jrc)
+        .addBands(nat_forest)
+        .addBands(gain_validated.rename("gain_mask"))
+        .updateMask(full_valid)
     )
 
-    task = ee.batch.Export.image.toDrive(
-        image=fullStack.clip(geom).toFloat(),
-        description=tile_id,
-        folder=DRIVE_FOLDER,
-        fileNamePrefix=tile_id,
-        region=geom,
-        scale=scale,
-        maxPixels=1e13,
-        fileFormat="GeoTIFF",
+
+def save_tasks(tasks_file, task_ids):
+    with open(tasks_file, "w") as f:
+        json.dump(task_ids, f)
+
+
+def load_tasks(tasks_file):
+    if not tasks_file.exists():
+        return {}
+    with open(tasks_file) as f:
+        return json.load(f)
+
+
+def rclone_to_hpc(tile_id, drive_folder, hpc_remote):
+    return subprocess.run(
+        [
+            "rclone",
+            "moveto",
+            "--drive-use-trash=false",
+            f"{DRIVE_REMOTE}:{drive_folder}/{tile_id}.tif",
+            f"{hpc_remote}/{tile_id}.tif",
+        ],
+        capture_output=True,
+        text=True,
     )
-    task.start()
-    tasks[task] = tile_id
-    print(f"  Submitted {tile_id}")
 
-uploaded = set()
-failed = set()
 
-print("Monitoring tasks...")
-while True:
-    for task, tile_id in tasks.items():
-        if tile_id in uploaded or tile_id in failed:
-            continue
+def monitor(tasks, n, drive_folder, hpc_remote):
+    uploaded = set()
+    failed = set()
 
-        state = task.status()["state"]
+    while True:
+        for task, tile_id in tasks.items():
+            if tile_id in uploaded or tile_id in failed:
+                continue
 
-        if state == "COMPLETED":
-            print(f"{tile_id} complete — moving Drive -> HPC...")
-            result = subprocess.run(
-                [
-                    "rclone",
-                    "moveto",
-                    f"{DRIVE_REMOTE}:{DRIVE_FOLDER}/{tile_id}.tif",
-                    f"{HPC_REMOTE}/{tile_id}.tif",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                print(f"{tile_id} on HPC")
-                uploaded.add(tile_id)
-            else:
-                print(f"rclone error for {tile_id}: {result.stderr}")
+            state = task.status()["state"]
+
+            if state == "COMPLETED":
+                print(f"{tile_id} complete — moving to HPC...")
+                result = rclone_to_hpc(tile_id, drive_folder, hpc_remote)
+                if result.returncode == 0:
+                    print(f"{tile_id} on HPC")
+                    uploaded.add(tile_id)
+                else:
+                    print(f"rclone error for {tile_id}: {result.stderr}")
+                    failed.add(tile_id)
+
+            elif state == "FAILED":
+                print(f"{tile_id} FAILED: {task.status().get('error_message')}")
                 failed.add(tile_id)
 
-        elif state == "FAILED":
-            print(f"{tile_id} FAILED: {task.status().get('error_message')}")
-            failed.add(tile_id)
+        print(
+            f"Uploaded: {len(uploaded)}/{n} | Failed: {len(failed)} | Pending: {n - len(uploaded) - len(failed)}"
+        )
 
-    print(
-        f"Uploaded: {len(uploaded)}/{n} | Failed: {len(failed)} | Pending: {n - len(uploaded) - len(failed)}"
+        if len(uploaded) + len(failed) == n:
+            return uploaded, failed
+
+        time.sleep(POLL_INTERVAL)
+
+
+def run(aoi_id: str, aoi_bounds: list):
+    drive_folder = aoi_to_folder(aoi_id)
+    hpc_remote = f"{HPC_BASE}/{drive_folder}"
+    tasks_file = OUTPUT_DIR / f"tasks_{drive_folder}.json"
+
+    aoi, min_lon, min_lat, max_lon, max_lat, tile_deg_lon, tile_deg_lat = build_aoi(
+        aoi_bounds
+    )
+    gain_validated, gain_binary = build_gain_layer(aoi)
+    full_valid = build_full_valid(aoi)
+    grid = build_grid(min_lon, min_lat, max_lon, max_lat, tile_deg_lon, tile_deg_lat)
+    valid_tiles, tile_area_pixels = build_valid_tiles(gain_binary, full_valid, grid)
+    fabdem, slope, gain_height, jrc, nat_forest = build_ancillary(aoi, gain_validated)
+
+    full_grid_index = valid_tiles.map(lambda t: enrich_tile(t, tile_area_pixels))
+    filtered_tiles = valid_tiles.filter(
+        ee.Filter.gte("sum", tile_area_pixels.multiply(0.01))
     )
 
-    if len(uploaded) + len(failed) == n:
-        break
+    saved = load_tasks(tasks_file)
 
-    time.sleep(POLL_INTERVAL)
+    if saved:
+        print(f"Resuming {len(saved)} tasks for {aoi_id}...")
+        all_ee_tasks = {t.id: t for t in ee.batch.Task.list()}
+        tasks = {}
+        for tile_id, task_id in saved.items():
+            if task_id in all_ee_tasks:
+                tasks[all_ee_tasks[task_id]] = tile_id
+            else:
+                print(
+                    f"  Warning: task {task_id} for {tile_id} not found in EE task list"
+                )
+        n = len(tasks)
+    else:
+        ee.batch.Export.table.toDrive(
+            collection=full_grid_index,
+            description=f"{drive_folder}_index",
+            folder=drive_folder,
+            fileNamePrefix=f"{drive_folder}_index",
+            fileFormat="CSV",
+        ).start()
 
-print(f"Done. {len(uploaded)} tiles on HPC, {len(failed)} failed.")
-if failed:
-    print(f"Failed tiles: {failed}")
+        tile_list = filtered_tiles.toList(filtered_tiles.size())
+        n = filtered_tiles.size().getInfo()
+        print(f"Submitting {n} export tasks for {aoi_id}...")
+
+        tasks = {}
+        task_ids = {}
+        for i in tqdm(range(n), desc=f"Submitting {aoi_id}", smoothing=0):
+            tile = ee.Feature(tile_list.get(i))
+            geom = tile.geometry()
+            tile_id = tile.get("tile_id").getInfo()
+
+            stack = build_full_stack(
+                geom,
+                fabdem,
+                slope,
+                gain_height,
+                jrc,
+                nat_forest,
+                gain_validated,
+                full_valid,
+            )
+
+            task = ee.batch.Export.image.toDrive(
+                image=stack.clip(geom).toFloat(),
+                description=tile_id,
+                folder=drive_folder,
+                fileNamePrefix=tile_id,
+                region=geom,
+                scale=SCALE,
+                maxPixels=1e13,
+                fileFormat="GeoTIFF",
+            )
+            task.start()
+            tasks[task] = tile_id
+            task_ids[tile_id] = task.id
+
+        save_tasks(tasks_file, task_ids)
+
+    uploaded, failed = monitor(tasks, n, drive_folder, hpc_remote)
+
+    if not failed:
+        tasks_file.unlink(missing_ok=True)
+
+    print(f"Done. {len(uploaded)} tiles on HPC, {len(failed)} failed.")
+    if failed:
+        print(f"Failed tiles: {failed}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Export forest gain tiles for an AOI.")
+    parser.add_argument("--aoi-id", required=True, help="AOI identifier, e.g. 'wales'")
+    parser.add_argument(
+        "--bounds",
+        required=True,
+        nargs=4,
+        type=float,
+        metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
+    )
+    args = parser.parse_args()
+
+    run(aoi_id=args.aoi_id, aoi_bounds=args.bounds)
+
+# example usage: python gee.py --aoi-id wales --bounds -4.04 51.54 -3.32 51.75

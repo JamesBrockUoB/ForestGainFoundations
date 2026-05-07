@@ -9,17 +9,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEE_PROJECT = os.getenv("GEE_PROJECT")
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/aois"))
-OUTPUT_FILE = OUTPUT_DIR / os.getenv("OUTPUT_FILE", "valid_aois.json")
+
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/"))
+OUTPUT_FILE = OUTPUT_DIR / os.getenv("OUTPUT_FILE", "aois/valid_aois.json")
+OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+CHECKPOINT = OUTPUT_FILE.parent / "aoi_filter_checkpoint.json"
+
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1000))
 AOI_STEP = float(os.getenv("AOI_STEP", 1.0))
 TILE_PIXELS = int(os.getenv("TILE_PIXELS", 128))
 TILE_SCALE = int(os.getenv("TILE_SCALE", 10))
-
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-CHECKPOINT = OUTPUT_DIR / "aoi_filter_checkpoint.json"
-REJECTED_FILE = OUTPUT_DIR / "aoi_filter_rejected.json"
 
 ee.Authenticate()
 ee.Initialize(project=GEE_PROJECT)
@@ -40,7 +40,7 @@ def aoi_is_valid(aoi_geom):
         )
         .get("Map")
     )
-    return ee.Number(has_land).And(ee.Number(has_tree).gt(0))
+    return ee.Number(has_land).And(ee.Number(has_tree).unmask(0).gt(0))
 
 
 def generate_global_aois(step=AOI_STEP):
@@ -68,13 +68,14 @@ print(f"Total 1x1 degree cells: {len(all_aois)}")
 
 if CHECKPOINT.exists():
     with open(CHECKPOINT) as f:
-        valid_aois = json.load(f)
+        data = json.load(f)
+        valid_aois = data.get("valid", [])
+        rejected_ids = set(data.get("rejected", []))
+
     processed_ids = {a["id"] for a in valid_aois}
-    rejected_ids = (
-        set(json.load(open(REJECTED_FILE))) if REJECTED_FILE.exists() else set()
-    )
     already_done = processed_ids | rejected_ids
     remaining = [a for a in all_aois if a["id"] not in already_done]
+
     print(
         f"Resuming — {len(valid_aois)} valid, {len(rejected_ids)} rejected, {len(remaining)} remaining"
     )
@@ -127,9 +128,14 @@ for i in range(0, len(remaining), BATCH_SIZE):
             rejected_ids.add(a["id"])
 
     with open(CHECKPOINT, "w") as f:
-        json.dump(valid_aois, f, indent=2)
-    with open(REJECTED_FILE, "w") as f:
-        json.dump(list(rejected_ids), f, indent=2)
+        json.dump(
+            {
+                "valid": valid_aois,
+                "rejected": list(rejected_ids),
+            },
+            f,
+            indent=2,
+        )
 
     processed = i + len(batch)
     print(f"  {processed}/{len(remaining)} processed — {len(valid_aois)} valid so far")
