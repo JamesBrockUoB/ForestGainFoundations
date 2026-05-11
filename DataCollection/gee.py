@@ -135,6 +135,64 @@ def build_valid_tiles(gain_binary, full_valid, grid):
     return valid_tiles, tile_area_pixels
 
 
+def score_tile_viability(tile, gain_validated, gain_height):
+    geom = tile.geometry()
+    gain_mask = gain_validated.selfMask()
+
+    def mean_delta(img1, img2, band):
+        return ee.Number(
+            img2.select(band)
+            .subtract(img1.select(band))
+            .updateMask(gain_mask)
+            .reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geom,
+                scale=SCALE,
+                maxPixels=1e13,
+            )
+            .get(band)
+        )
+
+    s2_t0 = s2_composite(geom, 2016)
+    s2_t1 = s2_composite(geom, 2020)
+    s1_t0 = s1_composite(geom, 2016)
+    s1_t1 = s1_composite(geom, 2020)
+
+    ndvi = mean_delta(s2_t0, s2_t1, "NDVI")
+    evi = mean_delta(s2_t0, s2_t1, "EVI")
+    vvvh = mean_delta(s1_t0, s1_t1, "VVVH")
+
+    ndvi_scaled = ndvi.clamp(0, 0.5).divide(0.5)
+    evi_scaled = evi.clamp(0, 0.5).divide(0.5)
+    vvvh_scaled = vvvh.multiply(-1).clamp(0, 1.0).divide(1.0)
+
+    gain_score = ndvi_scaled.add(evi_scaled).add(vvvh_scaled).divide(3)
+
+    canopy_mean = ee.Number(
+        gain_height.updateMask(gain_mask)
+        .reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geom,
+            scale=SCALE,
+            maxPixels=1e13,
+        )
+        .get("canopy_gain_height")
+    )
+
+    return tile.set(
+        {
+            "ndvi_delta": ndvi,
+            "evi_delta": evi,
+            "vvvh_delta": vvvh,
+            "ndvi_scaled": ndvi_scaled,
+            "evi_scaled": evi_scaled,
+            "vvvh_scaled": vvvh_scaled,
+            "gain_score": gain_score,
+            "gain_canopy_mean": canopy_mean,
+        }
+    )
+
+
 def build_ancillary(aoi, gain_validated):
     fabdem = (
         ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
@@ -144,8 +202,15 @@ def build_ancillary(aoi, gain_validated):
     )
     slope = ee.Terrain.slope(fabdem)
     canopy_raw = ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1")
+    canopy_sd_raw = ee.Image("users/nlang/ETH_GlobalCanopyHeightSD_2020_10m_v1")
     canopy = canopy_raw.clip(aoi).rename("canopy_height").updateMask(canopy_raw.gte(0))
+    canopy_sd = (
+        canopy_sd_raw.clip(aoi).rename("canopy_height_sd").updateMask(canopy_raw.gte(0))
+    )
     gain_height = canopy.updateMask(gain_validated).rename("canopy_gain_height")
+    gain_height_sd = canopy_sd.updateMask(gain_validated).rename(
+        "canopy_gain_height_sd"
+    )
     jrc = ee.Image("JRC/GFC2020_subtypes/V1").clip(aoi).rename("jrc_forest_type")
     nat_forest = (
         ee.ImageCollection(
@@ -158,7 +223,7 @@ def build_ancillary(aoi, gain_validated):
         .unmask(0)
         .rename("natural_forest_prob")
     )
-    return fabdem, slope, gain_height, jrc, nat_forest
+    return fabdem, slope, gain_height, gain_height_sd, jrc, nat_forest
 
 
 def enrich_tile(tile, tile_area_pixels):
@@ -269,7 +334,15 @@ def build_stack(s2, s1, dw, prefix):
 
 
 def build_full_stack(
-    geom, fabdem, slope, gain_height, jrc, nat_forest, gain_validated, full_valid
+    geom,
+    fabdem,
+    slope,
+    gain_height,
+    gain_height_sd,
+    jrc,
+    nat_forest,
+    gain_validated,
+    full_valid,
 ):
     return (
         build_stack(
@@ -297,6 +370,7 @@ def build_full_stack(
         .addBands(fabdem.rename("DEM"))
         .addBands(slope.rename("slope"))
         .addBands(gain_height)
+        .addBands(gain_height_sd)
         .addBands(jrc)
         .addBands(nat_forest)
         .addBands(gain_validated.rename("gain_mask"))
@@ -377,11 +451,31 @@ def run(aoi_id: str, aoi_bounds: list):
     full_valid = build_full_valid(aoi)
     grid = build_grid(min_lon, min_lat, max_lon, max_lat, tile_deg_lon, tile_deg_lat)
     valid_tiles, tile_area_pixels = build_valid_tiles(gain_binary, full_valid, grid)
-    fabdem, slope, gain_height, jrc, nat_forest = build_ancillary(aoi, gain_validated)
+    fabdem, slope, gain_height, gain_height_sd, jrc, nat_forest = build_ancillary(
+        aoi, gain_validated
+    )
+
+    GAIN_PCT_MIN = 0.01
+    GAIN_SCORE_MIN = 0.5
+    GAIN_CANOPY_MIN = 3.0
 
     full_grid_index = valid_tiles.map(lambda t: enrich_tile(t, tile_area_pixels))
-    filtered_tiles = valid_tiles.filter(
-        ee.Filter.gte("sum", tile_area_pixels.multiply(0.01))
+
+    full_grid_index = full_grid_index.map(
+        lambda t: score_tile_viability(t, gain_validated, gain_height)
+    )
+
+    gain_tiles = full_grid_index.filter(ee.Filter.gte("gain", GAIN_PCT_MIN))
+
+    scored_tiles = gain_tiles.map(
+        lambda t: score_tile_viability(t, gain_validated, gain_height)
+    )
+
+    filtered_tiles = scored_tiles.filter(
+        ee.Filter.And(
+            ee.Filter.gte("gain_score", GAIN_SCORE_MIN),
+            ee.Filter.gte("gain_canopy_mean", GAIN_CANOPY_MIN),
+        )
     )
 
     saved = load_tasks(tasks_file)
@@ -423,6 +517,7 @@ def run(aoi_id: str, aoi_bounds: list):
                 fabdem,
                 slope,
                 gain_height,
+                gain_height_sd,
                 jrc,
                 nat_forest,
                 gain_validated,
@@ -472,3 +567,19 @@ if __name__ == "__main__":
     run(aoi_id=args.aoi_id, aoi_bounds=args.bounds)
 
 # example usage: python gee.py --aoi-id wales --bounds -4.04 51.54 -3.32 51.75
+
+# p1: Mato Grosso do Sul eucalyptus plantation python gee.py --aoi-id mgs_plantation --bounds -52.05 -20.90 -51.96 -20.81
+
+# p2: Araucania Region pine plantation python gee.py --aoi-id chile_pine --bounds -72.85 -37.85 -72.76 -37.76
+
+# a1 South-west Cote d'Ivoire cocoa agroforestry near Soubre python gee.py --aoi-id cdi_cocoa --bounds -6.65 5.72 -6.56 5.81
+
+# a1 Xishuangbanna (西双版纳) rubber expansion python gee.py --aoi-id yunnan_rubber --bounds 100.85 21.85 100.94 21.94
+
+# n1 Pontal do Paranapanema natural regen zone sao Paulo python gee.py --aoi-id brazil_nat_regen --bounds -52.45 -22.35 -52.36 -22.26
+
+# n2 Eastern Usambara Mountains natural regen zone Tanzania python gee.py --aoi-id tanzania_nat_regen --bounds 38.60 4.90 38.69 4.99
+
+# r1 Glen Affric native woodland restoration Scotland python gee.py --aoi-id glen_affric --bounds -4.95 57.18 -4.86 57.27
+
+# r1 Loess plateua restoration zone near Yan'an (延安) python gee.py --aoi-id loess_restoration --bounds 109.35 36.45 109.44 36.54
