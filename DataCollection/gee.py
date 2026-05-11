@@ -139,55 +139,45 @@ def score_tile_viability(tile, gain_validated, gain_height):
     geom = tile.geometry()
     gain_mask = gain_validated.selfMask()
 
-    def mean_delta(img1, img2, band):
-        return ee.Number(
-            img2.select(band)
-            .subtract(img1.select(band))
-            .updateMask(gain_mask)
-            .reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=SCALE,
-                maxPixels=1e13,
-            )
-            .get(band)
-        )
+    s2_t0 = s2_peak_composite(geom, 2016)
+    s2_t1 = s2_peak_composite(geom, 2020)
 
-    s2_t0 = s2_composite(geom, 2016)
-    s2_t1 = s2_composite(geom, 2020)
-    s1_t0 = s1_composite(geom, 2016)
-    s1_t1 = s1_composite(geom, 2020)
+    ndvi_diff = (
+        s2_t1.select("NDVI")
+        .subtract(s2_t0.select("NDVI"))
+        .updateMask(gain_mask)
+        .rename("NDVI_diff")
+    )
 
-    ndvi = mean_delta(s2_t0, s2_t1, "NDVI")
-    evi = mean_delta(s2_t0, s2_t1, "EVI")
-    vvvh = mean_delta(s1_t0, s1_t1, "VVVH")
+    stats = ndvi_diff.reduceRegion(
+        reducer=ee.Reducer.median(),
+        geometry=geom,
+        scale=SCALE,
+        maxPixels=1e13,
+    )
 
-    ndvi_scaled = ndvi.clamp(0, 0.5).divide(0.5)
-    evi_scaled = evi.clamp(0, 0.5).divide(0.5)
-    vvvh_scaled = vvvh.multiply(-1).clamp(0, 1.0).divide(1.0)
+    ndvi_delta = ee.Number(
+        ee.Algorithms.If(stats.get("NDVI_diff"), stats.get("NDVI_diff"), 0)
+    )
 
-    gain_score = ndvi_scaled.add(evi_scaled).add(vvvh_scaled).divide(3)
+    canopy_stats = gain_height.updateMask(gain_mask).reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geom,
+        scale=SCALE,
+        maxPixels=1e13,
+    )
 
     canopy_mean = ee.Number(
-        gain_height.updateMask(gain_mask)
-        .reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=geom,
-            scale=SCALE,
-            maxPixels=1e13,
+        ee.Algorithms.If(
+            canopy_stats.get("canopy_gain_height"),
+            canopy_stats.get("canopy_gain_height"),
+            0,
         )
-        .get("canopy_gain_height")
     )
 
     return tile.set(
         {
-            "ndvi_delta": ndvi,
-            "evi_delta": evi,
-            "vvvh_delta": vvvh,
-            "ndvi_scaled": ndvi_scaled,
-            "evi_scaled": evi_scaled,
-            "vvvh_scaled": vvvh_scaled,
-            "gain_score": gain_score,
+            "ndvi_delta": ndvi_delta,
             "gain_canopy_mean": canopy_mean,
         }
     )
@@ -229,7 +219,7 @@ def build_ancillary(aoi, gain_validated):
 def enrich_tile(tile, tile_area_pixels):
     countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
     biomes = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
-    centroid = tile.geometry().centroid()
+    centroid = tile.geometry().centroid(maxError=1)
     coords = tile.geometry().bounds().coordinates().get(0)
     gain_pct = ee.Number(tile.get("sum")).divide(tile_area_pixels).multiply(100)
     return tile.set(
@@ -259,14 +249,28 @@ def add_indices(img):
 def s2_composite(geom, year):
     start = "2015-01-01" if year == 2016 else f"{year}-01-01"
     end = "2016-12-31" if year == 2016 else f"{year}-12-31"
-    reduced = (
+    ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
         .map(add_indices)
-        .reduce(ee.Reducer.percentile([25]))
     )
+    reduced = ic.reduce(ee.Reducer.percentile([25]))
+    fallback = (
+        ee.Image.constant(0)
+        .rename("B2_p25")
+        .addBands(ee.Image.constant(0).rename("B3_p25"))
+        .addBands(ee.Image.constant(0).rename("B4_p25"))
+        .addBands(ee.Image.constant(0).rename("B5_p25"))
+        .addBands(ee.Image.constant(0).rename("B6_p25"))
+        .addBands(ee.Image.constant(0).rename("B7_p25"))
+        .addBands(ee.Image.constant(0).rename("B8_p25"))
+        .addBands(ee.Image.constant(0).rename("NDVI_p25"))
+        .addBands(ee.Image.constant(0).rename("EVI_p25"))
+        .updateMask(ee.Image.constant(0))
+    )
+    reduced = ee.Image(ee.Algorithms.If(ic.size().eq(0), fallback, reduced))
     return reduced.select(
         [
             "B2_p25",
@@ -280,6 +284,29 @@ def s2_composite(geom, year):
             "EVI_p25",
         ],
         ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "NDVI", "EVI"],
+    )
+
+
+def s2_peak_composite(geom, year):
+    centroid = ee.Geometry(geom).centroid(maxError=1)
+    lat = ee.Number(centroid.coordinates().get(1))
+    north = lat.gt(0)
+
+    if year == 2016:
+        start = ee.String(ee.Algorithms.If(north, "2015-05-01", "2015-11-01"))
+        end = ee.String(ee.Algorithms.If(north, "2016-09-30", "2017-03-31"))
+    else:
+        start = ee.String(ee.Algorithms.If(north, f"{year}-05-01", f"{year}-11-01"))
+        end = ee.String(ee.Algorithms.If(north, f"{year}-09-30", f"{year+1}-03-31"))
+
+    return (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterDate(start, end)
+        .filterBounds(geom)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
+        .map(add_indices)
+        .select(["NDVI", "EVI"])
+        .median()
     )
 
 
@@ -456,16 +483,12 @@ def run(aoi_id: str, aoi_bounds: list):
     )
 
     GAIN_PCT_MIN = 0.01
-    GAIN_SCORE_MIN = 0.5
+    NDVI_DELTA_MIN = 0.0
     GAIN_CANOPY_MIN = 3.0
 
     full_grid_index = valid_tiles.map(lambda t: enrich_tile(t, tile_area_pixels))
 
-    full_grid_index = full_grid_index.map(
-        lambda t: score_tile_viability(t, gain_validated, gain_height)
-    )
-
-    gain_tiles = full_grid_index.filter(ee.Filter.gte("gain", GAIN_PCT_MIN))
+    gain_tiles = full_grid_index.filter(ee.Filter.gte("gainPct", GAIN_PCT_MIN))
 
     scored_tiles = gain_tiles.map(
         lambda t: score_tile_viability(t, gain_validated, gain_height)
@@ -473,7 +496,7 @@ def run(aoi_id: str, aoi_bounds: list):
 
     filtered_tiles = scored_tiles.filter(
         ee.Filter.And(
-            ee.Filter.gte("gain_score", GAIN_SCORE_MIN),
+            ee.Filter.gt("ndvi_delta", NDVI_DELTA_MIN),
             ee.Filter.gte("gain_canopy_mean", GAIN_CANOPY_MIN),
         )
     )

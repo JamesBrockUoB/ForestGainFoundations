@@ -71,74 +71,62 @@ def dw_crops_mean(geom):
     )
 
 
+def safe_num(val, default):
+    return ee.Number(ee.Algorithms.If(ee.Algorithms.IsEqual(val, None), default, val))
+
+
 def aoi_is_valid(f):
     geom = f.geometry()
 
-    # Land presence
     has_land = land.filterBounds(geom).size().gt(0)
 
-    # Tree cover fraction at 1km — require > MIN_TREE_COVER_FRACTION
     tree_stats = forest_px.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=geom,
         scale=1000,
         maxPixels=1e9,
     )
-    tree_fraction = ee.Number(tree_stats.get("Map", 0))
+    tree_fraction = safe_num(tree_stats.get("Map"), 0)
     has_sufficient_tree = tree_fraction.gt(MIN_TREE_COVER_FRACTION)
 
     s2_2016 = s2_scene_count(geom, 2016)
     s2_2020 = s2_scene_count(geom, 2020)
     s2_2025 = s2_scene_count(geom, 2025)
-
     has_s2_all = s2_2016.gt(0).And(s2_2020.gt(0)).And(s2_2025.gt(0))
 
     is_valid = has_land.And(has_sufficient_tree).And(has_s2_all)
 
-    # JRC mode: 1=natural regen, 10=primary, 20=planted
-    jrc_mode_num = ee.Number(
+    jrc_mode = safe_num(
         jrc.reduceRegion(
             reducer=ee.Reducer.mode(),
             geometry=geom,
             scale=1000,
             maxPixels=1e9,
-        ).get("Map", -1)
+        ).get("Map"),
+        -1,
     )
 
-    # Nature Trace natural forest probability mean
-    nat_mean_num = ee.Number(
+    nat_mean = safe_num(
         nat_forest.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=geom,
             scale=1000,
             maxPixels=1e9,
-        ).get("B0", 0)
+        ).get("B0"),
+        0,
     )
 
-    # DynamicWorld crops fraction as agroforestry prior
-    crops_mean_num = ee.Number(dw_crops_mean(geom))
+    crops_mean = dw_crops_mean(geom)
 
-    # Soft dominant class label based on feature combination:
-    #   plantation:       jrc_mode == 20
-    #   agroforestry:     crops_mean > 0.2
-    #   natural_regen:    jrc_mode == 1 AND nat_mean > 0.3
-    #   restoration:      nat_mean <= 0.3 AND jrc_mode != 20 AND crops_mean <= 0.2
-    # Expressed as integer: 0=plantation, 1=agroforestry, 2=natural_regen, 3=restoration
-    jrc_mode_num = ee.Number(ee.Algorithms.If(jrc_mode, jrc_mode, -1))
-
-    nat_mean_num = ee.Number(ee.Algorithms.If(nat_mean, nat_mean, 0))
-
-    crops_mean_num = ee.Number(ee.Algorithms.If(crops_mean, crops_mean, 0))
-
-    is_plantation = jrc_mode_num.eq(20)
-    is_agroforestry = crops_mean_num.gt(0.2).And(is_plantation.Not())
+    is_plantation = jrc_mode.eq(20)
+    is_agroforestry = crops_mean.gt(0.2).And(is_plantation.Not())
     is_nat_regen = (
-        jrc_mode_num.eq(1)
-        .And(nat_mean_num.gt(0.3))
+        jrc_mode.eq(1)
+        .And(nat_mean.gt(0.3))
         .And(is_plantation.Not())
         .And(is_agroforestry.Not())
     )
-    # restoration is the residual
+
     dominant_class = (
         ee.Number(0)
         .multiply(is_plantation)
@@ -158,9 +146,9 @@ def aoi_is_valid(f):
             "s2_count_2016": s2_2016,
             "s2_count_2020": s2_2020,
             "s2_count_2025": s2_2025,
-            "jrc_mode": jrc_mode_num,
-            "nat_mean": nat_mean_num,
-            "crops_mean": crops_mean_num,
+            "jrc_mode": jrc_mode,
+            "nat_mean": nat_mean,
+            "crops_mean": crops_mean,
             "dominant_class": dominant_class,
         }
     )
@@ -230,9 +218,7 @@ for i in range(0, len(remaining), BATCH_SIZE):
         for f in rejected_batch:
             rejected_ids.add(f["properties"]["id"])
     except Exception as e:
-        print(f"Batch error ({i}): {e} — skipping batch")
-        for a in batch:
-            rejected_ids.add(a["id"])
+        print(f"Batch error ({i}): {e} — will retry next run")
 
     with open(CHECKPOINT, "w") as f:
         json.dump({"valid": valid_aois, "rejected": list(rejected_ids)}, f, indent=2)
