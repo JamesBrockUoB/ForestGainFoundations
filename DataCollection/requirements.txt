@@ -4,3 +4,5 @@ rasterio
 python-dotenv
 matplotlib
 tqdm
+folium
+rasterio

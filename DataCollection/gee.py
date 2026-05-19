@@ -191,16 +191,14 @@ def build_ancillary(aoi, gain_validated):
         .clip(aoi)
     )
     slope = ee.Terrain.slope(fabdem)
-    canopy_raw = ee.Image("users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1")
-    canopy_sd_raw = ee.Image("users/nlang/ETH_GlobalCanopyHeightSD_2020_10m_v1")
+    canopy_raw = ee.ImageCollection(
+        "projects/sat-io/open-datasets/facebook/meta-canopy-height"
+    ).mosaic()
+
     canopy = canopy_raw.clip(aoi).rename("canopy_height").updateMask(canopy_raw.gte(0))
-    canopy_sd = (
-        canopy_sd_raw.clip(aoi).rename("canopy_height_sd").updateMask(canopy_raw.gte(0))
-    )
+
     gain_height = canopy.updateMask(gain_validated).rename("canopy_gain_height")
-    gain_height_sd = canopy_sd.updateMask(gain_validated).rename(
-        "canopy_gain_height_sd"
-    )
+
     jrc = ee.Image("JRC/GFC2020_subtypes/V1").clip(aoi).rename("jrc_forest_type")
     nat_forest = (
         ee.ImageCollection(
@@ -213,7 +211,7 @@ def build_ancillary(aoi, gain_validated):
         .unmask(0)
         .rename("natural_forest_prob")
     )
-    return fabdem, slope, gain_height, gain_height_sd, jrc, nat_forest
+    return fabdem, slope, gain_height, jrc, nat_forest
 
 
 def enrich_tile(tile, tile_area_pixels):
@@ -365,7 +363,6 @@ def build_full_stack(
     fabdem,
     slope,
     gain_height,
-    gain_height_sd,
     jrc,
     nat_forest,
     gain_validated,
@@ -397,7 +394,6 @@ def build_full_stack(
         .addBands(fabdem.rename("DEM"))
         .addBands(slope.rename("slope"))
         .addBands(gain_height)
-        .addBands(gain_height_sd)
         .addBands(jrc)
         .addBands(nat_forest)
         .addBands(gain_validated.rename("gain_mask"))
@@ -478,9 +474,7 @@ def run(aoi_id: str, aoi_bounds: list):
     full_valid = build_full_valid(aoi)
     grid = build_grid(min_lon, min_lat, max_lon, max_lat, tile_deg_lon, tile_deg_lat)
     valid_tiles, tile_area_pixels = build_valid_tiles(gain_binary, full_valid, grid)
-    fabdem, slope, gain_height, gain_height_sd, jrc, nat_forest = build_ancillary(
-        aoi, gain_validated
-    )
+    fabdem, slope, gain_height, jrc, nat_forest = build_ancillary(aoi, gain_validated)
 
     GAIN_PCT_MIN = 0.01
     NDVI_DELTA_MIN = 0.0
@@ -540,7 +534,6 @@ def run(aoi_id: str, aoi_bounds: list):
                 fabdem,
                 slope,
                 gain_height,
-                gain_height_sd,
                 jrc,
                 nat_forest,
                 gain_validated,
