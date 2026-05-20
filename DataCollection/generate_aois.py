@@ -364,6 +364,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 def _worker(batch_queue, result_queue, worker_id):
     _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     _credentials = ee.ServiceAccountCredentials(None, _creds_path)
+    time.sleep(worker_id * 2)
     ee.Initialize(_credentials, project=GEE_PROJECT)
 
     _land, _esa_veg, _gain_mask = _build_gee_datasets()
