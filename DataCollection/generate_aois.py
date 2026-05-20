@@ -59,7 +59,7 @@ OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 CHECKPOINT = OUTPUT_FILE.parent / "aoi_filter_checkpoint.json"
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 500))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))
 AOI_STEP = float(os.getenv("AOI_STEP", 0.25))
 
 USE_HPC = os.getenv("USE_HPC", "0") == "1"
@@ -83,8 +83,12 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-ee.Authenticate()
-ee.Initialize(project=GEE_PROJECT)
+
+creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+credentials = ee.ServiceAccountCredentials(None, creds_path)
+
+ee.Initialize(credentials, project=GEE_PROJECT)
 
 logger.info(f"GEE initialised | project={GEE_PROJECT} | HPC={USE_HPC}")
 
@@ -108,7 +112,8 @@ TREE_2020 = glulc_2020_i.remap(TREE_CLASSES, ONES, 0)
 
 GAIN_MASK = TREE_2020.And(TREE_2015.Not()).select([0]).rename("gain").unmask(0)
 
-land_mask = ee.Image.constant(1).clip(land.geometry()).rename("land")
+land = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+land_geom = land.geometry()
 
 logger.info("All GEE datasets loaded")
 
@@ -131,12 +136,16 @@ def atomic_json_write(path, obj, indent=None):
 
 
 def land_fraction(geom, scale=1000):
-    val = land_mask.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=geom,
-        scale=scale,
-        maxPixels=1e9,
-    ).get("land")
+    land_inside = land.filterBounds(geom).geometry()
+
+    val = (
+        ee.Image.constant(1)
+        .clip(land_inside)
+        .reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
+        )
+        .get("constant")
+    )
 
     return safe_num(val, 0)
 
@@ -163,17 +172,20 @@ def s2_usable_fraction(geom, year):
         .select(bands)
     )
 
-    # per-image: pixel is valid only if ALL bands are unmasked
     def valid_mask(img):
-        return img.mask().reduce(ee.Reducer.min())
+        return img.mask().reduce(ee.Reducer.min()).rename("valid")
 
-    # union over time: any valid observation
     valid = col.map(valid_mask).max()
 
-    # fraction of AOI with at least one valid observation
+    valid = ee.Image(
+        ee.Algorithms.If(
+            valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
+        )
+    )
+
     frac = valid.reduceRegion(
         reducer=ee.Reducer.mean(), geometry=geom, scale=100, maxPixels=1e9
-    ).get("constant")
+    ).get("valid")
 
     return safe_num(frac, 0)
 
@@ -211,7 +223,9 @@ def aoi_is_valid(f):
     geom = f.geometry()
 
     veg_frac = safe_num(
-        esa_veg.reduceRegion(ee.Reducer.mean(), geom, 1000, 1e9).get("esa_veg"),
+        esa_veg.reduceRegion(
+            ee.Reducer.mean(), geometry=geom, scale=1000, maxPixels=1e9
+        ).get("esa_veg"),
         0,
     )
 
@@ -223,7 +237,7 @@ def aoi_is_valid(f):
 
     land_frac = land_fraction(geom)
 
-    has_land = land_frac.gte(MIN_LAND_FRACTION).Or(has_gain)
+    has_land = land_frac.gte(MIN_LAND_FRACTION)
 
     has_s2 = (
         s2_usable_fraction(geom, 2016)
@@ -520,6 +534,11 @@ if __name__ == "__main__":
         with open(CHECKPOINT) as f:
             data = json.load(f)
 
+        # FIX: handle corrupted legacy format (list instead of dict)
+        if isinstance(data, list):
+            loaded_valid = data
+            loaded_rejected = []
+        else:
             loaded_valid = data.get("valid", [])
             loaded_rejected = data.get("rejected", [])
 
@@ -538,25 +557,29 @@ if __name__ == "__main__":
 
     else:
         remaining = all_aois
-
         loaded_valid = []
         loaded_rejected = []
 
         logger.info(f"Starting fresh — {len(remaining)} cells to process")
 
     if USE_HPC:
-        logger.info(f"Mode: HPC | workers={NUM_WORKERS} | " f"batch_size={BATCH_SIZE}")
+        logger.info(f"Mode: HPC | workers={NUM_WORKERS} | batch_size={BATCH_SIZE}")
 
         run_hpc(remaining)
 
-        with open(OUTPUT_FILE) as f:
-            valid_aois = json.load(f)
+        try:
+            with open(OUTPUT_FILE) as f:
+                valid_aois = json.load(f)
+        except Exception:
+            valid_aois = loaded_valid
 
-        if REJECTED_OUTPUT_FILE.exists():
-            with open(REJECTED_OUTPUT_FILE) as f:
-                rejected_aois = json.load(f)
-
-        else:
+        try:
+            if REJECTED_OUTPUT_FILE.exists():
+                with open(REJECTED_OUTPUT_FILE) as f:
+                    rejected_aois = json.load(f)
+            else:
+                rejected_aois = loaded_rejected
+        except Exception:
             rejected_aois = loaded_rejected
 
     else:
