@@ -83,7 +83,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
 creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 credentials = ee.ServiceAccountCredentials(None, creds_path)
@@ -92,30 +91,33 @@ ee.Initialize(credentials, project=GEE_PROJECT)
 
 logger.info(f"GEE initialised | project={GEE_PROJECT} | HPC={USE_HPC}")
 
-land = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
 
-esa_wc = ee.Image("ESA/WorldCover/v100/2020")
+def _build_gee_datasets():
+    """
+    Construct all GEE dataset objects needed for AOI validation.
 
-esa_trees = esa_wc.eq(10).unmask(0)
-esa_mangrove = esa_wc.eq(95).unmask(0)
-esa_veg = esa_trees.Or(esa_mangrove).unmask(0).rename("esa_veg")
+    Called in the main process (for local mode) and at the start of each
+    worker (for HPC mode) after ee.Initialize(), so that no GEE objects are
+    ever pickled and sent across the fork boundary.
+    """
+    _land = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
 
-glulc_2015 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2015").select([0])
-glulc_2020_i = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2020").select([0])
+    _esa_wc = ee.Image("ESA/WorldCover/v100/2020")
+    _esa_trees = _esa_wc.eq(10).unmask(0)
+    _esa_mangrove = _esa_wc.eq(95).unmask(0)
+    _esa_veg = _esa_trees.Or(_esa_mangrove).unmask(0).rename("esa_veg")
 
-TREE_CLASSES = ee.List.sequence(25, 96).cat(ee.List.sequence(125, 196))
+    _glulc_2015 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2015").select([0])
+    _glulc_2020 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2020").select([0])
 
-ONES = ee.List.repeat(1, TREE_CLASSES.length())
+    _tree_classes = ee.List.sequence(25, 96).cat(ee.List.sequence(125, 196))
+    _ones = ee.List.repeat(1, _tree_classes.length())
 
-TREE_2015 = glulc_2015.remap(TREE_CLASSES, ONES, 0)
-TREE_2020 = glulc_2020_i.remap(TREE_CLASSES, ONES, 0)
+    _tree_2015 = _glulc_2015.remap(_tree_classes, _ones, 0)
+    _tree_2020 = _glulc_2020.remap(_tree_classes, _ones, 0)
+    _gain_mask = _tree_2020.And(_tree_2015.Not()).select([0]).rename("gain").unmask(0)
 
-GAIN_MASK = TREE_2020.And(TREE_2015.Not()).select([0]).rename("gain").unmask(0)
-
-land = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
-land_geom = land.geometry()
-
-logger.info("All GEE datasets loaded")
+    return _land, _esa_veg, _gain_mask
 
 
 def safe_num(val, default=0):
@@ -135,8 +137,8 @@ def atomic_json_write(path, obj, indent=None):
     tmp.replace(path)
 
 
-def land_fraction(geom, scale=1000):
-    land_inside = land.filterBounds(geom).geometry()
+def land_fraction(_land, geom, scale=1000):
+    land_inside = _land.filterBounds(geom).geometry()
 
     val = (
         ee.Image.constant(1)
@@ -190,8 +192,8 @@ def s2_usable_fraction(geom, year):
     return safe_num(frac, 0)
 
 
-def forest_gain_fraction_umd(geom, scale=30):
-    val = GAIN_MASK.reduceRegion(
+def forest_gain_fraction_umd(_gain_mask, geom, scale=30):
+    val = _gain_mask.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=geom,
         scale=scale,
@@ -219,25 +221,25 @@ def rejection_reason_str(reason_code):
     return " + ".join(reasons) if reasons else "unknown"
 
 
-def aoi_is_valid(f):
+def aoi_is_valid(_land, _esa_veg, _gain_mask, f):
     geom = f.geometry()
 
     veg_frac = safe_num(
-        esa_veg.reduceRegion(
+        _esa_veg.reduceRegion(
             ee.Reducer.mean(), geometry=geom, scale=1000, maxPixels=1e9
         ).get("esa_veg"),
         0,
     )
 
-    fg_frac = forest_gain_fraction_umd(geom)
+    fg_frac = forest_gain_fraction_umd(_gain_mask, geom)
 
     has_gain = fg_frac.gte(MIN_GAIN_FRACTION)
 
     has_veg = veg_frac.gte(MIN_VEG_FRACTION)
 
-    land_frac = land_fraction(geom)
+    lf = land_fraction(_land, geom)
 
-    has_land = land_frac.gte(MIN_LAND_FRACTION)
+    has_land = lf.gte(MIN_LAND_FRACTION)
 
     has_s2 = (
         s2_usable_fraction(geom, 2016)
@@ -292,37 +294,38 @@ def generate_global_aois(step=AOI_STEP):
     return aois
 
 
-def process_batch(batch):
+def process_batch(_land, _esa_veg, _gain_mask, batch):
     features = [
         ee.Feature(
-            ee.Geometry.Rectangle(
-                [
-                    a["minLon"],
-                    a["minLat"],
-                    a["maxLon"],
-                    a["maxLat"],
-                ]
-            ),
+            ee.Geometry.Rectangle([a["minLon"], a["minLat"], a["maxLon"], a["maxLat"]]),
             a,
         )
         for a in batch
     ]
 
     fc = ee.FeatureCollection(features)
-
-    fc_validated = fc.map(aoi_is_valid)
+    fc_validated = fc.map(lambda f: aoi_is_valid(_land, _esa_veg, _gain_mask, f))
 
     valid_fc = fc_validated.filter(ee.Filter.gt("valid", 0))
-
     rejected_fc = fc_validated.filter(ee.Filter.eq("valid", 0))
 
+    def decode_reason(features):
+        for f in features:
+            props = f["properties"]
+            props["rejection_reason"] = rejection_reason_str(
+                int(round(props.get("rejection_reason", 0)))
+            )
+        return features
+
     return (
-        valid_fc.getInfo()["features"],
-        rejected_fc.getInfo()["features"],
+        decode_reason(valid_fc.getInfo()["features"]),
+        decode_reason(rejected_fc.getInfo()["features"]),
     )
 
 
-def run_local(remaining):
+def run_local(remaining, loaded_valid, loaded_rejected):
+    _land, _esa_veg, _gain_mask = _build_gee_datasets()
+
     valid_aois = []
     rejected_aois = []
 
@@ -330,10 +333,10 @@ def run_local(remaining):
         batch = remaining[i : i + BATCH_SIZE]
 
         try:
-            valid_batch, rejected_batch = process_batch(batch)
-
+            valid_batch, rejected_batch = process_batch(
+                _land, _esa_veg, _gain_mask, batch
+            )
             valid_aois.extend([f["properties"] for f in valid_batch])
-
             rejected_aois.extend([f["properties"] for f in rejected_batch])
 
         except Exception as e:
@@ -342,8 +345,8 @@ def run_local(remaining):
         atomic_json_write(
             CHECKPOINT,
             {
-                "valid": valid_aois,
-                "rejected": rejected_aois,
+                "valid": loaded_valid + valid_aois,
+                "rejected": loaded_rejected + rejected_aois,
             },
         )
 
@@ -358,7 +361,11 @@ def run_local(remaining):
 
 
 def _worker(batch_queue, result_queue, worker_id):
-    ee.Initialize(project=GEE_PROJECT)
+    _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    _credentials = ee.ServiceAccountCredentials(None, _creds_path)
+    ee.Initialize(_credentials, project=GEE_PROJECT)
+
+    _land, _esa_veg, _gain_mask = _build_gee_datasets()
 
     while True:
         item = batch_queue.get()
@@ -369,7 +376,7 @@ def _worker(batch_queue, result_queue, worker_id):
         batch_idx, batch = item
 
         try:
-            valid, rejected = process_batch(batch)
+            valid, rejected = process_batch(_land, _esa_veg, _gain_mask, batch)
 
             result_queue.put(("batch_result", batch_idx, valid, rejected))
 
@@ -433,26 +440,16 @@ def _writer(result_queue, total_batches):
                 f"{elapsed:.1f}min elapsed"
             )
 
-    atomic_json_write(
-        OUTPUT_FILE,
-        valid_aois,
-        indent=2,
-    )
+    atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
 
-    atomic_json_write(
-        REJECTED_OUTPUT_FILE,
-        rejected_aois,
-        indent=2,
-    )
+    atomic_json_write(REJECTED_OUTPUT_FILE, rejected_aois, indent=2)
 
-    logger.info(f"✓ Final output: {len(valid_aois)} valid AOIs → " f"{OUTPUT_FILE}")
+    logger.info(f"✓ Final output: {len(valid_aois)} valid AOIs → {OUTPUT_FILE}")
 
     logger.info(
         f"✓ Rejected output: {len(rejected_aois)} rejected AOIs → "
         f"{REJECTED_OUTPUT_FILE}"
     )
-
-    return valid_aois, rejected_aois
 
 
 def run_hpc(remaining):
@@ -502,8 +499,7 @@ def print_summary(valid_aois, rejected_aois):
     rejection_counts = {}
 
     for a in rejected_aois:
-        reason = rejection_reason_str(int(a.get("rejection_reason", 0)))
-
+        reason = a.get("rejection_reason", "unknown")
         rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
     total_processed = len(valid_aois) + len(rejected_aois)
@@ -534,7 +530,6 @@ if __name__ == "__main__":
         with open(CHECKPOINT) as f:
             data = json.load(f)
 
-        # FIX: handle corrupted legacy format (list instead of dict)
         if isinstance(data, list):
             loaded_valid = data
             loaded_rejected = []
@@ -569,30 +564,33 @@ if __name__ == "__main__":
 
         try:
             with open(OUTPUT_FILE) as f:
-                valid_aois = json.load(f)
+                new_valid = json.load(f)
         except Exception:
-            valid_aois = loaded_valid
+            new_valid = []
+
+        valid_aois = loaded_valid + new_valid
+        atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
 
         try:
             if REJECTED_OUTPUT_FILE.exists():
                 with open(REJECTED_OUTPUT_FILE) as f:
-                    rejected_aois = json.load(f)
+                    new_rejected = json.load(f)
             else:
-                rejected_aois = loaded_rejected
+                new_rejected = []
         except Exception:
-            rejected_aois = loaded_rejected
+            new_rejected = []
+
+        rejected_aois = loaded_rejected + new_rejected
+        atomic_json_write(REJECTED_OUTPUT_FILE, rejected_aois, indent=2)
 
     else:
         logger.info(f"Mode: local | batch_size={BATCH_SIZE}")
 
-        valid_aois, rejected_batch = run_local(remaining)
+        new_valid, new_rejected = run_local(remaining, loaded_valid, loaded_rejected)
 
-        rejected_aois = loaded_rejected + rejected_batch
+        valid_aois = loaded_valid + new_valid
+        rejected_aois = loaded_rejected + new_rejected
 
-        atomic_json_write(
-            OUTPUT_FILE,
-            valid_aois,
-            indent=2,
-        )
+        atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
 
     print_summary(valid_aois, rejected_aois)
