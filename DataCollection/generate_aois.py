@@ -1,7 +1,7 @@
 """
 generate_aois.py
 
-AOI generation with basic sanity checks. No class priors or scoring.
+AOI generation with basic sanity checks.
 
 Runs in two modes controlled by the USE_HPC environment variable:
   USE_HPC=0 (default) — single-process, sequential batches, suitable for local dev
@@ -364,7 +364,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 def _worker(batch_queue, result_queue, worker_id):
     _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     _credentials = ee.ServiceAccountCredentials(None, _creds_path)
-    time.sleep(worker_id * 2)
+    time.sleep(worker_id * 3)
     ee.Initialize(_credentials, project=GEE_PROJECT)
 
     _land, _esa_veg, _gain_mask = _build_gee_datasets()
