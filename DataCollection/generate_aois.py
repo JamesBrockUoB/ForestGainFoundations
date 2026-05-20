@@ -40,6 +40,7 @@ import multiprocessing as mp
 import os
 import threading
 import time
+import random
 from pathlib import Path
 
 import ee
@@ -375,15 +376,31 @@ def _worker(batch_queue, result_queue, worker_id):
 
         batch_idx, batch = item
 
-        try:
-            valid, rejected = process_batch(_land, _esa_veg, _gain_mask, batch)
-
-            result_queue.put(("batch_result", batch_idx, valid, rejected))
-
-        except Exception as e:
-            logger.error(f"Worker {worker_id} | Batch {batch_idx}: {e}")
-
-            result_queue.put(("error", batch_idx, str(e)))
+        for attempt in range(5):
+            try:
+                valid, rejected = process_batch(_land, _esa_veg, _gain_mask, batch)
+                result_queue.put(("batch_result", batch_idx, valid, rejected))
+                break
+            except Exception as e:
+                err = str(e)
+                if (
+                    "429" in err
+                    or "concurrent" in err.lower()
+                    or "quota" in err.lower()
+                ):
+                    wait = (2**attempt) + random.uniform(0, 2)
+                    logger.warning(
+                        f"Worker {worker_id} | Batch {batch_idx} | "
+                        f"Rate limited, retry {attempt+1}/5 in {wait:.1f}s"
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(f"Worker {worker_id} | Batch {batch_idx}: {e}")
+                    result_queue.put(("error", batch_idx, err))
+                    break
+        else:
+            logger.error(f"Worker {worker_id} | Batch {batch_idx}: exhausted retries")
+            result_queue.put(("error", batch_idx, "exhausted retries"))
 
 
 def _writer(result_queue, total_batches):
