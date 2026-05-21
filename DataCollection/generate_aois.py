@@ -70,6 +70,8 @@ MIN_VEG_FRACTION = 0.01
 MIN_LAND_FRACTION = 0.05
 MIN_GAIN_FRACTION = 0.001
 
+AOI_LIST_CACHE = OUTPUT_FILE.parent / "all_aois.json"
+
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -139,18 +141,22 @@ def atomic_json_write(path, obj, indent=None):
 
 
 def land_fraction(_land, geom, scale=1000):
-    land_inside = _land.filterBounds(geom).geometry()
 
-    val = (
-        ee.Image.constant(1)
-        .clip(land_inside)
-        .reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
+    land_fc = _land.filterBounds(geom)
+
+    def compute():
+        land_geom = land_fc.geometry()
+
+        return (
+            ee.Image.constant(1)
+            .clip(land_geom)
+            .reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
+            )
+            .get("constant")
         )
-        .get("constant")
-    )
 
-    return safe_num(val, 0)
+    return ee.Number(ee.Algorithms.If(land_fc.size().gt(0), compute(), 0))
 
 
 def mask_s2_scl(img):
@@ -161,36 +167,62 @@ def mask_s2_scl(img):
     return img.updateMask(mask)
 
 
-def s2_usable_fraction(geom, year):
-    start = f"{year}-01-01"
-    end = f"{year}-12-31"
+def has_usable_s2(geom):
+    """Returns a boolean on whether s2 imagery for an AOI is usable"""
 
-    bands = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
+    def year_frac(start, end):
+        bands = [
+            "B1",
+            "B2",
+            "B3",
+            "B4",
+            "B5",
+            "B6",
+            "B7",
+            "B8",
+            "B8A",
+            "B9",
+            "B11",
+            "B12",
+        ]
 
-    col = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterDate(start, end)
-        .filterBounds(geom)
-        .map(mask_s2_scl)
-        .select(bands)
-    )
-
-    def valid_mask(img):
-        return img.mask().reduce(ee.Reducer.min()).rename("valid")
-
-    valid = col.map(valid_mask).max()
-
-    valid = ee.Image(
-        ee.Algorithms.If(
-            valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
+        col = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterDate(start, end)
+            .filterBounds(geom)
+            .map(mask_s2_scl)
+            .select(bands)
         )
+
+        def valid_mask(img):
+            return img.mask().reduce(ee.Reducer.min()).rename("valid")
+
+        valid = col.map(valid_mask).max()
+
+        valid = ee.Image(
+            ee.Algorithms.If(
+                valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
+            )
+        )
+
+        return valid.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=geom, scale=500, maxPixels=1e9
+        ).get("valid")
+
+    fracs = ee.Dictionary(
+        {
+            "2016": safe_num(year_frac("2015-01-01", "2016-12-31"), 0),
+            "2020": safe_num(year_frac("2020-01-01", "2020-12-31"), 0),
+            "2025": safe_num(year_frac("2025-01-01", "2025-12-31"), 0),
+        }
     )
 
-    frac = valid.reduceRegion(
-        reducer=ee.Reducer.mean(), geometry=geom, scale=100, maxPixels=1e9
-    ).get("valid")
-
-    return safe_num(frac, 0)
+    return (
+        fracs.getNumber("2016")
+        .gte(0.05)
+        .And(fracs.getNumber("2020").gte(0.05))
+        .And(fracs.getNumber("2025").gte(0.05))
+    )
 
 
 def forest_gain_fraction_umd(_gain_mask, geom, scale=30):
@@ -222,80 +254,82 @@ def rejection_reason_str(reason_code):
     return " + ".join(reasons) if reasons else "unknown"
 
 
-def aoi_is_valid(_land, _esa_veg, _gain_mask, f):
-    geom = f.geometry()
+def generate_global_aois(step=AOI_STEP, batch_size=2000):
+    import ee
+    import math
 
-    veg_frac = safe_num(
-        _esa_veg.reduceRegion(
-            ee.Reducer.mean(), geometry=geom, scale=1000, maxPixels=1e9
-        ).get("esa_veg"),
-        0,
-    )
+    cells = []
 
-    fg_frac = forest_gain_fraction_umd(_gain_mask, geom)
-
-    has_gain = fg_frac.gte(MIN_GAIN_FRACTION)
-
-    has_veg = veg_frac.gte(MIN_VEG_FRACTION)
-
-    lf = land_fraction(_land, geom)
-
-    has_land = lf.gte(MIN_LAND_FRACTION)
-
-    has_s2 = (
-        s2_usable_fraction(geom, 2016)
-        .gte(0.05)
-        .And(s2_usable_fraction(geom, 2020).gte(0.05))
-        .And(s2_usable_fraction(geom, 2025).gte(0.05))
-    )
-
-    rejection_reason = (
-        ee.Number(0)
-        .add(ee.Number(1).multiply(has_veg.Not()))
-        .add(ee.Number(2).multiply(has_s2.Not()))
-        .add(ee.Number(4).multiply(has_land.Not()))
-        .add(ee.Number(8).multiply(has_gain.Not()))
-    )
-
-    is_valid = has_veg.And(has_s2).And(has_land).And(has_gain)
-
-    return f.set(
-        {
-            "valid": is_valid,
-            "rejection_reason": rejection_reason,
-            "veg_fraction": veg_frac,
-            "forest_gain_frac": fg_frac,
-        }
-    )
-
-
-def generate_global_aois(step=AOI_STEP):
-    aois = []
-
-    lat = -90.0
-
-    while lat < 90.0:
+    lat = -60.0
+    while lat < 85.0:
         lon = -180.0
-
         while lon < 180.0:
-            aois.append(
+            cells.append(
                 {
-                    "id": f"aoi_{round(lon,4)}_{round(lat,4)}",
                     "minLon": round(lon, 4),
                     "minLat": round(lat, 4),
                     "maxLon": round(min(lon + step, 180.0), 4),
-                    "maxLat": round(min(lat + step, 90.0), 4),
+                    "maxLat": round(min(lat + step, 85.0), 4),
+                    "id": f"aoi_{round(lon,4)}_{round(lat,4)}",
                 }
             )
+            lon += step
+        lat += step
 
-            lon = round(lon + step, 4)
+    total = len(cells)
+    print(f"[AOI] total cells: {total}")
 
-        lat = round(lat + step, 4)
+    land_mask = (
+        ee.Image("COPERNICUS/Landcover/100m/Proba-V-C3/Global/2019")
+        .select("discrete_classification")
+        .neq(200)
+    )
 
-    return aois
+    valid = []
+    batches = math.ceil(total / batch_size)
+
+    for i in range(batches):
+        start = i * batch_size
+        end = min((i + 1) * batch_size, total)
+        batch = cells[start:end]
+
+        print(f"[AOI] processing batch {i+1}/{batches} ({start}-{end})")
+
+        features = [
+            ee.Feature(
+                ee.Geometry.Rectangle(
+                    [c["minLon"], c["minLat"], c["maxLon"], c["maxLat"]]
+                ),
+                c,
+            )
+            for c in batch
+        ]
+
+        fc = ee.FeatureCollection(features)
+
+        def add_land(f):
+            frac = land_mask.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=f.geometry(),
+                scale=1000,
+                maxPixels=1e9,
+            ).get("discrete_classification")
+
+            return f.set("land_frac", frac)
+
+        fc = fc.map(add_land)
+        fc = fc.filter(ee.Filter.gt("land_frac", 0))
+
+        batch_result = fc.getInfo()["features"]
+        valid.extend(batch_result)
+
+        print(f"[AOI] batch {i+1}/{batches} → valid so far: {len(valid)}")
+
+    return valid
 
 
 def process_batch(_land, _esa_veg, _gain_mask, batch):
+    batch = [a.get("properties", a) if isinstance(a, dict) else a for a in batch]
     features = [
         ee.Feature(
             ee.Geometry.Rectangle([a["minLon"], a["minLat"], a["maxLon"], a["maxLat"]]),
@@ -305,22 +339,79 @@ def process_batch(_land, _esa_veg, _gain_mask, batch):
     ]
 
     fc = ee.FeatureCollection(features)
-    fc_validated = fc.map(lambda f: aoi_is_valid(_land, _esa_veg, _gain_mask, f))
 
-    valid_fc = fc_validated.filter(ee.Filter.gt("valid", 0))
-    rejected_fc = fc_validated.filter(ee.Filter.eq("valid", 0))
+    # Stage 1: land check (cheapest — vector op, no pixel reduction)
+    def add_land(f):
+        lf = land_fraction(_land, f.geometry())
+        return f.set("land_frac", lf, "has_land", lf.gte(MIN_LAND_FRACTION))
 
-    def decode_reason(features):
-        for f in features:
-            props = f["properties"]
-            props["rejection_reason"] = rejection_reason_str(
-                int(round(props.get("rejection_reason", 0)))
-            )
-        return features
+    fc = fc.map(add_land)
+    has_land_fc = fc.filter(ee.Filter.eq("has_land", 1))
+    no_land_fc = fc.filter(ee.Filter.eq("has_land", 0))
+
+    # Stage 2: vegetation check (single raster reduction, 1km scale)
+    def add_veg(f):
+        vf = safe_num(
+            _esa_veg.reduceRegion(
+                ee.Reducer.mean(), geometry=f.geometry(), scale=1000, maxPixels=1e9
+            ).get("esa_veg"),
+            0,
+        )
+        return f.set("veg_fraction", vf, "has_veg", vf.gte(MIN_VEG_FRACTION))
+
+    has_land_fc = has_land_fc.map(add_veg)
+    has_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 1))
+    no_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 0))
+
+    # Stage 3: forest gain check (30m reduction — expensive but eliminates many cells)
+    def add_gain(f):
+        fg = forest_gain_fraction_umd(_gain_mask, f.geometry())
+        return f.set("forest_gain_frac", fg, "has_gain", fg.gte(MIN_GAIN_FRACTION))
+
+    has_veg_fc = has_veg_fc.map(add_gain)
+    has_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 1))
+    no_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 0))
+
+    # Stage 4: S2 check (most expensive — only run on cells that passed everything else)
+    def add_s2(f):
+        geom = f.geometry()
+        has_s2 = has_usable_s2(geom)
+        return f.set("has_s2", has_s2)
+
+    has_gain_fc = has_gain_fc.map(add_s2)
+    valid_fc = has_gain_fc.filter(ee.Filter.eq("has_s2", 1))
+    no_s2_fc = has_gain_fc.filter(ee.Filter.eq("has_s2", 0))
+
+    no_land_fc = no_land_fc.map(
+        lambda f: f.set(
+            "rejection_reason",
+            "no_land",
+            "valid",
+            0,
+            "veg_fraction",
+            0,
+            "forest_gain_frac",
+            0,
+        )
+    )
+    no_veg_fc = no_veg_fc.map(
+        lambda f: f.set(
+            "rejection_reason", "insufficient_veg", "valid", 0, "forest_gain_frac", 0
+        )
+    )
+    no_gain_fc = no_gain_fc.map(
+        lambda f: f.set("rejection_reason", "no_forest_gain", "valid", 0)
+    )
+    no_s2_fc = no_s2_fc.map(
+        lambda f: f.set("rejection_reason", "missing_s2", "valid", 0)
+    )
+    valid_fc = valid_fc.map(lambda f: f.set("rejection_reason", "valid", "valid", 1))
+
+    all_rejected = no_land_fc.merge(no_veg_fc).merge(no_gain_fc).merge(no_s2_fc)
 
     return (
-        decode_reason(valid_fc.getInfo()["features"]),
-        decode_reason(rejected_fc.getInfo()["features"]),
+        valid_fc.getInfo()["features"],
+        all_rejected.getInfo()["features"],
     )
 
 
@@ -364,7 +455,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 def _worker(batch_queue, result_queue, worker_id):
     _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     _credentials = ee.ServiceAccountCredentials(None, _creds_path)
-    time.sleep(worker_id * 3)
+    time.sleep(worker_id * 5)
     ee.Initialize(_credentials, project=GEE_PROJECT)
 
     _land, _esa_veg, _gain_mask = _build_gee_datasets()
@@ -404,7 +495,12 @@ def _worker(batch_queue, result_queue, worker_id):
             result_queue.put(("error", batch_idx, "exhausted retries"))
 
 
-def _writer(result_queue, total_batches):
+def _writer(
+    result_queue,
+    total_batches,
+    loaded_valid,
+    loaded_rejected,
+):
     valid_aois = []
     rejected_aois = []
 
@@ -417,7 +513,6 @@ def _writer(result_queue, total_batches):
 
         except Exception:
             logger.warning(f"Result queue timeout ({done}/{total_batches})")
-
             continue
 
         msg_type = msg[0]
@@ -426,7 +521,6 @@ def _writer(result_queue, total_batches):
             _, batch_idx, valid, rejected = msg
 
             valid_aois.extend([f["properties"] for f in valid])
-
             rejected_aois.extend([f["properties"] for f in rejected])
 
             done += 1
@@ -442,13 +536,12 @@ def _writer(result_queue, total_batches):
             atomic_json_write(
                 CHECKPOINT,
                 {
-                    "valid": valid_aois,
-                    "rejected": rejected_aois,
+                    "valid": loaded_valid + valid_aois,
+                    "rejected": loaded_rejected + rejected_aois,
                 },
             )
 
             elapsed = (time.time() - t0) / 60
-
             rate = done / elapsed if elapsed > 0 else 0
 
             logger.info(
@@ -458,19 +551,31 @@ def _writer(result_queue, total_batches):
                 f"{elapsed:.1f}min elapsed"
             )
 
-    atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
+    atomic_json_write(
+        OUTPUT_FILE,
+        loaded_valid + valid_aois,
+        indent=2,
+    )
 
-    atomic_json_write(REJECTED_OUTPUT_FILE, rejected_aois, indent=2)
-
-    logger.info(f"✓ Final output: {len(valid_aois)} valid AOIs → {OUTPUT_FILE}")
+    atomic_json_write(
+        REJECTED_OUTPUT_FILE,
+        loaded_rejected + rejected_aois,
+        indent=2,
+    )
 
     logger.info(
-        f"✓ Rejected output: {len(rejected_aois)} rejected AOIs → "
+        f"✓ Final output: "
+        f"{len(loaded_valid) + len(valid_aois)} valid AOIs → {OUTPUT_FILE}"
+    )
+
+    logger.info(
+        f"✓ Rejected output: "
+        f"{len(loaded_rejected) + len(rejected_aois)} rejected AOIs → "
         f"{REJECTED_OUTPUT_FILE}"
     )
 
 
-def run_hpc(remaining):
+def run_hpc(remaining, loaded_valid, loaded_rejected):
     batches = [
         remaining[i : i + BATCH_SIZE] for i in range(0, len(remaining), BATCH_SIZE)
     ]
@@ -491,7 +596,12 @@ def run_hpc(remaining):
 
     writer_thread = threading.Thread(
         target=_writer,
-        args=(result_queue, len(batches)),
+        args=(
+            result_queue,
+            len(batches),
+            loaded_valid,
+            loaded_rejected,
+        ),
         daemon=False,
     )
 
@@ -540,7 +650,15 @@ def print_summary(valid_aois, rejected_aois):
 
 
 if __name__ == "__main__":
-    all_aois = generate_global_aois()
+    if AOI_LIST_CACHE.exists():
+        with open(AOI_LIST_CACHE) as f:
+            all_aois = json.load(f)
+        logger.info(f"Loaded {len(all_aois)} AOIs from cache")
+    else:
+        logger.info("Generating AOI list — this may take a while...")
+        all_aois = generate_global_aois()
+        atomic_json_write(AOI_LIST_CACHE, all_aois)
+        logger.info(f"Cached {len(all_aois)} land cells → {AOI_LIST_CACHE}")
 
     logger.info(f"Total {AOI_STEP}° cells: {len(all_aois)}")
 
@@ -578,7 +696,7 @@ if __name__ == "__main__":
     if USE_HPC:
         logger.info(f"Mode: HPC | workers={NUM_WORKERS} | batch_size={BATCH_SIZE}")
 
-        run_hpc(remaining)
+        run_hpc(remaining, loaded_valid, loaded_rejected)
 
         try:
             with open(OUTPUT_FILE) as f:
