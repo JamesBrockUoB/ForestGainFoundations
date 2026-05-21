@@ -96,14 +96,8 @@ logger.info(f"GEE initialised | project={GEE_PROJECT} | HPC={USE_HPC}")
 
 
 def _build_gee_datasets():
-    """
-    Construct all GEE dataset objects needed for AOI validation.
-
-    Called in the main process (for local mode) and at the start of each
-    worker (for HPC mode) after ee.Initialize(), so that no GEE objects are
-    ever pickled and sent across the fork boundary.
-    """
-    _land = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+    _land_fc = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+    _land_raster = ee.Image(0).paint(_land_fc, 1).unmask(0).rename("land")
 
     _esa_wc = ee.Image("ESA/WorldCover/v100/2020")
     _esa_trees = _esa_wc.eq(10).unmask(0)
@@ -120,7 +114,7 @@ def _build_gee_datasets():
     _tree_2020 = _glulc_2020.remap(_tree_classes, _ones, 0)
     _gain_mask = _tree_2020.And(_tree_2015.Not()).select([0]).rename("gain").unmask(0)
 
-    return _land, _esa_veg, _gain_mask
+    return _land_raster, _esa_veg, _gain_mask
 
 
 def safe_num(val, default=0):
@@ -140,36 +134,24 @@ def atomic_json_write(path, obj, indent=None):
     tmp.replace(path)
 
 
-def land_fraction(_land, geom, scale=1000):
+def land_fraction(_land_raster, geom, scale=1000):
+    val = _land_raster.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geom,
+        scale=scale,
+        maxPixels=1e9,
+    ).get("land")
 
-    land_fc = _land.filterBounds(geom)
-
-    def compute():
-        land_geom = land_fc.geometry()
-
-        return (
-            ee.Image.constant(1)
-            .clip(land_geom)
-            .reduceRegion(
-                reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
-            )
-            .get("constant")
-        )
-
-    return ee.Number(ee.Algorithms.If(land_fc.size().gt(0), compute(), 0))
+    return safe_num(val, 0)
 
 
 def mask_s2_scl(img):
     scl = img.select("SCL")
-
     mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10)).And(scl.neq(0))
-
     return img.updateMask(mask)
 
 
 def has_usable_s2(geom):
-    """Returns a boolean on whether s2 imagery for an AOI is usable"""
-
     def year_frac(start, end):
         bands = [
             "B1",
@@ -328,7 +310,7 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
     return valid
 
 
-def process_batch(_land, _esa_veg, _gain_mask, batch):
+def process_batch(_land_raster, _esa_veg, _gain_mask, batch):
     batch = [a.get("properties", a) if isinstance(a, dict) else a for a in batch]
     features = [
         ee.Feature(
@@ -340,16 +322,14 @@ def process_batch(_land, _esa_veg, _gain_mask, batch):
 
     fc = ee.FeatureCollection(features)
 
-    # Stage 1: land check (cheapest — vector op, no pixel reduction)
     def add_land(f):
-        lf = land_fraction(_land, f.geometry())
+        lf = land_fraction(_land_raster, f.geometry())
         return f.set("land_frac", lf, "has_land", lf.gte(MIN_LAND_FRACTION))
 
     fc = fc.map(add_land)
     has_land_fc = fc.filter(ee.Filter.eq("has_land", 1))
     no_land_fc = fc.filter(ee.Filter.eq("has_land", 0))
 
-    # Stage 2: vegetation check (single raster reduction, 1km scale)
     def add_veg(f):
         vf = safe_num(
             _esa_veg.reduceRegion(
@@ -363,7 +343,6 @@ def process_batch(_land, _esa_veg, _gain_mask, batch):
     has_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 1))
     no_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 0))
 
-    # Stage 3: forest gain check (30m reduction — expensive but eliminates many cells)
     def add_gain(f):
         fg = forest_gain_fraction_umd(_gain_mask, f.geometry())
         return f.set("forest_gain_frac", fg, "has_gain", fg.gte(MIN_GAIN_FRACTION))
@@ -372,11 +351,8 @@ def process_batch(_land, _esa_veg, _gain_mask, batch):
     has_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 1))
     no_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 0))
 
-    # Stage 4: S2 check (most expensive — only run on cells that passed everything else)
     def add_s2(f):
-        geom = f.geometry()
-        has_s2 = has_usable_s2(geom)
-        return f.set("has_s2", has_s2)
+        return f.set("has_s2", has_usable_s2(f.geometry()))
 
     has_gain_fc = has_gain_fc.map(add_s2)
     valid_fc = has_gain_fc.filter(ee.Filter.eq("has_s2", 1))
@@ -396,7 +372,12 @@ def process_batch(_land, _esa_veg, _gain_mask, batch):
     )
     no_veg_fc = no_veg_fc.map(
         lambda f: f.set(
-            "rejection_reason", "insufficient_veg", "valid", 0, "forest_gain_frac", 0
+            "rejection_reason",
+            "insufficient_veg",
+            "valid",
+            0,
+            "forest_gain_frac",
+            0,
         )
     )
     no_gain_fc = no_gain_fc.map(
@@ -409,14 +390,17 @@ def process_batch(_land, _esa_veg, _gain_mask, batch):
 
     all_rejected = no_land_fc.merge(no_veg_fc).merge(no_gain_fc).merge(no_s2_fc)
 
-    return (
-        valid_fc.getInfo()["features"],
-        all_rejected.getInfo()["features"],
-    )
+    all_fc = valid_fc.merge(all_rejected)
+    all_results = all_fc.getInfo()["features"]
+
+    valid_out = [f for f in all_results if f["properties"].get("valid") == 1]
+    rejected_out = [f for f in all_results if f["properties"].get("valid") == 0]
+
+    return valid_out, rejected_out
 
 
 def run_local(remaining, loaded_valid, loaded_rejected):
-    _land, _esa_veg, _gain_mask = _build_gee_datasets()
+    _land_raster, _esa_veg, _gain_mask = _build_gee_datasets()
 
     valid_aois = []
     rejected_aois = []
@@ -426,7 +410,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
         try:
             valid_batch, rejected_batch = process_batch(
-                _land, _esa_veg, _gain_mask, batch
+                _land_raster, _esa_veg, _gain_mask, batch
             )
             valid_aois.extend([f["properties"] for f in valid_batch])
             rejected_aois.extend([f["properties"] for f in rejected_batch])
@@ -458,7 +442,7 @@ def _worker(batch_queue, result_queue, worker_id):
     time.sleep(worker_id * 5)
     ee.Initialize(_credentials, project=GEE_PROJECT)
 
-    _land, _esa_veg, _gain_mask = _build_gee_datasets()
+    _land_raster, _esa_veg, _gain_mask = _build_gee_datasets()
 
     while True:
         item = batch_queue.get()
@@ -470,7 +454,9 @@ def _worker(batch_queue, result_queue, worker_id):
 
         for attempt in range(5):
             try:
-                valid, rejected = process_batch(_land, _esa_veg, _gain_mask, batch)
+                valid, rejected = process_batch(
+                    _land_raster, _esa_veg, _gain_mask, batch
+                )
                 result_queue.put(("batch_result", batch_idx, valid, rejected))
                 break
             except Exception as e:
