@@ -465,6 +465,7 @@ def _worker(batch_queue, result_queue, worker_id):
                     "429" in err
                     or "concurrent" in err.lower()
                     or "quota" in err.lower()
+                    or "memory" in err.lower()
                 ):
                     wait = (2**attempt) + random.uniform(0, 2)
                     logger.warning(
@@ -671,7 +672,12 @@ if __name__ == "__main__":
             f"{len(loaded_rejected)} rejected, "
             f"{len(remaining)} remaining"
         )
-
+    elif OUTPUT_FILE.exists():
+        with open(OUTPUT_FILE) as f:
+            loaded_valid = json.load(f)
+        loaded_rejected = []
+        already_done = {a["id"] for a in loaded_valid}
+        remaining = [a for a in all_aois if a["id"] not in already_done]
     else:
         remaining = all_aois
         loaded_valid = []
@@ -681,38 +687,21 @@ if __name__ == "__main__":
 
     if USE_HPC:
         logger.info(f"Mode: HPC | workers={NUM_WORKERS} | batch_size={BATCH_SIZE}")
-
-        run_hpc(remaining, loaded_valid, loaded_rejected)
-
-        try:
-            with open(OUTPUT_FILE) as f:
-                new_valid = json.load(f)
-        except Exception:
-            new_valid = []
-
-        valid_aois = loaded_valid + new_valid
-        atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
-
-        try:
-            if REJECTED_OUTPUT_FILE.exists():
-                with open(REJECTED_OUTPUT_FILE) as f:
-                    new_rejected = json.load(f)
-            else:
-                new_rejected = []
-        except Exception:
-            new_rejected = []
-
-        rejected_aois = loaded_rejected + new_rejected
-        atomic_json_write(REJECTED_OUTPUT_FILE, rejected_aois, indent=2)
+        new_valid, new_rejected = run_hpc(remaining, loaded_valid, loaded_rejected)
 
     else:
         logger.info(f"Mode: local | batch_size={BATCH_SIZE}")
-
         new_valid, new_rejected = run_local(remaining, loaded_valid, loaded_rejected)
 
-        valid_aois = loaded_valid + new_valid
-        rejected_aois = loaded_rejected + new_rejected
+    valid_aois = loaded_valid + new_valid
+    rejected_aois = loaded_rejected + new_rejected
 
-        atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
+    atomic_json_write(OUTPUT_FILE, valid_aois, indent=2)
+    atomic_json_write(REJECTED_OUTPUT_FILE, rejected_aois, indent=2)
+
+    logger.info(f"✓ Final output: {len(valid_aois)} valid AOIs → {OUTPUT_FILE}")
+    logger.info(
+        f"✓ Rejected output: {len(rejected_aois)} rejected AOIs → {REJECTED_OUTPUT_FILE}"
+    )
 
     print_summary(valid_aois, rejected_aois)
