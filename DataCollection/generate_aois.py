@@ -487,6 +487,7 @@ def _writer(
     total_batches,
     loaded_valid,
     loaded_rejected,
+    out,
 ):
     valid_aois = []
     rejected_aois = []
@@ -561,6 +562,9 @@ def _writer(
         f"{REJECTED_OUTPUT_FILE}"
     )
 
+    out["valid"] = valid_aois
+    out["rejected"] = rejected_aois
+
 
 def run_hpc(remaining, loaded_valid, loaded_rejected):
     batches = [
@@ -569,6 +573,9 @@ def run_hpc(remaining, loaded_valid, loaded_rejected):
 
     batch_queue = mp.Queue()
     result_queue = mp.Queue()
+
+    manager = mp.Manager()
+    out_dict = manager.dict()
 
     workers = [
         mp.Process(
@@ -583,12 +590,7 @@ def run_hpc(remaining, loaded_valid, loaded_rejected):
 
     writer_thread = threading.Thread(
         target=_writer,
-        args=(
-            result_queue,
-            len(batches),
-            loaded_valid,
-            loaded_rejected,
-        ),
+        args=(result_queue, len(batches), loaded_valid, loaded_rejected, out_dict),
         daemon=False,
     )
 
@@ -608,6 +610,11 @@ def run_hpc(remaining, loaded_valid, loaded_rejected):
         w.join()
 
     writer_thread.join()
+
+    return (
+        list(out_dict.get("valid", [])),
+        list(out_dict.get("rejected", [])),
+    )
 
 
 def print_summary(valid_aois, rejected_aois):
