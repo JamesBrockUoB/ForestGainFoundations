@@ -654,6 +654,8 @@ if __name__ == "__main__":
         atomic_json_write(AOI_LIST_CACHE, all_aois)
         logger.info(f"Cached {len(all_aois)} land cells → {AOI_LIST_CACHE}")
 
+    all_aois = [a.get("properties", a) for a in all_aois]
+
     logger.info(f"Total {AOI_STEP}° cells: {len(all_aois)}")
 
     if CHECKPOINT.exists():
