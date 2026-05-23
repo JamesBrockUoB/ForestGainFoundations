@@ -452,12 +452,13 @@ def _worker(batch_queue, result_queue, worker_id):
 
         batch_idx, batch = item
 
-        for attempt in range(5):
+        for attempt in range(8):
             try:
                 valid, rejected = process_batch(
                     _land_raster, _esa_veg, _gain_mask, batch
                 )
                 result_queue.put(("batch_result", batch_idx, valid, rejected))
+                time.sleep(random.uniform(1, 3))
                 break
             except Exception as e:
                 err = str(e)
@@ -497,7 +498,7 @@ def _writer(
 
     while done < total_batches:
         try:
-            msg = result_queue.get(timeout=300)
+            msg = result_queue.get(timeout=600)
 
         except Exception:
             logger.warning(f"Result queue timeout ({done}/{total_batches})")
