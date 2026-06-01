@@ -348,25 +348,33 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     fc = fc.map(add_geometry_metadata)
 
     def add_ecoregion_metadata(f):
-        geom = f.geometry()
+        centroid = f.geometry().centroid(1)
 
-        # all overlapping ecoregions
-        candidates = _ecoregions.filterBounds(geom)
+        eco = ee.Feature(_ecoregions.filterBounds(centroid).sort("ECO_ID").first())
 
-        def with_area(eco):
-            intersection = eco.geometry().intersection(geom, maxError=100)
+        biome_name = ee.String(
+            ee.Algorithms.If(
+                eco,
+                ee.Feature(eco).get("BIOME_NAME"),
+                "Unknown",
+            )
+        )
 
-            return eco.set("_intersect_area", intersection.area(maxError=100))
+        biome_num = ee.Number(
+            ee.Algorithms.If(
+                eco,
+                ee.Feature(eco).get("BIOME_NUM"),
+                -1,
+            )
+        )
 
-        candidates = candidates.map(with_area)
-
-        dominant = ee.Feature(candidates.sort("_intersect_area", False).first())
-
-        biome_name = ee.Algorithms.If(dominant, dominant.get("BIOME_NAME"), "Unknown")
-
-        biome_num = ee.Algorithms.If(dominant, dominant.get("BIOME_NUM"), -1)
-
-        region = ee.Algorithms.If(dominant, dominant.get("REALM"), "Unknown")
+        region = ee.String(
+            ee.Algorithms.If(
+                eco,
+                ee.Feature(eco).get("REALM"),
+                "Unknown",
+            )
+        )
 
         return f.set(
             "biome_name",
@@ -401,28 +409,8 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     no_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 0))
 
     def add_gain(f):
-        fg = forest_gain_fraction_umd(
-            _gain_mask,
-            f.geometry(),
-        )
-
-        area_km2 = ee.Number(f.get("aoi_area_km2"))
-
-        gain_area_km2 = fg.multiply(area_km2)
-
-        # 30m x 30m pixels = 900 m²
-        gain_pixels = gain_area_km2.multiply(1e6).divide(900)
-
-        return f.set(
-            "forest_gain_frac",
-            fg,
-            "forest_gain_area_km2",
-            gain_area_km2,
-            "forest_gain_pixels",
-            gain_pixels,
-            "has_gain",
-            fg.gte(MIN_GAIN_FRACTION),
-        )
+        fg = forest_gain_fraction_umd(_gain_mask, f.geometry())
+        return f.set("forest_gain_frac", fg, "has_gain", fg.gte(MIN_GAIN_FRACTION))
 
     has_veg_fc = has_veg_fc.map(add_gain)
     has_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 1))
