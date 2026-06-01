@@ -114,7 +114,9 @@ def _build_gee_datasets():
     _tree_2020 = _glulc_2020.remap(_tree_classes, _ones, 0)
     _gain_mask = _tree_2020.And(_tree_2015.Not()).select([0]).rename("gain").unmask(0)
 
-    return _land_raster, _esa_veg, _gain_mask
+    _ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
+
+    return _land_raster, _esa_veg, _gain_mask, _ecoregions
 
 
 def safe_num(val, default=0):
@@ -310,7 +312,7 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
     return valid
 
 
-def process_batch(_land_raster, _esa_veg, _gain_mask, batch):
+def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     batch = [a.get("properties", a) if isinstance(a, dict) else a for a in batch]
     features = [
         ee.Feature(
@@ -321,6 +323,61 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, batch):
     ]
 
     fc = ee.FeatureCollection(features)
+
+    def add_geometry_metadata(f):
+        geom = f.geometry()
+
+        area_km2 = geom.area().divide(1e6)
+
+        centroid = geom.centroid(1)
+
+        coords = ee.List(centroid.coordinates())
+
+        lon = ee.Number(coords.get(0))
+        lat = ee.Number(coords.get(1))
+
+        return f.set(
+            "aoi_area_km2",
+            area_km2,
+            "centroid_lon",
+            lon,
+            "centroid_lat",
+            lat,
+        )
+
+    fc = fc.map(add_geometry_metadata)
+
+    def add_ecoregion_metadata(f):
+        geom = f.geometry()
+
+        # all overlapping ecoregions
+        candidates = _ecoregions.filterBounds(geom)
+
+        def with_area(eco):
+            intersection = eco.geometry().intersection(geom, maxError=100)
+
+            return eco.set("_intersect_area", intersection.area(maxError=100))
+
+        candidates = candidates.map(with_area)
+
+        dominant = ee.Feature(candidates.sort("_intersect_area", False).first())
+
+        biome_name = ee.Algorithms.If(dominant, dominant.get("BIOME_NAME"), "Unknown")
+
+        biome_num = ee.Algorithms.If(dominant, dominant.get("BIOME_NUM"), -1)
+
+        region = ee.Algorithms.If(dominant, dominant.get("REALM"), "Unknown")
+
+        return f.set(
+            "biome_name",
+            biome_name,
+            "biome_num",
+            biome_num,
+            "region",
+            region,
+        )
+
+    fc = fc.map(add_ecoregion_metadata)
 
     def add_land(f):
         lf = land_fraction(_land_raster, f.geometry())
@@ -344,8 +401,28 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, batch):
     no_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 0))
 
     def add_gain(f):
-        fg = forest_gain_fraction_umd(_gain_mask, f.geometry())
-        return f.set("forest_gain_frac", fg, "has_gain", fg.gte(MIN_GAIN_FRACTION))
+        fg = forest_gain_fraction_umd(
+            _gain_mask,
+            f.geometry(),
+        )
+
+        area_km2 = ee.Number(f.get("aoi_area_km2"))
+
+        gain_area_km2 = fg.multiply(area_km2)
+
+        # 30m x 30m pixels = 900 m²
+        gain_pixels = gain_area_km2.multiply(1e6).divide(900)
+
+        return f.set(
+            "forest_gain_frac",
+            fg,
+            "forest_gain_area_km2",
+            gain_area_km2,
+            "forest_gain_pixels",
+            gain_pixels,
+            "has_gain",
+            fg.gte(MIN_GAIN_FRACTION),
+        )
 
     has_veg_fc = has_veg_fc.map(add_gain)
     has_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 1))
@@ -400,7 +477,7 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, batch):
 
 
 def run_local(remaining, loaded_valid, loaded_rejected):
-    _land_raster, _esa_veg, _gain_mask = _build_gee_datasets()
+    _land_raster, _esa_veg, _gain_mask, _ecoregions = _build_gee_datasets()
 
     valid_aois = []
     rejected_aois = []
@@ -410,7 +487,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
         try:
             valid_batch, rejected_batch = process_batch(
-                _land_raster, _esa_veg, _gain_mask, batch
+                _land_raster, _esa_veg, _gain_mask, _ecoregions, batch
             )
             valid_aois.extend([f["properties"] for f in valid_batch])
             rejected_aois.extend([f["properties"] for f in rejected_batch])
@@ -442,7 +519,7 @@ def _worker(batch_queue, result_queue, worker_id):
     time.sleep(worker_id * 5)
     ee.Initialize(_credentials, project=GEE_PROJECT)
 
-    _land_raster, _esa_veg, _gain_mask = _build_gee_datasets()
+    _land_raster, _esa_veg, _gain_mask, _ecoregions = _build_gee_datasets()
 
     while True:
         item = batch_queue.get()
@@ -455,7 +532,7 @@ def _worker(batch_queue, result_queue, worker_id):
         for attempt in range(8):
             try:
                 valid, rejected = process_batch(
-                    _land_raster, _esa_veg, _gain_mask, batch
+                    _land_raster, _esa_veg, _gain_mask, _ecoregions, batch
                 )
                 result_queue.put(("batch_result", batch_idx, valid, rejected))
                 time.sleep(random.uniform(1, 3))
