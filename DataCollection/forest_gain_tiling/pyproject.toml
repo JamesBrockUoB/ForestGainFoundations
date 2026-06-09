@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "forest-gain"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "earthengine-api",
+    "python-dotenv",
+    "tqdm",
+]
+
+[project.scripts]
+forest-gain = "forest_gain_tiling.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forest_gain_tiling*"]
