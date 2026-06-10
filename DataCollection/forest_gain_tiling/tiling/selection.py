@@ -1,83 +1,96 @@
+"""Tile selection and filtering with streaming support."""
+
 from __future__ import annotations
 
 import logging
-from collections import Counter, defaultdict
+import random
+from collections import Counter
 from typing import Any
+
+from enums import TileStatus
+from registry.store import iter_tiles
 
 
 def filter_candidates(
-    registry: dict[str, Any],
-    target_status: str,
-    *,
+    status: str,
     aoi_id: str | None = None,
     biome: str | None = None,
     region: str | None = None,
     logger: logging.Logger | None = None,
-) -> list[dict]:
-    candidates = [e for e in registry.values() if e["status"] == target_status]
+) -> list[dict[str, Any]]:
+    """
+    Stream and filter candidate tiles from database.
+    Returns list after applying all filters (for compatibility with stratified_sample).
+    Never materializes the entire grid - only the filtered results.
+    """
+    candidates = []
 
-    if aoi_id:
-        candidates = [e for e in candidates if aoi_id in e.get("aoi_ids", [])]
-        if logger:
-            logger.info(f"Filtered to AOI {aoi_id}: {len(candidates):,} tiles")
+    for tile in iter_tiles(status=status):
+        # Filter by aoi_id
+        if aoi_id and aoi_id not in tile.get("aoi_ids", []):
+            continue
 
-    if biome:
-        candidates = [
-            e for e in candidates if biome.lower() in e.get("biome", "").lower()
-        ]
-        if logger:
-            logger.info(f"Filtered to biome '{biome}': {len(candidates):,} tiles")
+        # Filter by biome (case-insensitive substring)
+        if biome and biome.lower() not in tile.get("biome", "").lower():
+            continue
 
-    if region:
-        candidates = [
-            e for e in candidates if region.lower() in e.get("region", "").lower()
-        ]
-        if logger:
-            logger.info(f"Filtered to region '{region}': {len(candidates):,} tiles")
+        # Filter by region (case-insensitive substring)
+        if region and region.lower() not in tile.get("region", "").lower():
+            continue
+
+        candidates.append(tile)
+
+    if logger:
+        logger.info(f"Found {len(candidates):,} candidate tiles after filtering")
 
     return candidates
 
 
 def stratified_sample(
     candidates: list[dict],
-    key: str,
+    stratify_key: str,
     limit: int,
     mode: str = "prop",
 ) -> list[dict]:
-    buckets: dict[str, list[dict]] = defaultdict(list)
+    """
+    Stratified sampling from candidates.
+    mode='prop': sample proportionally by stratum
+    mode='equal': equal count from each stratum
+    """
+    # Group by stratum
+    strata: dict[str, list[dict]] = {}
     for tile in candidates:
-        buckets[tile.get(key, "Unknown")].append(tile)
+        key = tile.get(stratify_key, "Unknown")
+        if key not in strata:
+            strata[key] = []
+        strata[key].append(tile)
 
-    n_strata = len(buckets)
-    total = len(candidates)
+    sampled = []
 
     if mode == "equal":
-        base_alloc: dict[str, int] = {k: limit // n_strata for k in buckets}
-    else:
-        base_alloc = {k: int(limit * len(v) / total) for k, v in buckets.items()}
+        # Equal count per stratum
+        per_stratum = max(1, limit // len(strata))
+        for stratum_tiles in strata.values():
+            sampled.extend(
+                random.sample(stratum_tiles, min(per_stratum, len(stratum_tiles)))
+            )
+    else:  # mode == "prop"
+        # Proportional sampling
+        for stratum_tiles in strata.values():
+            stratum_count = int(limit * len(stratum_tiles) / len(candidates))
+            stratum_count = max(1, stratum_count)
+            sampled.extend(
+                random.sample(stratum_tiles, min(stratum_count, len(stratum_tiles)))
+            )
 
-    allocated = sum(base_alloc.values())
-    remainder = limit - allocated
-    for k in sorted(buckets, key=lambda k: -len(buckets[k])):
-        if remainder <= 0:
-            break
-        base_alloc[k] += 1
-        remainder -= 1
-
-    sampled: list[dict] = []
-    for k, alloc in base_alloc.items():
-        sampled.extend(buckets[k][:alloc])
-
-    return sampled
+    return sampled[:limit]
 
 
 def log_strata_counts(
     candidates: list[dict], key: str, logger: logging.Logger, mode: str
 ) -> None:
-    strata_counts = Counter(t.get(key, "Unknown") for t in candidates)
-    logger.info(
-        f"Stratified sample ({mode}) by {key}: "
-        f"{len(candidates):,} tiles across {len(strata_counts)} strata"
-    )
-    for stratum, n in strata_counts.most_common():
-        logger.info(f"  {stratum:<45} {n:>6,}")
+    """Log the stratified counts."""
+    counts = Counter(t.get(key, "Unknown") for t in candidates)
+    logger.info(f"Stratified sample ({mode} mode):")
+    for stratum, count in counts.most_common():
+        logger.info(f"  {stratum}: {count}")

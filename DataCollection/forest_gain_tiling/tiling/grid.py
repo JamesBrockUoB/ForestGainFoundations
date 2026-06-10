@@ -59,6 +59,12 @@ def crs_transform(tile: dict) -> list[float]:
 def build_global_grid(
     valid_aois: list[dict], logger: logging.Logger
 ) -> list[dict[str, Any]]:
+    """
+    Build global tile grid, skipping tiles already in database.
+    Returns only newly generated tiles (not in database yet).
+    """
+    from registry.store import load_registry_entry
+
     logger.info("Projecting AOI bounds to EPSG:3857…")
     aoi_bounds_m = [_aoi_to_3857(a) for a in valid_aois]
 
@@ -114,21 +120,30 @@ def build_global_grid(
         window[mask] = aoi_idx
 
     ri_arr, ci_arr = np.where(first_aoi >= 0)
-    logger.info(f"Assembling {len(ri_arr):,} retained tiles…")
+    logger.info(f"Assembling {len(ri_arr):,} candidate tiles…")
 
     x_mins = global_xmin + ci_arr * sz
     x_maxs = x_mins + sz
     y_mins = global_ymin + ri_arr * sz
     y_maxs = y_mins + sz
 
-    retained = []
-    for k in tqdm(range(len(ri_arr)), desc="Assembling tiles", unit="tile"):
+    new_tiles = []
+    skipped = 0
+
+    for k in tqdm(range(len(ri_arr)), desc="Checking tiles", unit="tile"):
         primary = valid_aois[first_aoi[ri_arr[k], ci_arr[k]]]
         xi = round(x_mins[k] / sz)
         yi = round(y_mins[k] / sz)
-        retained.append(
+        tile_id = f"tile_{xi}_{yi}"
+
+        # Check if already in database
+        if load_registry_entry(tile_id) is not None:
+            skipped += 1
+            continue
+
+        new_tiles.append(
             {
-                "tile_id": f"tile_{xi}_{yi}",
+                "tile_id": tile_id,
                 "xi": xi,
                 "yi": yi,
                 "x_min_m": float(x_mins[k]),
@@ -151,11 +166,12 @@ def build_global_grid(
             }
         )
 
-    logger.info(f"Retained {len(retained):,} tiles")
-    return retained
+    logger.info(f"Found {len(new_tiles):,} new tiles, {skipped:,} already in database")
+    return new_tiles
 
 
 def plan_summary(tiles: list[dict]) -> str:
+    """Generate summary statistics from tile list."""
     biome_counts = Counter(t["biome"] for t in tiles)
     region_counts = Counter(t["region"] for t in tiles)
     sz = settings.tile_size_m
@@ -165,17 +181,17 @@ def plan_summary(tiles: list[dict]) -> str:
         "═" * 60,
         "  TILE PLAN SUMMARY",
         "═" * 60,
-        f"  Total tiles : {len(tiles):>10,}",
-        f"  Grid size   : {sz:.0f} m x {sz:.0f} m  ({settings.tile_pixels}x{settings.tile_pixels} px @ {settings.scale} m/px)",
-        f"  CRS         : {settings.crs}",
-        f"  Min overlap : {settings.min_aoi_overlap_frac*100:.0f}% of tile inside a single AOI",
+        f"  Total new tiles : {len(tiles):>10,}",
+        f"  Grid size       : {sz:.0f} m x {sz:.0f} m  ({settings.tile_pixels}x{settings.tile_pixels} px @ {settings.scale} m/px)",
+        f"  CRS             : {settings.crs}",
+        f"  Min overlap     : {settings.min_aoi_overlap_frac*100:.0f}% of tile inside a single AOI",
         "",
         "  By biome:",
     ]
     for b, n in biome_counts.most_common():
-        lines.append(f"    {b:<45} {n:>8,}  ({100*n/len(tiles):5.1f}%)")
+        lines.append(f"    {b:<45} {n:>8,}  ({100*n/max(len(tiles),1):5.1f}%)")
     lines += ["", "  By region:"]
     for r, n in region_counts.most_common():
-        lines.append(f"    {r:<30} {n:>8,}  ({100*n/len(tiles):5.1f}%)")
+        lines.append(f"    {r:<30} {n:>8,}  ({100*n/max(len(tiles),1):5.1f}%)")
     lines += ["═" * 60, ""]
     return "\n".join(lines)

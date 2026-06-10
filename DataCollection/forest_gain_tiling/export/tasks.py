@@ -1,3 +1,5 @@
+"""Tile processing tasks with database persistence (no registry parameter)."""
+
 from __future__ import annotations
 
 import logging
@@ -10,21 +12,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 import ee
-
 from config import settings
 from datasets.registry import Datasets
 from enums import TileStatus
 from export.drive import rclone_to_hpc
-from stack.stacks import build_full_stack, build_full_valid
 from labels.gain import build_gain_layer
 from labels.viability import score_viability
-from registry.store import Registry, save_registry, update_tile
+from registry.store import update_tile
+from stack.stacks import build_full_stack, build_full_valid
 from tiling.grid import crs_transform, tile_geom
 
 
-def process_tile(
-    tile: dict[str, Any], registry: Registry, ds: Datasets, logger: logging.Logger
-) -> str:
+def process_tile(tile: dict[str, Any], ds: Datasets, logger: logging.Logger) -> str:
+    """Process a single tile, updating database directly (no registry dict)."""
     tile_id = tile["tile_id"]
     geom = tile_geom(tile)
     ct = crs_transform(tile)
@@ -51,9 +51,7 @@ def process_tile(
         if gain_pct < settings.gain_pct_min:
             reason = f"gain_pct={gain_pct:.3f} < {settings.gain_pct_min}"
             logger.info(f"reject (low gain {gain_pct:.2f}%): {tile_id}")
-            update_tile(
-                registry, tile_id, status=TileStatus.REJECTED, rejection_reason=reason
-            )
+            update_tile(tile_id, status=TileStatus.REJECTED, rejection_reason=reason)
             return str(TileStatus.REJECTED)
 
         viability = score_viability(geom, gain_validated, ds)
@@ -63,9 +61,7 @@ def process_tile(
         ):
             reason = f"viability={viability}"
             logger.info(f"reject (viability): {tile_id} {viability}")
-            update_tile(
-                registry, tile_id, status=TileStatus.REJECTED, rejection_reason=reason
-            )
+            update_tile(tile_id, status=TileStatus.REJECTED, rejection_reason=reason)
             return str(TileStatus.REJECTED)
 
         full_valid = build_full_valid(geom)
@@ -85,7 +81,6 @@ def process_tile(
         )
         task.start()
         update_tile(
-            registry,
             tile_id,
             status=TileStatus.SUBMITTED,
             gee_task_id=task.id,
@@ -93,17 +88,16 @@ def process_tile(
         )
         logger.info(f"submitted: {tile_id}  task={task.id}")
 
-        return _poll_task(task, tile_id, registry, logger)
+        return _poll_task(task, tile_id, logger)
 
     except Exception as exc:
         logger.error(f"error processing {tile_id}: {exc}")
-        update_tile(registry, tile_id, status=TileStatus.FAILED, error=str(exc))
+        update_tile(tile_id, status=TileStatus.FAILED, error=str(exc))
         return str(TileStatus.FAILED)
 
 
-def _poll_task(
-    task: ee.batch.Task, tile_id: str, registry: Registry, logger: logging.Logger
-) -> str:
+def _poll_task(task: ee.batch.Task, tile_id: str, logger: logging.Logger) -> str:
+    """Poll GEE task until completion."""
     while True:
         state = task.status()["state"]
 
@@ -111,7 +105,6 @@ def _poll_task(
             if settings.hpc_path:
                 rclone_to_hpc(tile_id, settings.hpc_path, logger)
             update_tile(
-                registry,
                 tile_id,
                 status=TileStatus.COMPLETE,
                 completed_at=datetime.now(timezone.utc).isoformat(),
@@ -121,35 +114,32 @@ def _poll_task(
         if state == "FAILED":
             err = task.status().get("error_message", "unknown")
             logger.error(f"GEE task failed: {tile_id} — {err}")
-            update_tile(registry, tile_id, status=TileStatus.FAILED, error=err)
+            update_tile(tile_id, status=TileStatus.FAILED, error=err)
             return str(TileStatus.FAILED)
 
         if state in ("CANCELLED", "CANCEL_REQUESTED"):
-            update_tile(
-                registry, tile_id, status=TileStatus.FAILED, error="task cancelled"
-            )
+            update_tile(tile_id, status=TileStatus.FAILED, error="task cancelled")
             return str(TileStatus.FAILED)
 
         time.sleep(settings.poll_interval)
 
 
-def run_local(
-    candidates: list[dict], registry: Registry, ds: Datasets, logger: logging.Logger
-) -> None:
+def run_local(candidates: list[dict], ds: Datasets, logger: logging.Logger) -> None:
+    """Process tiles sequentially."""
     total = len(candidates)
     for i, tile in enumerate(candidates, 1):
         logger.info(f"Tile {i}/{total}: {tile['tile_id']}")
-        process_tile(tile, registry, ds, logger)
+        process_tile(tile, ds, logger)
         time.sleep(0.2)
 
 
 def _mp_worker(tile_queue: mp.Queue, result_queue: mp.Queue, worker_id: int) -> None:
+    """Worker process for HPC mode."""
     credentials = ee.ServiceAccountCredentials(None, settings.gee_credentials)
     time.sleep(worker_id * 5)
     ee.Initialize(credentials, project=settings.gee_project)
 
     ds = Datasets()
-    local_registry: Registry = {}
     logger = logging.getLogger(f"gee.worker.{worker_id}")
 
     while True:
@@ -158,13 +148,16 @@ def _mp_worker(tile_queue: mp.Queue, result_queue: mp.Queue, worker_id: int) -> 
             break
 
         tile_id = tile["tile_id"]
-        local_registry[tile_id] = dict(tile)
 
         for attempt in range(8):
-            status = process_tile(tile, local_registry, ds, logger)
+            status = process_tile(tile, ds, logger)
             if status != str(TileStatus.FAILED):
                 break
-            err = local_registry[tile_id].get("error", "")
+            # Retry on transient GEE errors
+            from registry.store import load_registry_entry
+
+            entry = load_registry_entry(tile_id)
+            err = entry.get("error", "") if entry else ""
             if any(k in err.lower() for k in ("429", "concurrent", "quota", "memory")):
                 wait = (2**attempt) + random.uniform(0, 2)
                 logger.warning(
@@ -176,45 +169,43 @@ def _mp_worker(tile_queue: mp.Queue, result_queue: mp.Queue, worker_id: int) -> 
         else:
             logger.error(f"Worker {worker_id} | {tile_id}: exhausted retries")
 
-        result_queue.put((tile_id, local_registry[tile_id]))
+        result_queue.put(tile_id)
 
 
-def _mp_writer(
-    result_queue: mp.Queue, total: int, registry: Registry, logger: logging.Logger
-) -> None:
+def _mp_writer(result_queue: mp.Queue, total: int, logger: logging.Logger) -> None:
+    """Writer thread to report progress."""
+    from registry.store import _get_db
+
+    db = _get_db()
     done = 0
     t0 = time.time()
 
     while done < total:
         try:
-            tile_id, entry = result_queue.get(timeout=600)
+            tile_id = result_queue.get(timeout=600)
         except Exception:
             logger.warning(f"Result queue timeout ({done}/{total})")
             continue
 
-        registry[tile_id] = entry
         done += 1
 
         if done % 20 == 0:
-            save_registry(registry)
             elapsed = (time.time() - t0) / 60
             rate = done / elapsed if elapsed > 0 else 0
-            counts = Counter(e["status"] for e in registry.values())
+            counts = db.status_counts()
             logger.info(
                 f"Progress {done}/{total} | "
-                f"complete={counts[str(TileStatus.COMPLETE)]} "
-                f"rejected={counts[str(TileStatus.REJECTED)]} "
-                f"failed={counts[str(TileStatus.FAILED)]} | "
+                f"complete={counts.get(str(TileStatus.COMPLETE), 0)} "
+                f"rejected={counts.get(str(TileStatus.REJECTED), 0)} "
+                f"failed={counts.get(str(TileStatus.FAILED), 0)} | "
                 f"{rate:.1f} tiles/min | {elapsed:.1f}min elapsed"
             )
 
-    save_registry(registry)
-    logger.info("Writer complete — registry flushed")
+    logger.info("Writer complete")
 
 
-def run_hpc(
-    candidates: list[dict], registry: Registry, ds: Datasets, logger: logging.Logger
-) -> None:
+def run_hpc(candidates: list[dict], ds: Datasets, logger: logging.Logger) -> None:
+    """Process tiles using HPC workers."""
     tile_queue: mp.Queue = mp.Queue()
     result_queue: mp.Queue = mp.Queue()
 
@@ -224,7 +215,7 @@ def run_hpc(
     ]
     writer_thread = threading.Thread(
         target=_mp_writer,
-        args=(result_queue, len(candidates), registry, logger),
+        args=(result_queue, len(candidates), logger),
         daemon=False,
     )
 

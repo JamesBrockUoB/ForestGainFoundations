@@ -28,8 +28,8 @@ class Settings:
     valid_aois_path: Path = field(
         default_factory=lambda: _DATA_DIR / "aois" / "valid_aois_enriched.json"
     )
-    registry_path: Path = field(
-        default_factory=lambda: _DATA_DIR / "tiles" / "tile_registry.json"
+    registry_db_path: Path = field(
+        default_factory=lambda: _DATA_DIR / "tiles" / "tile_registry.db"
     )
     aoi_audit_path: Path = field(
         default_factory=lambda: _DATA_DIR / "tiles" / "aoi_tile_audit.json"

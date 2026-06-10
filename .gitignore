@@ -3,6 +3,12 @@
 
 */data/forest_gain_wales
 
-*/logs
+**/logs/
 
 __pycache__/
+
+settings.json
+
+*.db
+
+*.db-journal

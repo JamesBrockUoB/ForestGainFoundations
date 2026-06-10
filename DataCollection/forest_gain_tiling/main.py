@@ -39,10 +39,10 @@ from export.tasks import run_hpc, run_local
 from registry.store import (
     audit_summary,
     build_aoi_audit,
-    load_registry,
+    iter_tiles,
     registry_summary,
     save_aoi_audit,
-    save_registry,
+    save_tile_entry,
 )
 from tiling.grid import build_global_grid, plan_summary
 from tiling.selection import (
@@ -81,6 +81,7 @@ def init_gee() -> Datasets:
 
 
 def cmd_plan(args: argparse.Namespace) -> None:
+    """Plan phase: generate tiles and add new ones to registry, resume from saved state."""
     logger = setup_logging("plan")
 
     logger.info(f"Loading valid AOIs from {settings.valid_aois_path}…")
@@ -88,24 +89,23 @@ def cmd_plan(args: argparse.Namespace) -> None:
         valid_aois = json.load(f)
     logger.info(f"  {len(valid_aois):,} valid AOIs")
 
+    logger.info("Building global grid…")
     tiles = build_global_grid(valid_aois, logger)
     print(plan_summary(tiles))
 
-    registry = load_registry()
+    logger.info(f"Adding {len(tiles):,} new tiles to registry…")
     new_count = 0
     for t in tiles:
-        if t["tile_id"] not in registry:
-            registry[t["tile_id"]] = t
+        if save_tile_entry(t):  # Returns True if newly inserted
             new_count += 1
 
-    settings.registry_path.parent.mkdir(parents=True, exist_ok=True)
-    save_registry(registry)
+    settings.registry_db_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(
-        f"Registry: {new_count:,} new tiles added, "
-        f"{len(tiles)-new_count:,} already existed → {settings.registry_path}"
+        f"Registry: {new_count:,} new tiles added → {settings.registry_db_path}"
     )
 
-    audit = build_aoi_audit(registry, valid_aois)
+    logger.info("Building AOI audit…")
+    audit = build_aoi_audit(valid_aois)
     settings.aoi_audit_path.parent.mkdir(parents=True, exist_ok=True)
     save_aoi_audit(audit)
     logger.info(f"AOI audit written → {settings.aoi_audit_path}")
@@ -113,38 +113,27 @@ def cmd_plan(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    registry = load_registry()
-    if not registry:
-        print("Registry is empty. Run `python main.py plan` first.")
-        return
-    print(registry_summary(registry))
+    """Print registry status summary."""
+    print(registry_summary())
 
 
 def cmd_audit(args: argparse.Namespace) -> None:
-    registry = load_registry()
-    if not registry:
-        print("Registry is empty. Run `python main.py plan` first.")
-        return
+    """Regenerate AOI coverage audit."""
     logger = setup_logging("audit")
     logger.info(f"Loading valid AOIs from {settings.valid_aois_path}…")
     with open(settings.valid_aois_path) as f:
         valid_aois = json.load(f)
-    audit = build_aoi_audit(registry, valid_aois)
+    audit = build_aoi_audit(valid_aois)
     save_aoi_audit(audit)
     print(audit_summary(audit))
-    uncovered = [aoi_id for aoi_id, v in audit.items() if not v["has_coverage"]]
-    logger.info(
-        f"AOIs with no complete tiles: {len(uncovered):,} — see {settings.aoi_audit_path}"
-    )
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    """
+    Run phase: process tiles with optional filters.
+    Resumes from saved state - only processes tiles not yet complete/rejected.
+    """
     logger = setup_logging("run")
-
-    registry = load_registry()
-    if not registry:
-        logger.error("Registry is empty. Run `python main.py plan` first.")
-        return
 
     target_status = args.status or str(TileStatus.PENDING)
     if target_status == str(TileStatus.REJECTED):
@@ -153,9 +142,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             "and will likely be rejected again unless thresholds have changed."
         )
 
+    logger.info("Loading candidates from registry (streaming)…")
     candidates = filter_candidates(
-        registry,
-        target_status,
+        status=target_status,
         aoi_id=args.aoi_id,
         biome=args.biome,
         region=args.region,
@@ -175,31 +164,18 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.info("No tiles match the given filters.")
         return
 
-    complete_count = sum(
-        1 for e in registry.values() if e["status"] == str(TileStatus.COMPLETE)
-    )
-    logger.info(
-        f"Processing {len(candidates):,} tiles  "
-        f"(registry total: {len(registry):,}  complete: {complete_count:,})"
-    )
+    logger.info(f"Processing {len(candidates):,} tiles")
 
     ds = init_gee()
 
     if settings.use_hpc:
         logger.info(f"Mode: HPC | workers={settings.num_workers}")
-        run_hpc(candidates, registry, ds, logger)
+        run_hpc(candidates, ds, logger)
     else:
         logger.info("Mode: local sequential")
-        run_local(candidates, registry, ds, logger)
+        run_local(candidates, ds, logger)
 
-    print(registry_summary(registry))
-
-    if settings.valid_aois_path.exists():
-        with open(settings.valid_aois_path) as f:
-            valid_aois = json.load(f)
-        audit = build_aoi_audit(registry, valid_aois)
-        save_aoi_audit(audit)
-        print(audit_summary(audit))
+    print(registry_summary())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -238,7 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    settings.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.registry_db_path.parent.mkdir(parents=True, exist_ok=True)
     settings.aoi_audit_path.parent.mkdir(parents=True, exist_ok=True)
 
     parser = build_parser()
