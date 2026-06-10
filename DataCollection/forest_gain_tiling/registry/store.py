@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from typing import Any
 
 from config import settings
@@ -35,6 +35,14 @@ def save_tile_entry(tile: dict[str, Any]) -> bool:
     return _get_db().insert_or_ignore(tile)
 
 
+def save_tiles_batch(tiles: list[dict[str, Any]], batch_size: int = 100000) -> int:
+    """
+    Insert multiple tiles efficiently in batches.
+    Returns count of newly inserted tiles.
+    """
+    return _get_db().insert_batch(tiles, batch_size=batch_size)
+
+
 def update_tile(tile_id: str, **kwargs: Any) -> None:
     """Update specific fields on a tile and persist immediately."""
     if "status" in kwargs and isinstance(kwargs["status"], TileStatus):
@@ -46,7 +54,7 @@ def iter_tiles(
     status: str | None = None, batch_size: int = 1000
 ) -> list[dict[str, Any]]:
     """
-    Stream tiles in batches (never materializes entire grid).
+    Stream tiles in batches.
     Use for large-scale iteration without memory buildup.
     """
     db = _get_db()
@@ -75,25 +83,25 @@ def get_registry_stats() -> dict[str, Any]:
 def build_aoi_audit(
     valid_aois: list[dict],
 ) -> dict[str, dict[str, Any]]:
-    """Build AOI coverage audit by querying database incrementally."""
+    """Build AOI coverage audit using indexed SQL queries."""
+    from tqdm import tqdm
+
     db = _get_db()
-    aoi_tile_counts: dict[str, Counter] = defaultdict(Counter)
-
-    # Stream through all tiles without materializing entire dataset
-    for entry in iter_tiles():
-        for aoi_id in entry.get("aoi_ids", []):
-            aoi_tile_counts[aoi_id][entry["status"]] += 1
-
     result: dict[str, dict] = {}
-    for aoi in valid_aois:
+    complete_status = str(TileStatus.COMPLETE)
+
+    # Fast indexed query per AOI
+    for aoi in tqdm(valid_aois, desc="Building AOI audit", unit="aoi"):
         aoi_id = aoi["id"]
-        counts = aoi_tile_counts.get(aoi_id, Counter())
-        complete = counts.get(str(TileStatus.COMPLETE), 0)
+        status_counts = db.get_aoi_tile_counts(aoi_id)
+        complete = status_counts.get(complete_status, 0)
+        total = sum(status_counts.values())
+
         result[aoi_id] = AoiAuditEntry(
             biome=aoi.get("biome_name", "Unknown"),
             region=aoi.get("region", "Unknown"),
-            tile_counts=dict(counts),
-            total_tiles=sum(counts.values()),
+            tile_counts=status_counts,
+            total_tiles=total,
             complete_tiles=complete,
             has_coverage=complete > 0,
         ).__dict__
@@ -102,7 +110,7 @@ def build_aoi_audit(
 
 
 def save_aoi_audit(audit: dict) -> None:
-    """Save AOI audit to JSON file (for external analysis)."""
+    """Save AOI audit to JSON file."""
     import json
 
     tmp = settings.aoi_audit_path.with_suffix(".tmp")

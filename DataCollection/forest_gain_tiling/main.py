@@ -39,12 +39,10 @@ from export.tasks import run_hpc, run_local
 from registry.store import (
     audit_summary,
     build_aoi_audit,
-    iter_tiles,
     registry_summary,
     save_aoi_audit,
-    save_tile_entry,
 )
-from tiling.grid import build_global_grid, plan_summary
+from tiling.grid import build_global_grid
 from tiling.selection import (
     filter_candidates,
     log_strata_counts,
@@ -81,7 +79,7 @@ def init_gee() -> Datasets:
 
 
 def cmd_plan(args: argparse.Namespace) -> None:
-    """Plan phase: generate tiles and add new ones to registry, resume from saved state."""
+    """Plan phase: generate tiles and add new ones to registry."""
     logger = setup_logging("plan")
 
     logger.info(f"Loading valid AOIs from {settings.valid_aois_path}…")
@@ -89,20 +87,68 @@ def cmd_plan(args: argparse.Namespace) -> None:
         valid_aois = json.load(f)
     logger.info(f"  {len(valid_aois):,} valid AOIs")
 
-    logger.info("Building global grid…")
-    tiles = build_global_grid(valid_aois, logger)
-    print(plan_summary(tiles))
+    from registry.store import _get_db
 
-    logger.info(f"Adding {len(tiles):,} new tiles to registry…")
-    new_count = 0
-    for t in tiles:
-        if save_tile_entry(t):  # Returns True if newly inserted
-            new_count += 1
+    db_tile_count = _get_db().count_tiles()
 
-    settings.registry_db_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(
-        f"Registry: {new_count:,} new tiles added → {settings.registry_db_path}"
-    )
+    if db_tile_count > 0:
+        logger.info(
+            f"Database already has {db_tile_count:,} tiles. Skipping grid generation."
+        )
+    else:
+        logger.info("Database is empty. Generating tile grid…")
+
+        logger.info("Streaming tiles to database in batches…")
+        from collections import Counter
+
+        from registry.store import save_tiles_batch
+
+        batch = []
+        batch_size = 100000
+        new_count = 0
+        biome_counts = Counter()
+        region_counts = Counter()
+        total = 0
+
+        for t in build_global_grid(valid_aois, logger):
+            batch.append(t)
+
+            biome_counts[t["biome"]] += 1
+            region_counts[t["region"]] += 1
+            total += 1
+
+            if len(batch) >= batch_size:
+                new_count += save_tiles_batch(batch, batch_size=batch_size)
+                batch = []
+
+        if batch:
+            new_count += save_tiles_batch(batch, batch_size=batch_size)
+
+        settings.registry_db_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            f"Registry: {new_count:,} new tiles added → {settings.registry_db_path}"
+        )
+
+        sz = settings.tile_size_m
+        lines = [
+            "",
+            "═" * 60,
+            "  TILE PLAN SUMMARY",
+            "═" * 60,
+            f"  Total tiles : {total:>10,}",
+            f"  Grid size   : {sz:.0f} m x {sz:.0f} m  ({settings.tile_pixels}x{settings.tile_pixels} px @ {settings.scale} m/px)",
+            f"  CRS         : {settings.crs}",
+            f"  Min overlap : {settings.min_aoi_overlap_frac*100:.0f}% of tile inside a single AOI",
+            "",
+            "  By biome:",
+        ]
+        for b, n in biome_counts.most_common():
+            lines.append(f"    {b:<45} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+        lines += ["", "  By region:"]
+        for r, n in region_counts.most_common():
+            lines.append(f"    {r:<30} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+        lines += ["═" * 60, ""]
+        print("\n".join(lines))
 
     logger.info("Building AOI audit…")
     audit = build_aoi_audit(valid_aois)

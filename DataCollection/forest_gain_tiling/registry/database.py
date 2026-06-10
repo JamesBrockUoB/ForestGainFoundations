@@ -36,6 +36,7 @@ class RegistryDB:
     def _init_schema(self) -> None:
         """Initialize database schema if not exists."""
         with self._conn() as conn:
+            # Main tiles table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tiles (
                     tile_id TEXT PRIMARY KEY,
@@ -51,7 +52,6 @@ class RegistryDB:
                     max_lat REAL NOT NULL,
                     biome TEXT NOT NULL,
                     region TEXT NOT NULL,
-                    aoi_ids TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     gee_task_id TEXT,
                     submitted_at TEXT,
@@ -62,6 +62,18 @@ class RegistryDB:
                     updated_at TEXT NOT NULL
                 )
                 """)
+
+            # Junction table for AOI-tile relationships (indexed for fast lookups)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tile_aois (
+                    tile_id TEXT NOT NULL,
+                    aoi_id TEXT NOT NULL,
+                    PRIMARY KEY (tile_id, aoi_id),
+                    FOREIGN KEY (tile_id) REFERENCES tiles(tile_id)
+                )
+                """)
+
+            # Indexes on tiles table
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_status ON tiles(status)
                 """)
@@ -74,6 +86,15 @@ class RegistryDB:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_updated ON tiles(updated_at DESC)
                 """)
+
+            # Indexes on tile_aois table (fast audit lookups)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tile_aois_aoi ON tile_aois(aoi_id)
+                """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tile_aois_tile ON tile_aois(tile_id)
+                """)
+
             conn.commit()
 
     def insert_or_ignore(self, tile: dict[str, Any]) -> bool:
@@ -81,17 +102,16 @@ class RegistryDB:
         Insert a tile, returning True if inserted, False if already exists.
         """
         now = datetime.now(timezone.utc).isoformat()
-        aoi_ids = ",".join(tile.get("aoi_ids", []))
 
         with self._conn() as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO tiles (
                     tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
-                    min_lon, min_lat, max_lon, max_lat, biome, region, aoi_ids,
+                    min_lon, min_lat, max_lon, max_lat, biome, region,
                     status, gee_task_id, submitted_at, completed_at,
                     rejection_reason, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tile["tile_id"],
@@ -107,7 +127,6 @@ class RegistryDB:
                     tile["max_lat"],
                     tile["biome"],
                     tile["region"],
-                    aoi_ids,
                     str(tile.get("status", TileStatus.PENDING)),
                     tile.get("gee_task_id"),
                     tile.get("submitted_at"),
@@ -118,18 +137,125 @@ class RegistryDB:
                     now,
                 ),
             )
+            inserted = cursor.rowcount > 0
+
+            # Insert AOI relationships if newly inserted
+            if inserted:
+                for aoi_id in tile.get("aoi_ids", []):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO tile_aois (tile_id, aoi_id) VALUES (?, ?)",
+                        (tile["tile_id"], aoi_id),
+                    )
+
             conn.commit()
-            return cursor.rowcount > 0
+            return inserted
+
+    def insert_batch(
+        self, tiles: list[dict[str, Any]], batch_size: int = 100000
+    ) -> int:
+        """
+        Insert multiple tiles in a single transaction.
+        Also populates the tile_aois junction table.
+        Returns count of newly inserted tiles.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        inserted = 0
+
+        with self._conn() as conn:
+            for i in range(0, len(tiles), batch_size):
+                batch = tiles[i : i + batch_size]
+
+                # Insert tiles
+                params_list = [
+                    (
+                        tile["tile_id"],
+                        tile["xi"],
+                        tile["yi"],
+                        tile["x_min_m"],
+                        tile["y_min_m"],
+                        tile["x_max_m"],
+                        tile["y_max_m"],
+                        tile["min_lon"],
+                        tile["min_lat"],
+                        tile["max_lon"],
+                        tile["max_lat"],
+                        tile["biome"],
+                        tile["region"],
+                        str(tile.get("status", TileStatus.PENDING)),
+                        tile.get("gee_task_id"),
+                        tile.get("submitted_at"),
+                        tile.get("completed_at"),
+                        tile.get("rejection_reason"),
+                        tile.get("error"),
+                        now,
+                        now,
+                    )
+                    for tile in batch
+                ]
+
+                cursor = conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO tiles (
+                        tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
+                        min_lon, min_lat, max_lon, max_lat, biome, region,
+                        status, gee_task_id, submitted_at, completed_at,
+                        rejection_reason, error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    params_list,
+                )
+                inserted += cursor.rowcount
+
+                # Insert AOI relationships (junction table)
+                aoi_params = []
+                for tile in batch:
+                    for aoi_id in tile.get("aoi_ids", []):
+                        aoi_params.append((tile["tile_id"], aoi_id))
+
+                if aoi_params:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO tile_aois (tile_id, aoi_id) VALUES (?, ?)",
+                        aoi_params,
+                    )
+
+                conn.commit()
+
+        return inserted
 
     def get_tile(self, tile_id: str) -> dict[str, Any] | None:
-        """Fetch a single tile by ID."""
+        """Fetch a single tile by ID (with AOI IDs)."""
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM tiles WHERE tile_id = ?", (tile_id,)
             ).fetchone()
-            if row:
-                return self._row_to_dict(row)
-        return None
+            if not row:
+                return None
+
+            # Get AOI IDs from junction table
+            aoi_rows = conn.execute(
+                "SELECT aoi_id FROM tile_aois WHERE tile_id = ?", (tile_id,)
+            ).fetchall()
+            aoi_ids = [r["aoi_id"] for r in aoi_rows]
+
+            return self._row_to_dict(row, aoi_ids)
+
+    def get_aoi_tile_counts(self, aoi_id: str) -> dict[str, int]:
+        """
+        Get status counts for a single AOI (used for audit).
+        Fast indexed query - uses junction table instead of string search.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.status, COUNT(*) as cnt
+                FROM tiles t
+                INNER JOIN tile_aois ta ON t.tile_id = ta.tile_id
+                WHERE ta.aoi_id = ?
+                GROUP BY t.status
+                """,
+                (aoi_id,),
+            ).fetchall()
+            return {row["status"]: row["cnt"] for row in rows}
 
     def update_tile(self, tile_id: str, **kwargs: Any) -> None:
         """Update specific fields on a tile."""
@@ -165,7 +291,15 @@ class RegistryDB:
 
         with self._conn() as conn:
             rows = conn.execute(query, params).fetchall()
-            return [self._row_to_dict(row) for row in rows]
+            result = []
+            for row in rows:
+                # Get AOI IDs from junction table for each tile
+                aoi_rows = conn.execute(
+                    "SELECT aoi_id FROM tile_aois WHERE tile_id = ?", (row["tile_id"],)
+                ).fetchall()
+                aoi_ids = [r["aoi_id"] for r in aoi_rows]
+                result.append(self._row_to_dict(row, aoi_ids))
+            return result
 
     def count_tiles(self, status: str | None = None) -> int:
         """Count tiles, optionally filtered by status."""
@@ -230,14 +364,19 @@ class RegistryDB:
             return {row["rejection_reason"]: row["cnt"] for row in rows}
 
     def clear_all(self) -> None:
-        """Clear all tiles (use with caution)."""
+        """Clear all tiles and AOI relationships (use with caution)."""
         with self._conn() as conn:
+            conn.execute("DELETE FROM tile_aois")
             conn.execute("DELETE FROM tiles")
             conn.commit()
 
-    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _row_to_dict(
+        self, row: sqlite3.Row, aoi_ids: list[str] | None = None
+    ) -> dict[str, Any]:
         """Convert a database row to a dictionary with proper types."""
-        aoi_ids = [a.strip() for a in row["aoi_ids"].split(",") if a.strip()]
+        if aoi_ids is None:
+            aoi_ids = []
+
         return {
             "tile_id": row["tile_id"],
             "xi": row["xi"],
