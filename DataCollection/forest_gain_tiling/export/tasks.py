@@ -7,7 +7,6 @@ import multiprocessing as mp
 import random
 import threading
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,52 +16,19 @@ from datasets.registry import Datasets
 from enums import TileStatus
 from export.drive import rclone_to_hpc
 from labels.gain import build_gain_layer
-from labels.viability import score_viability
 from registry.store import update_tile
 from stack.stacks import build_full_stack, build_full_valid
 from tiling.grid import crs_transform, tile_geom
 
 
 def process_tile(tile: dict[str, Any], ds: Datasets, logger: logging.Logger) -> str:
-    """Process a single tile, updating database directly (no registry dict)."""
+    """Process a single VALID tile: build pseudo-labels, export."""
     tile_id = tile["tile_id"]
     geom = tile_geom(tile)
     ct = crs_transform(tile)
 
     try:
-        gain_validated, gain_binary = build_gain_layer(geom, ds)
-
-        gain_stats = gain_binary.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=geom,
-            scale=settings.scale,
-            crs=settings.crs,
-            crsTransform=ct,
-            maxPixels=1_000_000_000,
-        )
-        gain_pct = (
-            ee.Number(
-                ee.Algorithms.If(gain_stats.get("gain"), gain_stats.get("gain"), 0)
-            )
-            .multiply(100)
-            .getInfo()
-        )
-
-        if gain_pct < settings.gain_pct_min:
-            reason = f"gain_pct={gain_pct:.3f} < {settings.gain_pct_min}"
-            logger.info(f"reject (low gain {gain_pct:.2f}%): {tile_id}")
-            update_tile(tile_id, status=TileStatus.REJECTED, rejection_reason=reason)
-            return str(TileStatus.REJECTED)
-
-        viability = score_viability(geom, gain_validated, ds)
-        if (
-            viability["ndvi_delta"] <= settings.ndvi_delta_min
-            or viability["gain_canopy_mean"] < settings.gain_canopy_min
-        ):
-            reason = f"viability={viability}"
-            logger.info(f"reject (viability): {tile_id} {viability}")
-            update_tile(tile_id, status=TileStatus.REJECTED, rejection_reason=reason)
-            return str(TileStatus.REJECTED)
+        gain_validated, _ = build_gain_layer(geom, ds)
 
         full_valid = build_full_valid(geom)
         stack = build_full_stack(tile, geom, gain_validated, full_valid, ds)

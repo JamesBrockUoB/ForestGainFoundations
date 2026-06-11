@@ -7,7 +7,6 @@ import random
 from collections import Counter
 from typing import Any
 
-from enums import TileStatus
 from registry.store import iter_tiles
 
 

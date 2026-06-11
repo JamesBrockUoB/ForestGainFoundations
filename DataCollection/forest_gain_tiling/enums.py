@@ -3,6 +3,7 @@ from enum import Enum
 
 class TileStatus(str, Enum):
     PENDING = "pending"
+    VALID = "valid"
     SUBMITTED = "submitted"
     COMPLETE = "complete"
     REJECTED = "rejected"

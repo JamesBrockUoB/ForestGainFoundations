@@ -4,8 +4,10 @@ Forest-gain tile export pipeline.
 Commands
 --------
   python main.py plan                              # build tile registry, print summary
-  python main.py run                               # process all pending tiles
-  python main.py run --limit 500                   # next N pending tiles
+  python main.py filter                            # run cheap viability/coverage filters
+  python main.py filter --limit 1000               # filter next N pending tiles
+  python main.py run                               # process all valid tiles
+  python main.py run --limit 500                   # next N valid tiles
   python main.py run --biome "Boreal Forests"      # filter by biome (substring match)
   python main.py run --region Neotropic            # filter by region
   python main.py run --aoi-id aoi_-73.25_-52.75   # single AOI (debug)
@@ -13,13 +15,20 @@ Commands
   python main.py status                            # print registry summary
   python main.py audit                             # report AOIs with no tiles
 
+Filter flags
+------------
+  --aoi-id     AOI_ID       filter to a single AOI
+  --biome      SUBSTRING    filter by biome (case-insensitive substring)
+  --region     SUBSTRING    filter by region (case-insensitive substring)
+  --limit      N            max tiles to filter
+
 Run flags
 ---------
   --aoi-id     AOI_ID       filter to a single AOI
   --biome      SUBSTRING    filter by biome (case-insensitive substring)
   --region     SUBSTRING    filter by region (case-insensitive substring)
   --limit      N            max tiles to process
-  --status     STATUS       pending (default) | failed | rejected
+  --status     STATUS       valid (default) | failed | rejected
   --stratify   KEY          biome | region
   --stratify-mode  MODE     prop (default) | equal
 """
@@ -36,6 +45,7 @@ from config import settings
 from datasets.registry import Datasets
 from enums import TileStatus
 from export.tasks import run_hpc, run_local
+from filtering.tasks import run_filter_hpc, run_filter_local
 from registry.store import (
     audit_summary,
     build_aoi_audit,
@@ -104,7 +114,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
         from registry.store import save_tiles_batch
 
         batch = []
-        batch_size = 100000
+        batch_size = 1000000
         new_count = 0
         biome_counts = Counter()
         region_counts = Counter()
@@ -150,13 +160,6 @@ def cmd_plan(args: argparse.Namespace) -> None:
         lines += ["═" * 60, ""]
         print("\n".join(lines))
 
-    logger.info("Building AOI audit…")
-    audit = build_aoi_audit(valid_aois)
-    settings.aoi_audit_path.parent.mkdir(parents=True, exist_ok=True)
-    save_aoi_audit(audit)
-    logger.info(f"AOI audit written → {settings.aoi_audit_path}")
-    print(audit_summary(audit))
-
 
 def cmd_status(args: argparse.Namespace) -> None:
     """Print registry status summary."""
@@ -174,17 +177,55 @@ def cmd_audit(args: argparse.Namespace) -> None:
     print(audit_summary(audit))
 
 
+def cmd_filter(args: argparse.Namespace) -> None:
+    """
+    Filter phase: cheap viability/coverage checks on pending tiles.
+    No exports happen here — tiles are marked valid or rejected.
+    """
+    logger = setup_logging("filter")
+
+    logger.info("Loading pending candidates from registry (streaming)…")
+    candidates = filter_candidates(
+        status=str(TileStatus.PENDING),
+        aoi_id=args.aoi_id,
+        biome=args.biome,
+        region=args.region,
+        logger=logger,
+    )
+
+    if args.limit:
+        candidates = candidates[: args.limit]
+        logger.info(f"Limited to {args.limit} tiles")
+
+    if not candidates:
+        logger.info("No tiles match the given filters.")
+        return
+
+    logger.info(f"Filtering {len(candidates):,} tiles")
+
+    ds = init_gee()
+
+    if settings.use_hpc:
+        logger.info(f"Mode: HPC | workers={settings.num_workers}")
+        run_filter_hpc(candidates, ds, logger)
+    else:
+        logger.info("Mode: local sequential")
+        run_filter_local(candidates, ds, logger)
+
+    print(registry_summary())
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """
-    Run phase: process tiles with optional filters.
+    Run phase: process valid tiles (pseudo-labels + export).
     Resumes from saved state - only processes tiles not yet complete/rejected.
     """
     logger = setup_logging("run")
 
-    target_status = args.status or str(TileStatus.PENDING)
+    target_status = args.status or str(TileStatus.VALID)
     if target_status == str(TileStatus.REJECTED):
         logger.warning(
-            "Targeting rejected tiles — these failed viability checks "
+            "Targeting rejected tiles — these failed the filter checks "
             "and will likely be rejected again unless thresholds have changed."
         )
 
@@ -236,6 +277,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="Print current registry progress")
     sub.add_parser("audit", help="Report AOIs with no complete tiles")
 
+    filter_p = sub.add_parser(
+        "filter", help="Run cheap viability/coverage filters (no exports)"
+    )
+    filter_p.add_argument("--aoi-id", default=None)
+    filter_p.add_argument("--biome", default=None)
+    filter_p.add_argument("--region", default=None)
+    filter_p.add_argument("--limit", default=None, type=int)
+
     run_p = sub.add_parser("run", help="Submit and monitor export tasks")
     run_p.add_argument("--aoi-id", default=None)
     run_p.add_argument("--biome", default=None)
@@ -243,9 +292,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--limit", default=None, type=int)
     run_p.add_argument(
         "--status",
-        default=str(TileStatus.PENDING),
+        default=str(TileStatus.VALID),
         choices=[
-            str(s) for s in (TileStatus.PENDING, TileStatus.FAILED, TileStatus.REJECTED)
+            str(s) for s in (TileStatus.VALID, TileStatus.FAILED, TileStatus.REJECTED)
         ],
     )
     run_p.add_argument("--stratify", default=None, choices=["biome", "region"])
@@ -270,6 +319,7 @@ if __name__ == "__main__":
         "plan": cmd_plan,
         "status": cmd_status,
         "audit": cmd_audit,
+        "filter": cmd_filter,
         "run": cmd_run,
     }
     dispatch[args.command](args)

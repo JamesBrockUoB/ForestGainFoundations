@@ -34,7 +34,7 @@ class RegistryDB:
             conn.close()
 
     def _init_schema(self) -> None:
-        """Initialize database schema if not exists."""
+        """Initialise database schema if not exists."""
         with self._conn() as conn:
             # Main tiles table
             conn.execute("""
@@ -63,7 +63,7 @@ class RegistryDB:
                 )
                 """)
 
-            # Junction table for AOI-tile relationships (indexed for fast lookups)
+            # Junction table for AOI-tile relationships
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tile_aois (
                     tile_id TEXT NOT NULL,
@@ -87,7 +87,7 @@ class RegistryDB:
                 CREATE INDEX IF NOT EXISTS idx_updated ON tiles(updated_at DESC)
                 """)
 
-            # Indexes on tile_aois table (fast audit lookups)
+            # Indexes on tile_aois table
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tile_aois_aoi ON tile_aois(aoi_id)
                 """)
@@ -111,7 +111,7 @@ class RegistryDB:
                     min_lon, min_lat, max_lon, max_lat, biome, region,
                     status, gee_task_id, submitted_at, completed_at,
                     rejection_reason, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tile["tile_id"],
@@ -151,13 +151,9 @@ class RegistryDB:
             return inserted
 
     def insert_batch(
-        self, tiles: list[dict[str, Any]], batch_size: int = 100000
+        self, tiles: list[dict[str, Any]], batch_size: int = 1000000
     ) -> int:
-        """
-        Insert multiple tiles in a single transaction.
-        Also populates the tile_aois junction table.
-        Returns count of newly inserted tiles.
-        """
+        """Insert multiple tiles and their AOI relationships in batches."""
         now = datetime.now(timezone.utc).isoformat()
         inserted = 0
 
@@ -165,7 +161,6 @@ class RegistryDB:
             for i in range(0, len(tiles), batch_size):
                 batch = tiles[i : i + batch_size]
 
-                # Insert tiles
                 params_list = [
                     (
                         tile["tile_id"],
@@ -200,13 +195,13 @@ class RegistryDB:
                         min_lon, min_lat, max_lon, max_lat, biome, region,
                         status, gee_task_id, submitted_at, completed_at,
                         rejection_reason, error, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     params_list,
                 )
                 inserted += cursor.rowcount
 
-                # Insert AOI relationships (junction table)
+                # Batch all AOI relationships
                 aoi_params = []
                 for tile in batch:
                     for aoi_id in tile.get("aoi_ids", []):

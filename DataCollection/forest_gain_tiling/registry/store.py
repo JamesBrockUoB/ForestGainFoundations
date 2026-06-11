@@ -35,7 +35,7 @@ def save_tile_entry(tile: dict[str, Any]) -> bool:
     return _get_db().insert_or_ignore(tile)
 
 
-def save_tiles_batch(tiles: list[dict[str, Any]], batch_size: int = 100000) -> int:
+def save_tiles_batch(tiles: list[dict[str, Any]], batch_size: int = 1000000) -> int:
     """
     Insert multiple tiles efficiently in batches.
     Returns count of newly inserted tiles.

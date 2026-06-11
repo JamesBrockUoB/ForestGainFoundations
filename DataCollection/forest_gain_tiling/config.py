@@ -46,6 +46,7 @@ class Settings:
     gain_pct_min: float = 1.0
     ndvi_delta_min: float = 0.0
     gain_canopy_min: float = 1.0
+    s2_min_valid_frac: float = 0.95
 
     poll_interval: int = 30
     use_hpc: bool = field(default_factory=lambda: os.getenv("USE_HPC", "0") == "1")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ee
-
+from config import settings
 from datasets.registry import Datasets
 
 
@@ -39,6 +39,18 @@ def s2_availability(geom: ee.Geometry, year: int) -> ee.Image:
     return ic.map(lambda i: i.mask().reduce(ee.Reducer.min())).reduce(ee.Reducer.max())
 
 
+def s2_coverage_frac(geom: ee.Geometry, year: int) -> ee.Number:
+    valid = s2_availability(geom, year)
+    stats = valid.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geom,
+        scale=settings.scale,
+        crs=settings.crs,
+        maxPixels=1_000_000_000,
+    )
+    return ee.Number(ee.Algorithms.If(stats.get("valid"), stats.get("valid"), 0))
+
+
 def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     start, end = _date_range(year)
     bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "NDVI", "EVI"]
@@ -62,7 +74,7 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     return reduced.select([b + "_p25" for b in bands], bands)
 
 
-def s2_peak(geom: ee.Geometry, year: int, ds: Datasets) -> ee.Image:  # noqa: ARG001
+def s2_peak(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     centroid = ee.Geometry(geom).centroid(maxError=1)
     north = ee.Number(centroid.coordinates().get(1)).gt(0)
 
@@ -84,9 +96,7 @@ def s2_peak(geom: ee.Geometry, year: int, ds: Datasets) -> ee.Image:  # noqa: AR
     )
 
 
-def s1_composite(
-    geom: ee.Geometry, year: int, ds: Datasets
-) -> ee.Image:  # noqa: ARG001
+def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     med = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
         .filterDate(f"{year}-01-01", f"{year}-12-31")
@@ -133,8 +143,8 @@ def build_timestep_stack(
 ) -> ee.Image:
     band_names = [f"{prefix}_{b}" for b in _BAND_SUFFIXES]
     return (
-        s2_composite(geom, year, ds)
-        .addBands(s1_composite(geom, year, ds))
+        s2_composite(geom, year)
+        .addBands(s1_composite(geom, year))
         .addBands(dw_composite(geom, year, ds))
         .rename(band_names)
     )
