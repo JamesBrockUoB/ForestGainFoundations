@@ -38,9 +38,9 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import random
 import threading
 import time
-import random
 from pathlib import Path
 
 import ee
@@ -239,8 +239,9 @@ def rejection_reason_str(reason_code):
 
 
 def generate_global_aois(step=AOI_STEP, batch_size=2000):
-    import ee
     import math
+
+    import ee
 
     cells = []
 
@@ -348,42 +349,68 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     fc = fc.map(add_geometry_metadata)
 
     def add_ecoregion_metadata(f):
-        centroid = f.geometry().centroid(1)
+        geom = f.geometry()
 
-        eco = ee.Feature(_ecoregions.filterBounds(centroid).sort("ECO_ID").first())
+        intersecting = _ecoregions.filterBounds(geom)
+
+        # compute eco area once (cheap vs intersection per pair)
+        eco_with_area = intersecting.map(
+            lambda e: e.set("eco_area", e.geometry().area(1))
+        )
+
+        ranked = eco_with_area.sort("eco_area", True)
+
+        has_match = ranked.size().gt(0)
+
+        eco = ee.Feature(ee.Algorithms.If(has_match, ranked.first(), ee.Feature(None)))
+
+        biome_name_raw = eco.get("BIOME_NAME")
+        biome_num_raw = eco.get("BIOME_NUM")
+        realm_raw = eco.get("REALM")
 
         biome_name = ee.String(
             ee.Algorithms.If(
-                eco,
-                ee.Feature(eco).get("BIOME_NAME"),
+                ee.Algorithms.Or(
+                    ee.Algorithms.IsEqual(biome_name_raw, None),
+                    ee.Algorithms.Or(
+                        ee.Algorithms.IsEqual(biome_name_raw, "N/A"),
+                        ee.Algorithms.IsEqual(biome_name_raw, ""),
+                    ),
+                ),
                 "Unknown",
+                biome_name_raw,
             )
         )
 
         biome_num = ee.Number(
             ee.Algorithms.If(
-                eco,
-                ee.Feature(eco).get("BIOME_NUM"),
-                -1,
+                ee.Algorithms.IsEqual(biome_num_raw, None), -1, biome_num_raw
             )
         )
 
-        region = ee.String(
+        realm = ee.String(
             ee.Algorithms.If(
-                eco,
-                ee.Feature(eco).get("REALM"),
+                ee.Algorithms.Or(
+                    ee.Algorithms.IsEqual(realm_raw, None),
+                    ee.Algorithms.Or(
+                        ee.Algorithms.IsEqual(realm_raw, "N/A"),
+                        ee.Algorithms.IsEqual(realm_raw, ""),
+                    ),
+                ),
                 "Unknown",
+                realm_raw,
             )
         )
 
-        return f.set(
-            "biome_name",
-            biome_name,
-            "biome_num",
-            biome_num,
-            "region",
-            region,
+        is_rock_ice = biome_num.eq(11)
+
+        biome_name = ee.String(
+            ee.Algorithms.If(is_rock_ice, "Rock and Ice", biome_name)
         )
+
+        realm = ee.String(ee.Algorithms.If(is_rock_ice, "Global", realm))
+
+        return f.set("biome_name", biome_name, "biome_num", biome_num, "region", realm)
 
     fc = fc.map(add_ecoregion_metadata)
 

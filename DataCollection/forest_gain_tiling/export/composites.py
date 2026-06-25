@@ -40,6 +40,7 @@ def s2_availability(geom: ee.Geometry, year: int) -> ee.Image:
 
 
 def s2_coverage_frac(geom: ee.Geometry, year: int) -> ee.Number:
+    """Fraction of pixels in geom with at least one valid S2 observation in `year`."""
     valid = s2_availability(geom, year)
     stats = valid.reduceRegion(
         reducer=ee.Reducer.mean(),
@@ -74,7 +75,7 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     return reduced.select([b + "_p25" for b in bands], bands)
 
 
-def s2_peak(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
+def s2_peak(geom: ee.Geometry, year: int, ds: Datasets) -> ee.Image:  # noqa: ARG001
     centroid = ee.Geometry(geom).centroid(maxError=1)
     north = ee.Number(centroid.coordinates().get(1)).gt(0)
 

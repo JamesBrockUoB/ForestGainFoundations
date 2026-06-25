@@ -4,8 +4,8 @@ Forest-gain tile export pipeline.
 Commands
 --------
   python main.py plan                              # build tile registry, print summary
-  python main.py filter                            # run cheap viability/coverage filters
-  python main.py filter --limit 1000               # filter next N pending tiles
+  python main.py filter                            # raster-batch filter all AOIs with pending tiles
+  python main.py filter --limit 5                  # filter only the first N AOIs (testing)
   python main.py run                               # process all valid tiles
   python main.py run --limit 500                   # next N valid tiles
   python main.py run --biome "Boreal Forests"      # filter by biome (substring match)
@@ -17,10 +17,7 @@ Commands
 
 Filter flags
 ------------
-  --aoi-id     AOI_ID       filter to a single AOI
-  --biome      SUBSTRING    filter by biome (case-insensitive substring)
-  --region     SUBSTRING    filter by region (case-insensitive substring)
-  --limit      N            max tiles to filter
+  --limit      N            max number of AOIs to process (for testing)
 
 Run flags
 ---------
@@ -179,38 +176,23 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
 def cmd_filter(args: argparse.Namespace) -> None:
     """
-    Filter phase: cheap viability/coverage checks on pending tiles.
-    No exports happen here — tiles are marked valid or rejected.
+    Filter phase: raster-batch viability/coverage checks on pending tiles.
+    One aggregated GEE raster fetch per AOI covers all of that AOI's
+    pending tiles. No exports happen here — tiles are marked valid or
+    rejected.
     """
     logger = setup_logging("filter")
 
-    logger.info("Loading pending candidates from registry (streaming)…")
-    candidates = filter_candidates(
-        status=str(TileStatus.PENDING),
-        aoi_id=args.aoi_id,
-        biome=args.biome,
-        region=args.region,
-        logger=logger,
-    )
+    init_gee()
 
-    if args.limit:
-        candidates = candidates[: args.limit]
-        logger.info(f"Limited to {args.limit} tiles")
-
-    if not candidates:
-        logger.info("No tiles match the given filters.")
-        return
-
-    logger.info(f"Filtering {len(candidates):,} tiles")
-
-    ds = init_gee()
+    limit_aois = args.limit
 
     if settings.use_hpc:
         logger.info(f"Mode: HPC | workers={settings.num_workers}")
-        run_filter_hpc(candidates, ds, logger)
+        run_filter_hpc(logger, limit_aois=limit_aois)
     else:
         logger.info("Mode: local sequential")
-        run_filter_local(candidates, ds, logger)
+        run_filter_local(logger, limit_aois=limit_aois)
 
     print(registry_summary())
 
@@ -278,12 +260,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("audit", help="Report AOIs with no complete tiles")
 
     filter_p = sub.add_parser(
-        "filter", help="Run cheap viability/coverage filters (no exports)"
+        "filter",
+        help="Run raster-batch viability/coverage filters (no exports)",
     )
-    filter_p.add_argument("--aoi-id", default=None)
-    filter_p.add_argument("--biome", default=None)
-    filter_p.add_argument("--region", default=None)
-    filter_p.add_argument("--limit", default=None, type=int)
+    filter_p.add_argument(
+        "--limit",
+        default=None,
+        type=int,
+        help="Max number of AOIs to process (for testing on a subset)",
+    )
 
     run_p = sub.add_parser("run", help="Submit and monitor export tasks")
     run_p.add_argument("--aoi-id", default=None)

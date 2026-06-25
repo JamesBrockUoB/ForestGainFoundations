@@ -6,9 +6,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent.parent / ".env")
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,9 @@ class Settings:
         default_factory=lambda: os.getenv("DRIVE_REMOTE", "gdrive")
     )
     gee_credentials: str = field(
-        default_factory=lambda: os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        default_factory=lambda: str(
+            _ROOT_DIR / os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        )
     )
     hpc_base: str | None = field(default_factory=lambda: os.getenv("HPC_BASE"))
 
