@@ -50,9 +50,13 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 GEE_PROJECT = os.getenv("GEE_PROJECT")
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/"))
 
-OUTPUT_FILE = OUTPUT_DIR / os.getenv("OUTPUT_FILE", "aois/valid_aois.json")
+OUTPUT_FILE = (
+    PROJECT_ROOT / OUTPUT_DIR / os.getenv("OUTPUT_FILE", "aois/valid_aois.json")
+)
 
 REJECTED_OUTPUT_FILE = OUTPUT_FILE.parent / "rejected_aois.json"
 
@@ -66,8 +70,10 @@ AOI_STEP = float(os.getenv("AOI_STEP", 0.25))
 USE_HPC = os.getenv("USE_HPC", "0") == "1"
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 4))
 
+SEARCH_MODE = os.getenv("SEARCH_MODE", "asset")
+
 MIN_VEG_FRACTION = 0.01
-MIN_LAND_FRACTION = 0.05
+MIN_LAND_FRACTION = 0.01
 MIN_GAIN_FRACTION = 0.001
 
 AOI_LIST_CACHE = OUTPUT_FILE.parent / "all_aois.json"
@@ -104,19 +110,67 @@ def _build_gee_datasets():
     _esa_mangrove = _esa_wc.eq(95).unmask(0)
     _esa_veg = _esa_trees.Or(_esa_mangrove).unmask(0).rename("esa_veg")
 
-    _glulc_2015 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2015").select([0])
-    _glulc_2020 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2020").select([0])
+    def load_dt_mosaic(year):
+        return (
+            ee.Image(
+                f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_mosaic"
+            )
+            .select([0])
+            .divide(2.55)
+            .rename("tree_cover_pct")
+        )
 
-    _tree_classes = ee.List.sequence(25, 96).cat(ee.List.sequence(125, 196))
-    _ones = ee.List.repeat(1, _tree_classes.length())
+    _cover_2017 = load_dt_mosaic(2017)
+    _cover_2020 = load_dt_mosaic(2020)
 
-    _tree_2015 = _glulc_2015.remap(_tree_classes, _ones, 0)
-    _tree_2020 = _glulc_2020.remap(_tree_classes, _ones, 0)
-    _gain_mask = _tree_2020.And(_tree_2015.Not()).select([0]).rename("gain").unmask(0)
+    _forest_2017 = _cover_2017.gt(50).unmask(0)
+    _forest_2020 = _cover_2020.gt(50).unmask(0)
+
+    _gain_mask = _forest_2017.Not().And(_forest_2020).rename("gain").unmask(0)
 
     _ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
 
     return _land_raster, _esa_veg, _gain_mask, _ecoregions
+
+
+def get_asset_bounds(year_start=2017, year_end=2020, padding=0.5):
+    """
+    Derive the geographic bounding box of the deadtrees gain layer
+    by unioning the tile geometries for the start and end years.
+    Returns (min_lon, min_lat, max_lon, max_lat) with optional padding.
+    """
+
+    def load_mosaic(year):
+        return ee.Image(
+            f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_mosaic"
+        )
+
+    bounds = (
+        load_mosaic(year_start)
+        .geometry()
+        .union(load_mosaic(year_end).geometry(), 1)
+        .bounds(1, "EPSG:4326")
+        .coordinates()
+        .get(0)
+    )
+
+    coords = ee.List(bounds).getInfo()
+
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+
+    min_lon = max(-180.0, min(lons) - padding)
+    min_lat = max(-90.0, min(lats) - padding)
+    max_lon = min(180.0, max(lons) + padding)
+    max_lat = min(90.0, max(lats) + padding)
+
+    logger.info(
+        f"Asset bounds derived: "
+        f"lon [{min_lon:.2f}, {max_lon:.2f}] "
+        f"lat [{min_lat:.2f}, {max_lat:.2f}]"
+    )
+
+    return min_lon, min_lat, max_lon, max_lat
 
 
 def safe_num(val, default=0):
@@ -209,7 +263,12 @@ def has_usable_s2(geom):
     )
 
 
-def forest_gain_fraction_umd(_gain_mask, geom, scale=30):
+def forest_gain_fraction_dt(_gain_mask, geom, scale=100):
+    """
+    Fraction of pixels in geom that transitioned from non-forest (2017)
+    to forest (2020) using the deadtrees.earth product at 10m resolution.
+    Reduced at 100m scale for speed — sufficient for AOI-level filtering.
+    """
     val = _gain_mask.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=geom,
@@ -238,17 +297,28 @@ def rejection_reason_str(reason_code):
     return " + ".join(reasons) if reasons else "unknown"
 
 
-def generate_global_aois(step=AOI_STEP, batch_size=2000):
+def generate_aois(
+    step=AOI_STEP,
+    batch_size=2000,
+    min_lon=-180.0,
+    min_lat=-60.0,
+    max_lon=180.0,
+    max_lat=85.0,
+):
     import math
-
-    import ee
 
     cells = []
 
-    lat = -60.0
-    while lat < 85.0:
-        lon = -180.0
-        while lon < 180.0:
+    # Snap to grid boundaries
+    lat_start = math.floor(min_lat / step) * step
+    lon_start = math.floor(min_lon / step) * step
+    lat_end = math.ceil(max_lat / step) * step
+    lon_end = math.ceil(max_lon / step) * step
+
+    lat = lat_start
+    while lat < lat_end:
+        lon = lon_start
+        while lon < lon_end:
             cells.append(
                 {
                     "minLon": round(lon, 4),
@@ -262,7 +332,7 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
         lat += step
 
     total = len(cells)
-    print(f"[AOI] total cells: {total}")
+    logger.info(f"[AOI] total cells in search area: {total}")
 
     land_mask = (
         ee.Image("COPERNICUS/Landcover/100m/Proba-V-C3/Global/2019")
@@ -272,13 +342,16 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
 
     valid = []
     batches = math.ceil(total / batch_size)
+    asset_geom = ee.Image(
+        "projects/symbolic-base-346316/assets/dt_tree_cover_2020_mosaic"
+    ).geometry()
 
     for i in range(batches):
         start = i * batch_size
         end = min((i + 1) * batch_size, total)
         batch = cells[start:end]
 
-        print(f"[AOI] processing batch {i+1}/{batches} ({start}-{end})")
+        logger.info(f"[AOI] processing batch {i+1}/{batches} ({start}-{end})")
 
         features = [
             ee.Feature(
@@ -291,6 +364,7 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
         ]
 
         fc = ee.FeatureCollection(features)
+        fc = fc.filterBounds(asset_geom)
 
         def add_land(f):
             frac = land_mask.reduceRegion(
@@ -299,7 +373,6 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
                 scale=1000,
                 maxPixels=1e9,
             ).get("discrete_classification")
-
             return f.set("land_frac", frac)
 
         fc = fc.map(add_land)
@@ -308,7 +381,7 @@ def generate_global_aois(step=AOI_STEP, batch_size=2000):
         batch_result = fc.getInfo()["features"]
         valid.extend(batch_result)
 
-        print(f"[AOI] batch {i+1}/{batches} → valid so far: {len(valid)}")
+        logger.info(f"[AOI] batch {i+1}/{batches} → valid so far: {len(valid)}")
 
     return valid
 
@@ -370,15 +443,17 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
 
         biome_name = ee.String(
             ee.Algorithms.If(
-                ee.Algorithms.Or(
-                    ee.Algorithms.IsEqual(biome_name_raw, None),
-                    ee.Algorithms.Or(
-                        ee.Algorithms.IsEqual(biome_name_raw, "N/A"),
+                ee.Algorithms.IsEqual(biome_name_raw, None),
+                "Unknown",
+                ee.Algorithms.If(
+                    ee.Algorithms.IsEqual(biome_name_raw, "N/A"),
+                    "Unknown",
+                    ee.Algorithms.If(
                         ee.Algorithms.IsEqual(biome_name_raw, ""),
+                        "Unknown",
+                        biome_name_raw,
                     ),
                 ),
-                "Unknown",
-                biome_name_raw,
             )
         )
 
@@ -390,15 +465,17 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
 
         realm = ee.String(
             ee.Algorithms.If(
-                ee.Algorithms.Or(
-                    ee.Algorithms.IsEqual(realm_raw, None),
-                    ee.Algorithms.Or(
-                        ee.Algorithms.IsEqual(realm_raw, "N/A"),
+                ee.Algorithms.IsEqual(realm_raw, None),
+                "Unknown",
+                ee.Algorithms.If(
+                    ee.Algorithms.IsEqual(realm_raw, "N/A"),
+                    "Unknown",
+                    ee.Algorithms.If(
                         ee.Algorithms.IsEqual(realm_raw, ""),
+                        "Unknown",
+                        realm_raw,
                     ),
                 ),
-                "Unknown",
-                realm_raw,
             )
         )
 
@@ -436,7 +513,7 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     no_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 0))
 
     def add_gain(f):
-        fg = forest_gain_fraction_umd(_gain_mask, f.geometry())
+        fg = forest_gain_fraction_dt(_gain_mask, f.geometry())
         return f.set("forest_gain_frac", fg, "has_gain", fg.gte(MIN_GAIN_FRACTION))
 
     has_veg_fc = has_veg_fc.map(add_gain)
@@ -742,8 +819,19 @@ if __name__ == "__main__":
             all_aois = json.load(f)
         logger.info(f"Loaded {len(all_aois)} AOIs from cache")
     else:
-        logger.info("Generating AOI list — this may take a while...")
-        all_aois = generate_global_aois()
+        logger.info(f"Generating AOI list — mode={SEARCH_MODE}")
+
+        if SEARCH_MODE == "asset":
+            min_lon, min_lat, max_lon, max_lat = get_asset_bounds()
+        else:
+            min_lon, min_lat, max_lon, max_lat = -180.0, -60.0, 180.0, 85.0
+
+        all_aois = generate_aois(
+            min_lon=min_lon,
+            min_lat=min_lat,
+            max_lon=max_lon,
+            max_lat=max_lat,
+        )
         atomic_json_write(AOI_LIST_CACHE, all_aois)
         logger.info(f"Cached {len(all_aois)} land cells → {AOI_LIST_CACHE}")
 

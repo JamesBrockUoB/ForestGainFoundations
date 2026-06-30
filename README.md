@@ -35,7 +35,7 @@ reforestation site informatics.
     **Step 4**: Setup .env file.
     Create a file in the project root folder called `.env` with the following variables:
       - GEE_PROJECT - Your GEE project name
-      - OUTPUT_DIR - DataCollection/data/
+      - OUTPUT_DIR - data/
       - OUTPUT_FILE - aois/aoi_filter_checkpoint.json
       - BATCH_SIZE - 500
       - AOI_STEP - 0.25

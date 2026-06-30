@@ -29,7 +29,7 @@ class Settings:
     hpc_base: str | None = field(default_factory=lambda: os.getenv("HPC_BASE"))
 
     valid_aois_path: Path = field(
-        default_factory=lambda: _DATA_DIR / "aois" / "valid_aois_enriched.json"
+        default_factory=lambda: _DATA_DIR / "aois" / "valid_aois.json"
     )
     registry_db_path: Path = field(
         default_factory=lambda: _DATA_DIR / "tiles" / "tile_registry.db"

@@ -77,12 +77,12 @@ import argparse
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import random
 import subprocess
 import threading
 import time
-import multiprocessing as mp
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,6 +95,7 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 GEE_PROJECT = os.getenv("GEE_PROJECT")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/"))
+AOI_FILE = Path(os.getenv("OUTPUT_FILE", "aois/valid_aois.json"))
 DRIVE_FOLDER = os.getenv("DRIVE_FOLDER", "forest_gain_tiles")
 DRIVE_REMOTE = os.getenv("DRIVE_REMOTE", "gdrive")
 HPC_BASE = os.getenv("HPC_BASE")
@@ -109,7 +110,7 @@ GAIN_PCT_MIN = 1.0
 NDVI_DELTA_MIN = 0.0
 GAIN_CANOPY_MIN = 3.0
 
-VALID_AOIS_PATH = Path("data/aois/valid_aois_enriched.json")
+VALID_AOIS_PATH = OUTPUT_DIR / AOI_FILE
 REGISTRY_PATH = OUTPUT_DIR / "tiles" / "tile_registry.json"
 AOI_AUDIT_PATH = OUTPUT_DIR / "tiles" / "aoi_tile_audit.json"
 LOG_DIR = Path("logs")
