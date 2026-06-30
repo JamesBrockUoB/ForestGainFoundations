@@ -9,7 +9,16 @@ import ee
 import numpy as np
 from config import settings
 from enums import TileStatus
+from pyproj import Transformer
 from tqdm import tqdm
+
+# Equal-area CRS for grid math — ensures every tile covers the same ground
+# area regardless of latitude. EPSG:3857 (Web Mercator) does not preserve
+# area, which previously caused tile counts to balloon at high latitudes
+# and tile ground size to shrink toward the poles.
+_GRID_CRS = "EPSG:6933"
+_to_grid_crs = Transformer.from_crs("EPSG:4326", _GRID_CRS, always_xy=True)
+_from_grid_crs = Transformer.from_crs(_GRID_CRS, "EPSG:4326", always_xy=True)
 
 
 def _snap(coord_m: float, *, down: bool) -> float:
@@ -17,29 +26,15 @@ def _snap(coord_m: float, *, down: bool) -> float:
     return fn(coord_m / settings.tile_size_m) * settings.tile_size_m
 
 
-def _aoi_to_3857(aoi: dict) -> tuple[float, float, float, float]:
-    R = 6_378_137.0
-
-    def lon2x(lon: float) -> float:
-        return R * math.radians(lon)
-
-    def lat2y(lat: float) -> float:
-        return R * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
-
-    return (
-        lon2x(aoi["minLon"]),
-        lat2y(aoi["minLat"]),
-        lon2x(aoi["maxLon"]),
-        lat2y(aoi["maxLat"]),
-    )
+def _aoi_to_grid_crs(aoi: dict) -> tuple[float, float, float, float]:
+    x_min, y_min = _to_grid_crs.transform(aoi["minLon"], aoi["minLat"])
+    x_max, y_max = _to_grid_crs.transform(aoi["maxLon"], aoi["maxLat"])
+    return (x_min, y_min, x_max, y_max)
 
 
-def _x2lon(x: float) -> float:
-    return math.degrees(x / 6_378_137.0)
-
-
-def _y2lat(y: float) -> float:
-    return math.degrees(2 * math.atan(math.exp(y / 6_378_137.0)) - math.pi / 2)
+def _xy2lonlat(x: float, y: float) -> tuple[float, float]:
+    lon, lat = _from_grid_crs.transform(x, y)
+    return lon, lat
 
 
 def tile_geom(tile: dict) -> ee.Geometry:
@@ -55,7 +50,7 @@ def crs_transform(tile: dict) -> list[float]:
     return [s, 0, tile["x_min_m"], 0, -s, tile["y_max_m"]]
 
 
-def build_global_grid(
+def build_grid(
     valid_aois: list[dict], logger: logging.Logger
 ) -> Generator[dict[str, Any], None, None]:
     """
@@ -63,8 +58,8 @@ def build_global_grid(
     Never materialises the full grid - yields one tile at a time.
     Database handles deduplication via INSERT OR IGNORE.
     """
-    logger.info("Projecting AOI bounds to EPSG:3857…")
-    aoi_bounds_m = [_aoi_to_3857(a) for a in valid_aois]
+    logger.info(f"Projecting AOI bounds to {_GRID_CRS} (equal-area)…")
+    aoi_bounds_m = [_aoi_to_grid_crs(a) for a in valid_aois]
 
     sz = settings.tile_size_m
     global_xmin = _snap(min(b[0] for b in aoi_bounds_m), down=True)
@@ -130,6 +125,9 @@ def build_global_grid(
         xi = round(x_mins[k] / sz)
         yi = round(y_mins[k] / sz)
 
+        min_lon, min_lat = _xy2lonlat(float(x_mins[k]), float(y_mins[k]))
+        max_lon, max_lat = _xy2lonlat(float(x_maxs[k]), float(y_maxs[k]))
+
         yield {
             "tile_id": f"tile_{xi}_{yi}",
             "xi": xi,
@@ -138,10 +136,10 @@ def build_global_grid(
             "y_min_m": float(y_mins[k]),
             "x_max_m": float(x_maxs[k]),
             "y_max_m": float(y_maxs[k]),
-            "min_lon": _x2lon(float(x_mins[k])),
-            "min_lat": _y2lat(float(y_mins[k])),
-            "max_lon": _x2lon(float(x_maxs[k])),
-            "max_lat": _y2lat(float(y_maxs[k])),
+            "min_lon": min_lon,
+            "min_lat": min_lat,
+            "max_lon": max_lon,
+            "max_lat": max_lat,
             "biome": primary.get("biome_name", "Unknown"),
             "region": primary.get("region", "Unknown"),
             "aoi_ids": [primary["id"]],

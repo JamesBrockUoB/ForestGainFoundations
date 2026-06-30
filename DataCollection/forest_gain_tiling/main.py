@@ -49,7 +49,7 @@ from registry.store import (
     registry_summary,
     save_aoi_audit,
 )
-from tiling.grid import build_global_grid
+from tiling.grid import build_grid
 from tiling.selection import (
     filter_candidates,
     log_strata_counts,
@@ -117,7 +117,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
         region_counts = Counter()
         total = 0
 
-        for t in build_global_grid(valid_aois, logger):
+        for t in build_grid(valid_aois, logger):
             batch.append(t)
 
             biome_counts[t["biome"]] += 1

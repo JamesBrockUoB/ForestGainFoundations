@@ -43,7 +43,7 @@ class Settings:
 
     tile_pixels: int = 128
     scale: int = 10
-    crs: str = "EPSG:3857"
+    crs: str = "EPSG:6933"
 
     min_aoi_overlap_frac: float = 0.1
     gain_pct_min: float = 1.0
