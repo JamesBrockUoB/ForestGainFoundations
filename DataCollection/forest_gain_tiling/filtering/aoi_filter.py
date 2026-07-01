@@ -94,7 +94,7 @@ def evaluate_tile_stats(stats: dict[str, float]) -> tuple[str, str | None]:
         )
 
     fracs = {
-        "2016": stats["s2_2016"],
+        "2017": stats["s2_2017"],
         "2020": stats["s2_2020"],
         "2025": stats["s2_2025"],
     }

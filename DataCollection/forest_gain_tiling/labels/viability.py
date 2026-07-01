@@ -14,7 +14,7 @@ def score_viability(
     ndvi_d = (
         s2_peak(geom, 2020, ds)
         .select("NDVI")
-        .subtract(s2_peak(geom, 2016, ds).select("NDVI"))
+        .subtract(s2_peak(geom, 2017, ds).select("NDVI"))
         .updateMask(gm)
     )
 

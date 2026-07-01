@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ee
-
 from datasets.registry import Datasets
 from export.composites import build_timestep_stack, s2_availability
 from labels.pseudo import build_pseudo_labels
@@ -9,7 +8,7 @@ from labels.pseudo import build_pseudo_labels
 
 def build_full_valid(geom: ee.Geometry) -> ee.Image:
     return (
-        s2_availability(geom, 2016)
+        s2_availability(geom, 2017)
         .And(s2_availability(geom, 2020))
         .And(s2_availability(geom, 2025))
         .selfMask()
@@ -36,7 +35,7 @@ def build_full_stack(
     )
 
     return (
-        build_timestep_stack(geom, 2016, "T0", ds)
+        build_timestep_stack(geom, 2017, "T0", ds)
         .addBands(build_timestep_stack(geom, 2020, "T1", ds))
         .addBands(build_timestep_stack(geom, 2025, "T2", ds))
         .addBands(fabdem.rename("DEM"))

@@ -128,7 +128,7 @@ def main() -> None:
         f"{'r_gain%':>8} {'t_gain%':>8} "
         f"{'r_ndvi':>8} {'t_ndvi':>8} "
         f"{'r_canopy':>8} {'t_canopy':>8} "
-        f"{'r_s2_16':>7} {'t_s2_16':>7} "
+        f"{'r_s2_17':>7} {'t_s2_17':>7} "
         f"{'r_s2_20':>7} {'t_s2_20':>7} "
         f"{'r_s2_25':>7} {'t_s2_25':>7}"
     )
@@ -170,7 +170,7 @@ def main() -> None:
             f"{r_stats['gain_frac']*100:>8.3f} {t_result['gain_pct']:>8.3f} "
             f"{r_ndvi_s:>8} {t_ndvi_s:>8} "
             f"{r_canopy_s:>8} {t_canopy_s:>8} "
-            f"{r_stats['s2_2016']:>7.3f} {t_result['s2_2016']:>7.3f} "
+            f"{r_stats['s2_2017']:>7.3f} {t_result['s2_2017']:>7.3f} "
             f"{r_stats['s2_2020']:>7.3f} {t_result['s2_2020']:>7.3f} "
             f"{r_stats['s2_2025']:>7.3f} {t_result['s2_2025']:>7.3f} "
             f"{match}"

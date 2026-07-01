@@ -31,7 +31,7 @@ valid
 rejection_reason
 veg_fraction
 forest_gain_frac
-s2_count_2016/2020/2025
+s2_count_2017/2020/2025
 """
 
 import json
@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 
 creds_path = PROJECT_ROOT / os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-credentials = ee.ServiceAccountCredentials(None, creds_path)
+credentials = ee.ServiceAccountCredentials(None, str(creds_path))
 
 ee.Initialize(credentials, project=GEE_PROJECT)
 
@@ -249,14 +249,14 @@ def has_usable_s2(geom):
 
     fracs = ee.Dictionary(
         {
-            "2016": safe_num(year_frac("2015-01-01", "2016-12-31"), 0),
+            "2017": safe_num(year_frac("2017-01-01", "2017-12-31"), 0),
             "2020": safe_num(year_frac("2020-01-01", "2020-12-31"), 0),
             "2025": safe_num(year_frac("2025-01-01", "2025-12-31"), 0),
         }
     )
 
     return (
-        fracs.getNumber("2016")
+        fracs.getNumber("2017")
         .gte(0.05)
         .And(fracs.getNumber("2020").gte(0.05))
         .And(fracs.getNumber("2025").gte(0.05))

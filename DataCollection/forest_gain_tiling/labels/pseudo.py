@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ee
-
 from datasets.registry import Datasets
 
 
@@ -26,11 +25,11 @@ def build_pseudo_labels(
     def dw_mean(y0: str, y1: str, band: str) -> ee.Image:
         return ds.dw.filterDate(y0, y1).filterBounds(geom).select(band).mean().unmask(0)
 
-    dw_trees_pre = dw_mean("2015-01-01", "2016-12-31", "trees")
-    dw_crops_pre = dw_mean("2015-01-01", "2016-12-31", "crops")
+    dw_trees_pre = dw_mean("2017-01-01", "2017-12-31", "trees")
+    dw_crops_pre = dw_mean("2017-01-01", "2017-12-31", "crops")
     dw_crops_post = dw_mean("2020-01-01", "2020-12-31", "crops")
 
-    annual = [dw_mean(f"{y}-01-01", f"{y}-12-31", "trees") for y in range(2016, 2021)]
+    annual = [dw_mean(f"{y}-01-01", f"{y}-12-31", "trees") for y in range(2017, 2021)]
     dw_stack = ee.ImageCollection(annual).toBands()
     dw_slope = dw_stack.reduce(ee.Reducer.linearFit()).select("scale").max(0).min(1.0)
     dw_std = dw_stack.reduce(ee.Reducer.stdDev())

@@ -16,8 +16,8 @@ from tqdm import tqdm
 # area, which previously caused tile counts to balloon at high latitudes
 # and tile ground size to shrink toward the poles.
 _GRID_CRS = settings.crs
-_to_grid_crs = Transformer.from_crs("EPSG:6933", _GRID_CRS, always_xy=True)
-_from_grid_crs = Transformer.from_crs(_GRID_CRS, "EPSG:6933", always_xy=True)
+_to_grid_crs = Transformer.from_crs("EPSG:4326", _GRID_CRS, always_xy=True)
+_from_grid_crs = Transformer.from_crs(_GRID_CRS, "EPSG:4326", always_xy=True)
 
 
 def _snap(coord_m: float, *, down: bool) -> float:
@@ -39,7 +39,7 @@ def _xy2lonlat(x: float, y: float) -> tuple[float, float]:
 def tile_geom(tile: dict) -> ee.Geometry:
     return ee.Geometry.Rectangle(
         [tile["min_lon"], tile["min_lat"], tile["max_lon"], tile["max_lat"]],
-        proj=ee.Projection(settings.crs_wkt),
+        proj=ee.Projection("EPSG:4326"),
         geodesic=False,
     )
 

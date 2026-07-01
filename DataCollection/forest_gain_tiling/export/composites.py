@@ -22,8 +22,6 @@ def _add_indices(img: ee.Image) -> ee.Image:
 
 
 def _date_range(year: int) -> tuple[str, str]:
-    if year == 2016:
-        return "2015-01-01", "2016-12-31"
     return f"{year}-01-01", f"{year}-12-31"
 
 
@@ -79,12 +77,8 @@ def s2_peak(geom: ee.Geometry, year: int, ds: Datasets) -> ee.Image:  # noqa: AR
     centroid = ee.Geometry(geom).centroid(maxError=1)
     north = ee.Number(centroid.coordinates().get(1)).gt(0)
 
-    if year == 2016:
-        start = ee.String(ee.Algorithms.If(north, "2015-05-01", "2015-11-01"))
-        end = ee.String(ee.Algorithms.If(north, "2016-09-30", "2017-03-31"))
-    else:
-        start = ee.String(ee.Algorithms.If(north, f"{year}-05-01", f"{year}-11-01"))
-        end = ee.String(ee.Algorithms.If(north, f"{year}-09-30", f"{year+1}-03-31"))
+    start = ee.String(ee.Algorithms.If(north, f"{year}-05-01", f"{year}-11-01"))
+    end = ee.String(ee.Algorithms.If(north, f"{year}-09-30", f"{year+1}-03-31"))
 
     return (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")

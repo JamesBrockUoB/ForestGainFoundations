@@ -56,7 +56,7 @@ def check_viability(
 
 def check_s2_coverage(geom: ee.Geometry) -> tuple[bool, str | None, dict]:
     fracs = {
-        year: s2_coverage_frac(geom, year).getInfo() for year in (2016, 2020, 2025)
+        year: s2_coverage_frac(geom, year).getInfo() for year in (2017, 2020, 2025)
     }
 
     if any(f < settings.s2_min_valid_frac for f in fracs.values()):
@@ -116,7 +116,7 @@ def filter_tile_with_stats(tile: dict, ds: Datasets) -> dict:
     viability = score_viability(geom, gain_validated, ds)
 
     fracs = {
-        year: s2_coverage_frac(geom, year).getInfo() for year in (2016, 2020, 2025)
+        year: s2_coverage_frac(geom, year).getInfo() for year in (2017, 2020, 2025)
     }
 
     status, reason = filter_tile(tile, ds)
@@ -126,7 +126,7 @@ def filter_tile_with_stats(tile: dict, ds: Datasets) -> dict:
         "gain_pct": gain_pct,
         "ndvi_delta": viability["ndvi_delta"],
         "gain_canopy_mean": viability["gain_canopy_mean"],
-        "s2_2016": fracs[2016],
+        "s2_2017": fracs[2017],
         "s2_2020": fracs[2020],
         "s2_2025": fracs[2025],
         "status": status,
