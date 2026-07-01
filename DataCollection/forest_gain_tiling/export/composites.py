@@ -46,7 +46,7 @@ def s2_coverage_frac(geom: ee.Geometry, year: int) -> ee.Number:
         reducer=ee.Reducer.mean(),
         geometry=geom,
         scale=settings.scale,
-        crs=settings.crs,
+        crs=settings.crs_wkt,
         maxPixels=1_000_000_000,
     )
     return ee.Number(ee.Algorithms.If(stats.get("valid"), stats.get("valid"), 0))

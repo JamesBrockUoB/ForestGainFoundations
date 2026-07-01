@@ -40,7 +40,7 @@ def process_tile(tile: dict[str, Any], ds: Datasets, logger: logging.Logger) -> 
             fileNamePrefix=tile_id,
             region=geom,
             scale=settings.scale,
-            crs=settings.crs,
+            crs=settings.crs_wkt,
             crsTransform=ct,
             maxPixels=10_000_000_000_000,
             fileFormat="GeoTIFF",

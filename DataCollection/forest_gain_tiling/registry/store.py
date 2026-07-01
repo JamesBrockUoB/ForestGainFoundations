@@ -43,6 +43,11 @@ def save_tiles_batch(tiles: list[dict[str, Any]], batch_size: int = 1000000) -> 
     return _get_db().insert_batch(tiles, batch_size=batch_size)
 
 
+def reset_tiles(status: str | None = None, clear_history: bool = False) -> int:
+    """Bulk-reset tile statuses back to 'pending'. Returns rows affected."""
+    return _get_db().reset_tiles(status=status, clear_history=clear_history)
+
+
 def update_tile(tile_id: str, **kwargs: Any) -> None:
     """Update specific fields on a tile and persist immediately."""
     if "status" in kwargs and isinstance(kwargs["status"], TileStatus):

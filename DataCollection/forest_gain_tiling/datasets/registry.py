@@ -43,9 +43,16 @@ class Datasets:
 
         self.dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
 
-        self.glulc_2015 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2015").select([0])
-        self.glulc_2020 = ee.Image("projects/glad/GLCLU2020/v2/LCLUC_2020").select([0])
+        self.dt_cover_2017 = (
+            ee.Image("projects/symbolic-base-346316/assets/dt_tree_cover_2017_mosaic")
+            .select(0)
+            .divide(2.55)
+            .rename("tree_cover_pct")
+        )
 
-        self.tree_classes: ee.List = ee.List.sequence(25, 96).cat(
-            ee.List.sequence(125, 196)
+        self.dt_cover_2020 = (
+            ee.Image("projects/symbolic-base-346316/assets/dt_tree_cover_2020_mosaic")
+            .select(0)
+            .divide(2.55)
+            .rename("tree_cover_pct")
         )

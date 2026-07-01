@@ -19,7 +19,7 @@ def check_gain(
         reducer=ee.Reducer.mean(),
         geometry=geom,
         scale=settings.scale,
-        crs=settings.crs,
+        crs=settings.crs_wkt,
         crsTransform=ct,
         maxPixels=1_000_000_000,
     )
@@ -103,7 +103,7 @@ def filter_tile_with_stats(tile: dict, ds: Datasets) -> dict:
         reducer=ee.Reducer.mean(),
         geometry=geom,
         scale=settings.scale,
-        crs=settings.crs,
+        crs=settings.crs_wkt,
         crsTransform=ct,
         maxPixels=1_000_000_000,
     )

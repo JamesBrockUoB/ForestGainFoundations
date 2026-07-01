@@ -358,6 +358,47 @@ class RegistryDB:
             ).fetchall()
             return {row["rejection_reason"]: row["cnt"] for row in rows}
 
+    def reset_tiles(
+        self, status: str | None = None, clear_history: bool = False
+    ) -> int:
+        """
+        Reset tile statuses back to 'pending' in a single bulk UPDATE.
+
+        status: if given, only reset tiles currently in this status.
+            If None, reset every tile not already pending.
+        clear_history: if True, also null out gee_task_id, submitted_at,
+            completed_at, rejection_reason, and error — a full wipe back
+            to a blank pending row. If False (default), only the status
+            flag is flipped and the old error/rejection_reason remain
+            visible for debugging.
+
+        Returns the number of rows affected.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        pending = str(TileStatus.PENDING)
+
+        set_clause = "status = ?, updated_at = ?"
+        params: list[Any] = [pending, now]
+
+        if clear_history:
+            set_clause += (
+                ", gee_task_id = NULL, submitted_at = NULL, "
+                "completed_at = NULL, rejection_reason = NULL, error = NULL"
+            )
+
+        query = f"UPDATE tiles SET {set_clause}"
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status)
+        else:
+            query += " WHERE status != ?"
+            params.append(pending)
+
+        with self._conn() as conn:
+            cursor = conn.execute(query, params)
+            conn.commit()
+            return cursor.rowcount
+
     def clear_all(self) -> None:
         """Clear all tiles and AOI relationships (use with caution)."""
         with self._conn() as conn:

@@ -60,7 +60,7 @@ def aoi_bbox_geom(extent: dict):
             extent["origin_x"] + extent["n_cols"] * sz,
             extent["origin_y"],
         ],
-        proj=ee.Projection(settings.crs),
+        proj=ee.Projection(settings.crs_wkt),
         geodesic=False,
     )
 
@@ -111,15 +111,13 @@ def filter_aoi(
     Run the raster-batch filter for one AOI's pending tiles.
     Updates tile statuses in the DB. Returns counts of valid/rejected/skipped.
     """
-    sz = settings.tile_size_m
     extent = compute_aoi_extent(tiles)
     n_rows = extent["n_rows"]
     n_cols = extent["n_cols"]
     geom = aoi_bbox_geom(extent)
 
     logger.info(
-        f"  [{aoi_id}] extent: {n_cols}x{n_rows} tiles "
-        f"({n_cols * n_cols} total) | "
+        f"[{aoi_id}] grid span: {n_cols}x{n_rows} tiles | "
         f"origin=({extent['origin_x']:.0f}, {extent['origin_y']:.0f})"
     )
 

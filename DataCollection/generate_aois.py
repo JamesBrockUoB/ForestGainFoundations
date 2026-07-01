@@ -92,7 +92,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+creds_path = PROJECT_ROOT / os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 credentials = ee.ServiceAccountCredentials(None, creds_path)
 
@@ -606,7 +606,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
 
 def _worker(batch_queue, result_queue, worker_id):
-    _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    _creds_path = PROJECT_ROOT / os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     _credentials = ee.ServiceAccountCredentials(None, _creds_path)
     time.sleep(worker_id * 5)
     ee.Initialize(_credentials, project=GEE_PROJECT)

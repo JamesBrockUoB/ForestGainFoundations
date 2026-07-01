@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ee
-
 from config import settings
 from datasets.registry import Datasets
 from export.composites import s2_peak
@@ -20,10 +19,10 @@ def score_viability(
     )
 
     nd_stats = ndvi_d.reduceRegion(
-        ee.Reducer.median(), geom, settings.scale, settings.crs, maxPixels=1e13
+        ee.Reducer.median(), geom, settings.scale, settings.crs_wkt, maxPixels=1e13
     )
     ch_stats = ds.meta_ch.updateMask(gm).reduceRegion(
-        ee.Reducer.mean(), geom, settings.scale, settings.crs, maxPixels=1e13
+        ee.Reducer.mean(), geom, settings.scale, settings.crs_wkt, maxPixels=1e13
     )
 
     nd_val = ee.Number(ee.Algorithms.If(nd_stats.get("NDVI"), nd_stats.get("NDVI"), 0))

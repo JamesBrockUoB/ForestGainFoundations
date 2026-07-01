@@ -44,6 +44,17 @@ class Settings:
     tile_pixels: int = 128
     scale: int = 10
     crs: str = "EPSG:6933"
+    crs_wkt: str = (
+        'PROJCS["WGS 84 / NSIDC EASE-Grid 2.0 Global",'
+        'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,'
+        'AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,'
+        'AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,'
+        'AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]],'
+        'PROJECTION["Cylindrical_Equal_Area"],PARAMETER["standard_parallel_1",30],'
+        'PARAMETER["central_meridian",0],PARAMETER["false_easting",0],'
+        'PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],'
+        'AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["EPSG","6933"]]'
+    )
 
     min_aoi_overlap_frac: float = 0.1
     gain_pct_min: float = 1.0

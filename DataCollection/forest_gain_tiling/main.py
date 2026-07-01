@@ -10,10 +10,13 @@ Commands
   python main.py run --limit 500                   # next N valid tiles
   python main.py run --biome "Boreal Forests"      # filter by biome (substring match)
   python main.py run --region Neotropic            # filter by region
-  python main.py run --aoi-id aoi_-73.25_-52.75   # single AOI (debug)
+  python main.py run --aoi-id aoi_-73.25_-52.75    # single AOI (debug)
   python main.py run --status failed               # retry failed tiles
   python main.py status                            # print registry summary
   python main.py audit                             # report AOIs with no tiles
+  python main.py reset --status failed             # retry only failed tiles, keep error text
+  python main.py reset --status rejected --yes     # re-filter previously rejected tiles, no prompt
+  python main.py reset --clear-history             # nuke everything back to blank pending
 
 Filter flags
 ------------
@@ -247,6 +250,29 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(registry_summary())
 
 
+def cmd_reset(args: argparse.Namespace) -> None:
+    """Reset tile statuses back to pending (destructive)."""
+    logger = setup_logging("reset")
+
+    from registry.store import reset_tiles
+
+    label = args.status or "ALL (non-pending)"
+    history_note = " and clear processing history" if args.clear_history else ""
+
+    if not args.yes:
+        confirm = input(
+            f"This will reset {label} tiles back to 'pending'{history_note}. "
+            f"Type 'yes' to confirm: "
+        )
+        if confirm.strip().lower() != "yes":
+            logger.info("Aborted.")
+            return
+
+    n = reset_tiles(status=args.status, clear_history=args.clear_history)
+    logger.info(f"Reset {n:,} tiles to pending.")
+    print(registry_summary())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Forest-gain tile export pipeline",
@@ -290,6 +316,29 @@ def build_parser() -> argparse.ArgumentParser:
         dest="stratify_mode",
     )
 
+    reset_p = sub.add_parser("reset", help="Reset tile statuses back to pending")
+    reset_p.add_argument(
+        "--status",
+        default=None,
+        choices=[
+            str(s)
+            for s in (
+                TileStatus.VALID,
+                TileStatus.FAILED,
+                TileStatus.REJECTED,
+                TileStatus.SUBMITTED,
+                TileStatus.COMPLETE,
+            )
+        ],
+        help="Only reset tiles currently in this status (default: reset all non-pending tiles)",
+    )
+    reset_p.add_argument(
+        "--clear-history",
+        action="store_true",
+        help="Also clear gee_task_id, submitted_at, completed_at, rejection_reason, error",
+    )
+    reset_p.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
     return parser
 
 
@@ -306,5 +355,6 @@ if __name__ == "__main__":
         "audit": cmd_audit,
         "filter": cmd_filter,
         "run": cmd_run,
+        "reset": cmd_reset,
     }
     dispatch[args.command](args)
