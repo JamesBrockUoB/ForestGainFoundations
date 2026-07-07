@@ -15,6 +15,7 @@ from config import settings
 from datasets.registry import Datasets
 from enums import TileStatus
 from export.drive import rclone_to_hpc
+from gee.auth import get_ee_credentials
 from labels.gain import build_gain_layer
 from registry.store import update_tile
 from stack.stacks import build_full_stack, build_full_valid
@@ -31,7 +32,7 @@ def process_tile(tile: dict[str, Any], ds: Datasets, logger: logging.Logger) -> 
         gain_validated, _ = build_gain_layer(geom, ds)
 
         full_valid = build_full_valid(geom)
-        stack = build_full_stack(tile, geom, gain_validated, full_valid, ds)
+        stack = build_full_stack(geom, gain_validated, full_valid, ds)
 
         task = ee.batch.Export.image.toDrive(
             image=stack,
@@ -101,9 +102,8 @@ def run_local(candidates: list[dict], ds: Datasets, logger: logging.Logger) -> N
 
 def _mp_worker(tile_queue: mp.Queue, result_queue: mp.Queue, worker_id: int) -> None:
     """Worker process for HPC mode."""
-    credentials = ee.ServiceAccountCredentials(None, settings.gee_credentials)
     time.sleep(worker_id * 5)
-    ee.Initialize(credentials, project=settings.gee_project)
+    ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
     ds = Datasets()
     logger = logging.getLogger(f"gee.worker.{worker_id}")

@@ -7,22 +7,29 @@ Runs in two modes controlled by the USE_HPC environment variable:
   USE_HPC=0 (default) — single-process, sequential batches, suitable for local dev
   USE_HPC=1           — multiprocess workers + dedicated writer thread for HPC/SLURM
 
+Period is controlled by the PERIOD environment variable:
+  PERIOD=p1 (default) — 2017 → 2020
+  PERIOD=p2           — 2020 → 2024
+
 Usage:
   # Local
-  python generate_aois.py
+  PERIOD=p1 python generate_aois.py
 
   # HPC
-  USE_HPC=1 NUM_WORKERS=32 sbatch submit_aoi_generation.sh
+  PERIOD=p2 USE_HPC=1 NUM_WORKERS=32 sbatch submit_aoi_generation.sh
 
 Validity checks
 ────────────────────────────────────────────────────────────────────────────────
 1. Has land          USDOS/LSIB_SIMPLE/2017 — excludes open ocean
 2. Has vegetation    ESA WorldCover trees (10) or mangrove (95) ≥ 1%
-                     Threshold relaxed to 0.5% if UMD forest gain confirmed
-                     (UMD 30m and ESA 1km aggregation can disagree)
-3. Has S2 imagery    COPERNICUS/S2_SR_HARMONIZED — 2016, 2020 and 2025 required
-4. Has forest gain   UMD GLCLUC 2015→2020 — at least 0.1% of cell must show
-                     tree cover gain (class 25-96, 125-196 in 2020 but not 2015)
+3. Has imagery       S2 (COPERNICUS/S2_SR_HARMONIZED) and S1 (COPERNICUS/S1_GRD)
+                     — every calendar year in the active period must clear 5%
+                     valid-pixel coverage for both sensors
+                     PERIOD=p1 → 2017,2018,2019,2020
+                     PERIOD=p2 → 2020,2021,2022,2023,2024
+4. Has forest gain   DT year_start→year_end for the active period — at least 0.1%
+                     of cell must show tree cover gain with over 50% confidence
+                     counting as tree cover
 
 Output fields per AOI
 ────────────────────────────────────────────────────────────────────────────────
@@ -31,7 +38,7 @@ valid
 rejection_reason
 veg_fraction
 forest_gain_frac
-s2_count_2017/2020/2025
+has_imagery
 """
 
 import json
@@ -45,24 +52,32 @@ from pathlib import Path
 
 import ee
 from dotenv import load_dotenv
+from forest_gain_tiling.config import settings
+from forest_gain_tiling.gee.auth import get_ee_credentials
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
-
-GEE_PROJECT = os.getenv("GEE_PROJECT")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/"))
 
-OUTPUT_FILE = (
-    PROJECT_ROOT / OUTPUT_DIR / os.getenv("OUTPUT_FILE", "aois/valid_aois.json")
-)
+PERIOD = os.getenv("PERIOD", "p1")  # "p1" = 2017→2020, "p2" = 2020→2024
 
-REJECTED_OUTPUT_FILE = OUTPUT_FILE.parent / "rejected_aois.json"
+PERIOD_YEARS = {
+    "p1": (2017, 2020),
+    "p2": (2020, 2024),
+}
+
+if PERIOD not in PERIOD_YEARS:
+    raise ValueError(f"PERIOD must be one of {list(PERIOD_YEARS)}, got {PERIOD!r}")
+
+YEAR_START, YEAR_END = PERIOD_YEARS[PERIOD]
+
+OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois_{PERIOD}.json"
+REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"rejected_aois_{PERIOD}.json"
+CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / f"aoi_filter_checkpoint_{PERIOD}.json"
 
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-CHECKPOINT = OUTPUT_FILE.parent / "aoi_filter_checkpoint.json"
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))
 AOI_STEP = float(os.getenv("AOI_STEP", 0.25))
@@ -75,8 +90,21 @@ SEARCH_MODE = os.getenv("SEARCH_MODE", "asset")
 MIN_VEG_FRACTION = 0.01
 MIN_LAND_FRACTION = 0.01
 MIN_GAIN_FRACTION = 0.001
+MIN_IMAGERY_FRACTION = 0.05
 
-AOI_LIST_CACHE = OUTPUT_FILE.parent / "all_aois.json"
+# Coverage-check band subsets. NOT for spectral analysis — these are a
+# deliberately small, high-resolution proxy for "is there usable imagery
+# here at all", not the full band set consumed by any downstream analysis.
+S2_BANDS = [
+    "B2",
+    "B4",
+    "B8",
+]  # blue + red + NIR, 10m — strong proxy for full-scene coverage
+S1_BANDS = ["VV", "VH"]
+
+# AOI_LIST_CACHE is intentionally NOT period-namespaced: the raw 0.25° grid
+# of candidate land cells is identical regardless of which period is active.
+AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "all_aois.json"
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -92,13 +120,16 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-creds_path = PROJECT_ROOT / os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+# OAuth user credentials (from `ee.Authenticate()`), not a service account.
+# get_ee_credentials() reads the refresh token from
+# settings.ee_credentials_path if set (env var EE_CREDENTIALS_PATH),
+# otherwise the library default ~/.config/earthengine/credentials, and
+# merges in ee's bundled OAuth client id/secret/token_uri.
+ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
-credentials = ee.ServiceAccountCredentials(None, str(creds_path))
-
-ee.Initialize(credentials, project=GEE_PROJECT)
-
-logger.info(f"GEE initialised | project={GEE_PROJECT} | HPC={USE_HPC}")
+logger.info(
+    f"GEE initialised | project={settings.gee_project} | HPC={USE_HPC} | PERIOD={PERIOD}"
+)
 
 
 def _build_gee_datasets():
@@ -120,13 +151,13 @@ def _build_gee_datasets():
             .rename("tree_cover_pct")
         )
 
-    _cover_2017 = load_dt_mosaic(2017)
-    _cover_2020 = load_dt_mosaic(2020)
+    _cover_start = load_dt_mosaic(YEAR_START)
+    _cover_end = load_dt_mosaic(YEAR_END)
 
-    _forest_2017 = _cover_2017.gt(50).unmask(0)
-    _forest_2020 = _cover_2020.gt(50).unmask(0)
+    _forest_start = _cover_start.gt(50).unmask(0)
+    _forest_end = _cover_end.gt(50).unmask(0)
 
-    _gain_mask = _forest_2017.Not().And(_forest_2020).rename("gain").unmask(0)
+    _gain_mask = _forest_start.Not().And(_forest_end).rename("gain").unmask(0)
 
     _ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
 
@@ -207,66 +238,69 @@ def mask_s2_scl(img):
     return img.updateMask(mask)
 
 
-def has_usable_s2(geom):
-    def year_frac(start, end):
-        bands = [
-            "B1",
-            "B2",
-            "B3",
-            "B4",
-            "B5",
-            "B6",
-            "B7",
-            "B8",
-            "B8A",
-            "B9",
-            "B11",
-            "B12",
-        ]
+def _year_valid_fraction(collection_id, geom, start, end, bands, mask_fn=None):
+    """
+    Fraction of geom covered by at least one fully-unmasked pixel, across all
+    images in collection_id intersecting geom within [start, end), for the
+    given bands.
+    """
+    col = ee.ImageCollection(collection_id).filterDate(start, end).filterBounds(geom)
 
-        col = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterDate(start, end)
-            .filterBounds(geom)
-            .map(mask_s2_scl)
-            .select(bands)
+    if mask_fn is not None:
+        col = col.map(mask_fn)
+
+    col = col.select(bands)
+
+    def valid_mask(img):
+        return img.mask().reduce(ee.Reducer.min()).rename("valid")
+
+    valid = col.map(valid_mask).max()
+
+    valid = ee.Image(
+        ee.Algorithms.If(
+            valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
         )
-
-        def valid_mask(img):
-            return img.mask().reduce(ee.Reducer.min()).rename("valid")
-
-        valid = col.map(valid_mask).max()
-
-        valid = ee.Image(
-            ee.Algorithms.If(
-                valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
-            )
-        )
-
-        return valid.reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=geom, scale=500, maxPixels=1e9
-        ).get("valid")
-
-    fracs = ee.Dictionary(
-        {
-            "2017": safe_num(year_frac("2017-01-01", "2017-12-31"), 0),
-            "2020": safe_num(year_frac("2020-01-01", "2020-12-31"), 0),
-            "2025": safe_num(year_frac("2025-01-01", "2025-12-31"), 0),
-        }
     )
 
-    return (
-        fracs.getNumber("2017")
-        .gte(0.05)
-        .And(fracs.getNumber("2020").gte(0.05))
-        .And(fracs.getNumber("2025").gte(0.05))
-    )
+    return valid.reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=geom, scale=500, maxPixels=1e9
+    ).get("valid")
+
+
+def has_usable_imagery(geom, min_frac=MIN_IMAGERY_FRACTION):
+    """
+    Requires, for every calendar year in [YEAR_START, YEAR_END] inclusive,
+    both S2 and S1 valid-pixel coverage >= min_frac over geom.
+    """
+    conditions = []
+
+    for year in range(YEAR_START, YEAR_END + 1):
+        start, end = f"{year}-01-01", f"{year}-12-31"
+
+        s2_frac = safe_num(
+            _year_valid_fraction(
+                "COPERNICUS/S2_SR_HARMONIZED", geom, start, end, S2_BANDS, mask_s2_scl
+            ),
+            0,
+        )
+        s1_frac = safe_num(
+            _year_valid_fraction("COPERNICUS/S1_GRD", geom, start, end, S1_BANDS),
+            0,
+        )
+
+        conditions.append(s2_frac.gte(min_frac).And(s1_frac.gte(min_frac)))
+
+    result = conditions[0]
+    for c in conditions[1:]:
+        result = result.And(c)
+
+    return result
 
 
 def forest_gain_fraction_dt(_gain_mask, geom, scale=100):
     """
-    Fraction of pixels in geom that transitioned from non-forest (2017)
-    to forest (2020) using the deadtrees.earth product at 10m resolution.
+    Fraction of pixels in geom that transitioned from non-forest (YEAR_START)
+    to forest (YEAR_END) using the deadtrees.earth product at 10m resolution.
     Reduced at 100m scale for speed — sufficient for AOI-level filtering.
     """
     val = _gain_mask.reduceRegion(
@@ -288,7 +322,7 @@ def rejection_reason_str(reason_code):
     if reason_code & 0x1:
         reasons.append("insufficient_veg")
     if reason_code & 0x2:
-        reasons.append("missing_s2")
+        reasons.append("missing_imagery")
     if reason_code & 0x4:
         reasons.append("no_land")
     if reason_code & 0x8:
@@ -520,12 +554,12 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     has_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 1))
     no_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 0))
 
-    def add_s2(f):
-        return f.set("has_s2", has_usable_s2(f.geometry()))
+    def add_imagery(f):
+        return f.set("has_imagery", has_usable_imagery(f.geometry()))
 
-    has_gain_fc = has_gain_fc.map(add_s2)
-    valid_fc = has_gain_fc.filter(ee.Filter.eq("has_s2", 1))
-    no_s2_fc = has_gain_fc.filter(ee.Filter.eq("has_s2", 0))
+    has_gain_fc = has_gain_fc.map(add_imagery)
+    valid_fc = has_gain_fc.filter(ee.Filter.eq("has_imagery", 1))
+    no_imagery_fc = has_gain_fc.filter(ee.Filter.eq("has_imagery", 0))
 
     no_land_fc = no_land_fc.map(
         lambda f: f.set(
@@ -552,12 +586,12 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
     no_gain_fc = no_gain_fc.map(
         lambda f: f.set("rejection_reason", "no_forest_gain", "valid", 0)
     )
-    no_s2_fc = no_s2_fc.map(
-        lambda f: f.set("rejection_reason", "missing_s2", "valid", 0)
+    no_imagery_fc = no_imagery_fc.map(
+        lambda f: f.set("rejection_reason", "missing_imagery", "valid", 0)
     )
     valid_fc = valid_fc.map(lambda f: f.set("rejection_reason", "valid", "valid", 1))
 
-    all_rejected = no_land_fc.merge(no_veg_fc).merge(no_gain_fc).merge(no_s2_fc)
+    all_rejected = no_land_fc.merge(no_veg_fc).merge(no_gain_fc).merge(no_imagery_fc)
 
     all_fc = valid_fc.merge(all_rejected)
     all_results = all_fc.getInfo()["features"]
@@ -606,11 +640,12 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
 
 def _worker(batch_queue, result_queue, worker_id):
-    _creds_path = PROJECT_ROOT / os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    _credentials = ee.ServiceAccountCredentials(None, _creds_path)
     time.sleep(worker_id * 5)
-    ee.Initialize(_credentials, project=GEE_PROJECT)
-
+    # See the module-level ee.Initialize call above for why this uses
+    # get_ee_credentials() instead of a service account: each worker
+    # process needs its own ee.Initialize call since GEE state isn't
+    # inherited across the multiprocessing fork/spawn boundary.
+    ee.Initialize(get_ee_credentials(), project=settings.gee_project)
     _land_raster, _esa_veg, _gain_mask, _ecoregions = _build_gee_datasets()
 
     while True:
@@ -822,7 +857,9 @@ if __name__ == "__main__":
         logger.info(f"Generating AOI list — mode={SEARCH_MODE}")
 
         if SEARCH_MODE == "asset":
-            min_lon, min_lat, max_lon, max_lat = get_asset_bounds()
+            min_lon, min_lat, max_lon, max_lat = get_asset_bounds(
+                year_start=YEAR_START, year_end=YEAR_END
+            )
         else:
             min_lon, min_lat, max_lon, max_lat = -180.0, -60.0, 180.0, 85.0
 

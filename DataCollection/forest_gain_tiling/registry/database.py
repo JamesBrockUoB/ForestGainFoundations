@@ -13,7 +13,15 @@ from enums import TileStatus
 
 
 class RegistryDB:
-    """SQLite database wrapper for tile registry with streaming/pagination support."""
+    """SQLite database wrapper for tile registry with streaming/pagination support.
+
+    A single database holds tiles for every period; the `period` column
+    (e.g. "p1", "p2") distinguishes them. Most read/write methods accept an
+    optional `period` filter — pass it explicitly (or rely on the caller
+    already having filtered) whenever an operation should not mix periods,
+    since gain/imagery validity is period-specific even for a tile at the
+    same grid location.
+    """
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or settings.registry_db_path
@@ -40,6 +48,7 @@ class RegistryDB:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tiles (
                     tile_id TEXT PRIMARY KEY,
+                    period TEXT NOT NULL,
                     xi INTEGER NOT NULL,
                     yi INTEGER NOT NULL,
                     x_min_m REAL NOT NULL,
@@ -78,6 +87,12 @@ class RegistryDB:
                 CREATE INDEX IF NOT EXISTS idx_status ON tiles(status)
                 """)
             conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_period ON tiles(period)
+                """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_period_status ON tiles(period, status)
+                """)
+            conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_biome ON tiles(biome)
                 """)
             conn.execute("""
@@ -107,14 +122,15 @@ class RegistryDB:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO tiles (
-                    tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
+                    tile_id, period, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
                     min_lon, min_lat, max_lon, max_lat, biome, region,
                     status, gee_task_id, submitted_at, completed_at,
                     rejection_reason, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tile["tile_id"],
+                    tile.get("period", settings.period),
                     tile["xi"],
                     tile["yi"],
                     tile["x_min_m"],
@@ -164,6 +180,7 @@ class RegistryDB:
                 params_list = [
                     (
                         tile["tile_id"],
+                        tile.get("period", settings.period),
                         tile["xi"],
                         tile["yi"],
                         tile["x_min_m"],
@@ -191,11 +208,11 @@ class RegistryDB:
                 cursor = conn.executemany(
                     """
                     INSERT OR IGNORE INTO tiles (
-                        tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
+                        tile_id, period, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
                         min_lon, min_lat, max_lon, max_lat, biome, region,
                         status, gee_task_id, submitted_at, completed_at,
                         rejection_reason, error, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     params_list,
                 )
@@ -234,24 +251,6 @@ class RegistryDB:
 
             return self._row_to_dict(row, aoi_ids)
 
-    def get_aoi_tile_counts(self, aoi_id: str) -> dict[str, int]:
-        """
-        Get status counts for a single AOI (used for audit).
-        Fast indexed query - uses junction table instead of string search.
-        """
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT t.status, COUNT(*) as cnt
-                FROM tiles t
-                INNER JOIN tile_aois ta ON t.tile_id = ta.tile_id
-                WHERE ta.aoi_id = ?
-                GROUP BY t.status
-                """,
-                (aoi_id,),
-            ).fetchall()
-            return {row["status"]: row["cnt"] for row in rows}
-
     def update_tile(self, tile_id: str, **kwargs: Any) -> None:
         """Update specific fields on a tile."""
         now = datetime.now(timezone.utc).isoformat()
@@ -265,18 +264,28 @@ class RegistryDB:
             conn.commit()
 
     def list_tiles(
-        self, status: str | None = None, limit: int | None = None, offset: int = 0
+        self,
+        status: str | None = None,
+        period: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """
-        Stream tiles with optional status filter, with pagination.
+        Stream tiles with optional status/period filters, with pagination.
         Use limit/offset for memory-efficient iteration over large datasets.
         """
         query = "SELECT * FROM tiles"
-        params = []
+        clauses = []
+        params: list[Any] = []
 
         if status is not None:
-            query += " WHERE status = ?"
+            clauses.append("status = ?")
             params.append(status)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
 
         query += " ORDER BY updated_at DESC"
 
@@ -296,35 +305,54 @@ class RegistryDB:
                 result.append(self._row_to_dict(row, aoi_ids))
             return result
 
-    def count_tiles(self, status: str | None = None) -> int:
-        """Count tiles, optionally filtered by status."""
+    def count_tiles(self, status: str | None = None, period: str | None = None) -> int:
+        """Count tiles, optionally filtered by status and/or period."""
         query = "SELECT COUNT(*) as cnt FROM tiles"
-        params = []
+        clauses = []
+        params: list[Any] = []
 
         if status is not None:
-            query += " WHERE status = ?"
+            clauses.append("status = ?")
             params.append(status)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
 
         with self._conn() as conn:
             result = conn.execute(query, params).fetchone()
             return result["cnt"]
 
-    def status_counts(self) -> dict[str, int]:
-        """Get counts by status."""
+    def status_counts(self, period: str | None = None) -> dict[str, int]:
+        """Get counts by status, optionally scoped to one period."""
+        query = "SELECT status, COUNT(*) as cnt FROM tiles"
+        params: list[Any] = []
+        if period is not None:
+            query += " WHERE period = ?"
+            params.append(period)
+        query += " GROUP BY status"
+
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) as cnt FROM tiles GROUP BY status"
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
             return {row["status"]: row["cnt"] for row in rows}
 
-    def biome_counts(self, status_filter: str | None = None) -> dict[str, int]:
-        """Get counts by biome, optionally filtered by status."""
+    def biome_counts(
+        self, status_filter: str | None = None, period: str | None = None
+    ) -> dict[str, int]:
+        """Get counts by biome, optionally filtered by status and/or period."""
         query = "SELECT biome, COUNT(*) as cnt FROM tiles"
-        params = []
+        clauses = []
+        params: list[Any] = []
 
         if status_filter is not None:
-            query += " WHERE status = ?"
+            clauses.append("status = ?")
             params.append(status_filter)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
 
         query += " GROUP BY biome ORDER BY cnt DESC"
 
@@ -332,14 +360,22 @@ class RegistryDB:
             rows = conn.execute(query, params).fetchall()
             return {row["biome"]: row["cnt"] for row in rows}
 
-    def region_counts(self, status_filter: str | None = None) -> dict[str, int]:
-        """Get counts by region, optionally filtered by status."""
+    def region_counts(
+        self, status_filter: str | None = None, period: str | None = None
+    ) -> dict[str, int]:
+        """Get counts by region, optionally filtered by status and/or period."""
         query = "SELECT region, COUNT(*) as cnt FROM tiles"
-        params = []
+        clauses = []
+        params: list[Any] = []
 
         if status_filter is not None:
-            query += " WHERE status = ?"
+            clauses.append("status = ?")
             params.append(status_filter)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
 
         query += " GROUP BY region ORDER BY cnt DESC"
 
@@ -347,38 +383,56 @@ class RegistryDB:
             rows = conn.execute(query, params).fetchall()
             return {row["region"]: row["cnt"] for row in rows}
 
-    def rejection_counts(self) -> dict[str, int]:
-        """Get rejection reason counts."""
+    def rejection_counts(self, period: str | None = None) -> dict[str, int]:
+        """Get rejection reason counts, optionally scoped to one period."""
+        query = (
+            "SELECT rejection_reason, COUNT(*) as cnt FROM tiles "
+            "WHERE status = ? AND rejection_reason IS NOT NULL"
+        )
+        params: list[Any] = [str(TileStatus.REJECTED)]
+        if period is not None:
+            query += " AND period = ?"
+            params.append(period)
+        query += " GROUP BY rejection_reason ORDER BY cnt DESC"
+
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT rejection_reason, COUNT(*) as cnt FROM tiles "
-                "WHERE status = ? AND rejection_reason IS NOT NULL "
-                "GROUP BY rejection_reason ORDER BY cnt DESC",
-                (str(TileStatus.REJECTED),),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
             return {row["rejection_reason"]: row["cnt"] for row in rows}
 
     def reset_tiles(
-        self, status: str | None = None, clear_history: bool = False
+        self,
+        status: str | None = None,
+        period: str | None = None,
+        clear_history: bool = False,
+        to_status: str = str(TileStatus.PENDING),
     ) -> int:
         """
-        Reset tile statuses back to 'pending' in a single bulk UPDATE.
+        Reset tile statuses back to `to_status` in a single bulk UPDATE.
 
         status: if given, only reset tiles currently in this status.
-            If None, reset every tile not already pending.
+            If None, reset every tile not already in `to_status` (within
+            `period`, if given).
+        period: if given, only reset tiles in this period. Strongly
+            recommended — resetting across periods indiscriminately will
+            queue tiles from a period you didn't mean to touch back
+            through the filter pipeline.
+        to_status: the status to reset tiles into (default 'pending').
+            Use this to resume a specific pipeline stage — e.g. resetting
+            FAILED tiles that died during the imagery stage back to
+            'cheap_valid' instead of all the way to 'pending', so stage 1
+            isn't redone.
         clear_history: if True, also null out gee_task_id, submitted_at,
             completed_at, rejection_reason, and error — a full wipe back
-            to a blank pending row. If False (default), only the status
-            flag is flipped and the old error/rejection_reason remain
-            visible for debugging.
+            to a blank row. If False (default), only the status flag is
+            flipped and the old error/rejection_reason remain visible for
+            debugging.
 
         Returns the number of rows affected.
         """
         now = datetime.now(timezone.utc).isoformat()
-        pending = str(TileStatus.PENDING)
 
         set_clause = "status = ?, updated_at = ?"
-        params: list[Any] = [pending, now]
+        params: list[Any] = [to_status, now]
 
         if clear_history:
             set_clause += (
@@ -387,12 +441,17 @@ class RegistryDB:
             )
 
         query = f"UPDATE tiles SET {set_clause}"
+        clauses = []
         if status is not None:
-            query += " WHERE status = ?"
+            clauses.append("status = ?")
             params.append(status)
         else:
-            query += " WHERE status != ?"
-            params.append(pending)
+            clauses.append("status != ?")
+            params.append(to_status)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        query += " WHERE " + " AND ".join(clauses)
 
         with self._conn() as conn:
             cursor = conn.execute(query, params)
@@ -415,6 +474,7 @@ class RegistryDB:
 
         return {
             "tile_id": row["tile_id"],
+            "period": row["period"],
             "xi": row["xi"],
             "yi": row["yi"],
             "x_min_m": row["x_min_m"],

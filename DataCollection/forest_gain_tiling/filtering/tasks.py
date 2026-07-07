@@ -4,157 +4,182 @@ import logging
 import multiprocessing as mp
 import threading
 import time
+from itertools import islice
 
 import ee
 from config import settings
 from datasets.registry import Datasets
 from enums import TileStatus
-from filtering.aoi_batches import iter_aoi_pending_tiles
-from filtering.aoi_filter import filter_aoi
+from filtering.tile_batches import count_pending, iter_pending_tile_batches
+from filtering.tile_filter import filter_batch_cheap, filter_batch_imagery
+from gee.auth import get_ee_credentials
+from tqdm import tqdm
+
+# Stage keys must match main.py's `--stage` choices (["cheap", "imagery"]).
+# NOTE: this used to be keyed "s2", which had drifted out of sync with
+# main.py's choices list — main.py never actually accepted "s2" as a valid
+# --stage value, so that mismatch would have surfaced as an argparse error
+# before ever reaching this dict. Renamed to "imagery" to match, and to
+# reflect that the stage now checks both S1 and S2.
+STAGES = {
+    "cheap": {
+        "input_status": str(TileStatus.PENDING),
+        "fn": filter_batch_cheap,
+    },
+    "imagery": {
+        "input_status": str(TileStatus.CHEAP_VALID),
+        "fn": filter_batch_imagery,
+    },
+}
 
 
-def run_filter_local(logger: logging.Logger, limit_aois: int | None = None) -> None:
-    """
-    Sequential AOI-batched filter run.
-    Iterates AOIs with pending tiles, fetches one aggregated raster per
-    AOI, and updates all of that AOI's pending tiles in one pass.
-    """
+def run_filter_local(
+    logger: logging.Logger,
+    stage: str,
+    batch_size: int,
+    limit_batches: int | None = None,
+) -> None:
+    cfg = STAGES[stage]
     ds = Datasets()
+    period = settings.period
 
-    total_valid = 0
-    total_rejected = 0
-    total_failed = 0
-    n_aois = 0
+    total_pending = count_pending(cfg["input_status"], period)
+    total_batches = -(-total_pending // batch_size)  # ceil division
+    if limit_batches is not None:
+        total_batches = min(total_batches, limit_batches)
+
+    totals: dict[str, int] = {}
+    n_tiles = 0
+    n_batches = 0
     t0 = time.time()
 
-    for aoi_id, tiles in iter_aoi_pending_tiles(status=str(TileStatus.PENDING)):
-        if limit_aois is not None and n_aois >= limit_aois:
-            break
+    logger.info(
+        f"starting | period={period} | batch_size={batch_size} | "
+        f"pending={total_pending:,} | total_batches={total_batches:,}"
+    )
 
-        logger.info(f"AOI {aoi_id}: starting ({len(tiles)} tiles)")
-        t_aoi = time.time()
+    batch_iter = iter_pending_tile_batches(cfg["input_status"], batch_size, period)
+    if limit_batches is not None:
+        batch_iter = islice(batch_iter, limit_batches)
 
-        counts = filter_aoi(aoi_id, tiles, ds, logger)
+    with tqdm(
+        batch_iter, total=total_batches, desc=f"filter[{stage}]", unit="batch"
+    ) as pbar:
+        for tiles in pbar:
+            n_batches += 1
+            n_tiles += len(tiles)
 
-        elapsed_aoi = time.time() - t_aoi
-        total_valid += counts.get("valid", 0)
-        total_rejected += counts.get("rejected", 0)
-        total_failed += counts.get("failed", 0)
-        n_aois += 1
+            counts = cfg["fn"](tiles, ds, logger, batch_label=f"batch {n_batches}")
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v
 
-        logger.info(
-            f"AOI {aoi_id}: done in {elapsed_aoi:.1f}s | "
-            f"valid={counts.get('valid', 0)} rejected={counts.get('rejected', 0)} "
-            f"failed={counts.get('failed', 0)}"
-        )
-
-        elapsed = (time.time() - t0) / 60
-        rate = n_aois / elapsed if elapsed > 0 else 0
-        logger.info(
-            f"AOIs processed: {n_aois:,} | "
-            f"valid={total_valid:,} rejected={total_rejected:,} "
-            f"failed={total_failed:,} | "
-            f"{rate:.1f} aois/min | {elapsed:.1f}min elapsed"
-        )
+            elapsed_min = (time.time() - t0) / 60
+            rate = n_tiles / elapsed_min if elapsed_min > 0 else 0
+            pbar.set_postfix(
+                {**totals, "tiles": n_tiles, "t/min": f"{rate:.0f}"}, refresh=False
+            )
 
     elapsed = (time.time() - t0) / 60
     logger.info(
-        f"Filter complete: {n_aois:,} AOIs | "
-        f"valid={total_valid:,} rejected={total_rejected:,} failed={total_failed:,} | "
-        f"{elapsed:.1f}min elapsed"
+        f"complete: {n_batches:,} batches, {n_tiles:,} tiles | "
+        + " ".join(f"{k}={v:,}" for k, v in totals.items())
+        + f" | {elapsed:.1f}min elapsed"
     )
 
 
-def _mp_worker(aoi_queue: mp.Queue, result_queue: mp.Queue, worker_id: int) -> None:
-    credentials = ee.ServiceAccountCredentials(None, settings.gee_credentials)
+def _mp_worker(
+    stage: str, logfile, batch_queue: mp.Queue, result_queue: mp.Queue, worker_id: int
+) -> None:
     time.sleep(worker_id * 5)
-    ee.Initialize(credentials, project=settings.gee_project)
+    ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
     ds = Datasets()
-    logger = logging.getLogger(f"gee.filter.worker.{worker_id}")
+    fn = STAGES[stage]["fn"]
+    logger = logging.getLogger(f"gee.filter.{stage}.worker.{worker_id}")
+    logger.setLevel(logging.INFO)
+    from main import _attach_handlers  # or shared logging_setup module
+
+    _attach_handlers(logger, logfile, f"filter_{stage}.w{worker_id}")
 
     while True:
-        item = aoi_queue.get()
+        item = batch_queue.get()
         if item is None:
             break
-
-        aoi_id, tiles = item
-        logger.info(f"AOI {aoi_id}: starting ({len(tiles)} tiles)")
-        t_aoi = time.time()
-
-        counts = filter_aoi(aoi_id, tiles, ds, logger)
-
-        logger.info(
-            f"AOI {aoi_id}: done in {time.time()-t_aoi:.1f}s | "
-            f"valid={counts.get('valid', 0)} rejected={counts.get('rejected', 0)} "
-            f"failed={counts.get('failed', 0)}"
-        )
-
-        result_queue.put((aoi_id, counts))
+        batch_idx, tiles = item
+        t0 = time.time()
+        counts = fn(tiles, ds, logger, batch_label=f"batch {batch_idx}")
+        logger.debug(f"batch {batch_idx}: done in {time.time()-t0:.1f}s")
+        result_queue.put((batch_idx, len(tiles), counts))
 
 
 def _mp_writer(result_queue: mp.Queue, total: int, logger: logging.Logger) -> None:
     done = 0
-    total_valid = 0
-    total_rejected = 0
-    total_failed = 0
+    n_tiles = 0
+    totals: dict[str, int] = {}
     t0 = time.time()
 
-    while done < total:
-        try:
-            _aoi_id, counts = result_queue.get(timeout=600)
-        except Exception:
-            logger.warning(f"Result queue timeout ({done}/{total})")
-            continue
+    with tqdm(total=total, desc="filter[hpc]", unit="batch") as pbar:
+        while done < total:
+            try:
+                _idx, ntiles, counts = result_queue.get(timeout=600)
+            except Exception:
+                logger.warning(f"Result queue timeout ({done}/{total})")
+                continue
 
-        done += 1
-        total_valid += counts.get("valid", 0)
-        total_rejected += counts.get("rejected", 0)
-        total_failed += counts.get("failed", 0)
+            done += 1
+            n_tiles += ntiles
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v
 
-        if done % 50 == 0:
-            elapsed = (time.time() - t0) / 60
-            rate = done / elapsed if elapsed > 0 else 0
-            logger.info(
-                f"AOIs {done}/{total} | "
-                f"valid={total_valid:,} rejected={total_rejected:,} "
-                f"failed={total_failed:,} | "
-                f"{rate:.1f} aois/min | {elapsed:.1f}min elapsed"
+            elapsed_min = (time.time() - t0) / 60
+            rate = n_tiles / elapsed_min if elapsed_min > 0 else 0
+            pbar.set_postfix(
+                {**totals, "tiles": n_tiles, "t/min": f"{rate:.0f}"}, refresh=False
             )
+            pbar.update(1)
 
     logger.info(
-        f"Filter writer complete: {done:,}/{total:,} AOIs | "
-        f"valid={total_valid:,} rejected={total_rejected:,} failed={total_failed:,}"
+        f"writer complete: {done:,}/{total:,} batches, {n_tiles:,} tiles | "
+        + " ".join(f"{k}={v:,}" for k, v in totals.items())
     )
 
 
-def run_filter_hpc(logger: logging.Logger, limit_aois: int | None = None) -> None:
-    """
-    HPC AOI-batched filter run.
-    Each worker pulls an AOI (aoi_id, tiles) off the queue, fetches its
-    aggregated raster, and updates the DB directly.
-    """
-    aoi_queue: mp.Queue = mp.Queue()
+def run_filter_hpc(
+    logger: logging.Logger,
+    stage: str,
+    batch_size: int,
+    limit_batches: int | None = None,
+) -> None:
+    cfg = STAGES[stage]
+    period = settings.period
+    batch_queue: mp.Queue = mp.Queue()
     result_queue: mp.Queue = mp.Queue()
 
-    aois = []
-    for aoi_id, tiles in iter_aoi_pending_tiles(status=str(TileStatus.PENDING)):
-        aois.append((aoi_id, tiles))
-        if limit_aois is not None and len(aois) >= limit_aois:
+    batches = []
+    for tiles in iter_pending_tile_batches(cfg["input_status"], batch_size, period):
+        batches.append(tiles)
+        if limit_batches is not None and len(batches) >= limit_batches:
             break
 
-    if not aois:
-        logger.info("No AOIs with pending tiles.")
+    if not batches:
+        logger.info(f"no tiles pending for stage '{stage}' | period={period}.")
         return
 
+    # find the active logfile so workers can attach their own handlers to it
+    logfile = next(
+        h.baseFilename
+        for h in logging.getLogger("gee").handlers
+        if isinstance(h, logging.FileHandler)
+    )
+
     workers = [
-        mp.Process(target=_mp_worker, args=(aoi_queue, result_queue, i))
+        mp.Process(
+            target=_mp_worker, args=(stage, logfile, batch_queue, result_queue, i)
+        )
         for i in range(settings.num_workers)
     ]
     writer_thread = threading.Thread(
-        target=_mp_writer,
-        args=(result_queue, len(aois), logger),
-        daemon=False,
+        target=_mp_writer, args=(result_queue, len(batches), logger), daemon=False
     )
 
     for w in workers:
@@ -162,14 +187,14 @@ def run_filter_hpc(logger: logging.Logger, limit_aois: int | None = None) -> Non
     writer_thread.start()
 
     logger.info(
-        f"Started {settings.num_workers} filter workers + 1 writer thread "
-        f"for {len(aois):,} AOIs"
+        f"started {settings.num_workers} workers for period={period} | "
+        f"{len(batches):,} batches ({sum(len(b) for b in batches):,} tiles)"
     )
 
-    for item in aois:
-        aoi_queue.put(item)
+    for idx, tiles in enumerate(batches, start=1):
+        batch_queue.put((idx, tiles))
     for _ in range(settings.num_workers):
-        aoi_queue.put(None)
+        batch_queue.put(None)
 
     for w in workers:
         w.join()

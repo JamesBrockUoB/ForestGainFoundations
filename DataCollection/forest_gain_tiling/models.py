@@ -39,13 +39,3 @@ class TileEntry:
         d = dict(d)
         d["status"] = TileStatus(d["status"])
         return cls(**d)
-
-
-@dataclass
-class AoiAuditEntry:
-    biome: str
-    region: str
-    tile_counts: dict[str, int]
-    total_tiles: int
-    complete_tiles: int
-    has_coverage: bool

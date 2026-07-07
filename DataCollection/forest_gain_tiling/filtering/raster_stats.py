@@ -3,63 +3,58 @@ from __future__ import annotations
 import ee
 from config import settings
 from datasets.registry import Datasets
-from export.composites import s2_availability, s2_peak
+from export.composites import s1_availability, s2_availability, s2_peak
 from labels.gain import build_gain_layer
 
 NO_GAIN_SENTINEL = -9999.0
 
-BAND_NAMES = [
-    "gain_frac",
-    "ndvi_delta",
-    "canopy_mean",
-    "s2_2017",
-    "s2_2020",
-    "s2_2025",
-]
+# canopy_mean only included when the active period's end year matches the
+# canopy-height snapshot (see settings.canopy_height_available) — tracked
+# when available, but see tile_filter.evaluate_cheap_stats for why it's
+# reporting-only, not a rejection gate.
+CHEAP_BAND_NAMES = ["gain_frac", "ndvi_delta"]
+if settings.canopy_height_available:
+    CHEAP_BAND_NAMES = CHEAP_BAND_NAMES + ["canopy_mean"]
+
+# Per-year S2 + S1 availability bands for the active period (settings.period,
+# fixed for the process lifetime via the PERIOD env var).
+#   PERIOD=p1 -> s2_2017, s2_2018, s2_2019, s2_2020, s1_2017, ..., s1_2020
+#   PERIOD=p2 -> s2_2020, ..., s2_2024, s1_2020, ..., s1_2024
+S2_BAND_NAMES = [f"s2_{y}" for y in settings.period_years]
+S1_BAND_NAMES = [f"s1_{y}" for y in settings.period_years]
+IMAGERY_BAND_NAMES = S2_BAND_NAMES + S1_BAND_NAMES
 
 
-def build_tile_stats_image(geom: ee.Geometry, ds: Datasets) -> ee.Image:
-    """
-    Build a multi-band image at native 10m resolution where, after
-    reduceResolution + reproject to the tile grid, each output pixel
-    corresponds to one tile and encodes:
-
-      gain_frac    - fraction of tile pixels with validated tree gain
-      ndvi_delta   - mean NDVI(2020) - NDVI(2017) within gain pixels,
-                      or NO_GAIN_SENTINEL if the tile has no gain pixels
-      canopy_mean  - mean canopy height (m) within gain pixels,
-                      or NO_GAIN_SENTINEL if the tile has no gain pixels
-      s2_2017      - fraction of tile pixels with valid S2 obs in 2017
-      s2_2020      - fraction of tile pixels with valid S2 obs in 2020
-      s2_2025      - fraction of tile pixels with valid S2 obs in 2025
-    """
+def build_cheap_stats_image(geom: ee.Geometry, ds: Datasets) -> ee.Image:
     gain_validated, gain_binary = build_gain_layer(geom, ds)
     gm = gain_validated.selfMask()
 
     ndvi_delta = (
-        s2_peak(geom, 2020, ds)
+        s2_peak(geom, settings.year_end)
         .select("NDVI")
-        .subtract(s2_peak(geom, 2017, ds).select("NDVI"))
+        .subtract(s2_peak(geom, settings.year_start).select("NDVI"))
         .updateMask(gm)
         .rename("ndvi_delta")
     )
 
-    canopy = ds.meta_ch.updateMask(gm).rename("canopy_mean")
+    bands = [gain_binary.rename("gain_frac"), ndvi_delta]
+    if settings.canopy_height_available:
+        bands.append(ds.meta_ch.updateMask(gm).rename("canopy_mean"))
 
-    s2_2017 = s2_availability(geom, 2017).rename("s2_2017")
-    s2_2020 = s2_availability(geom, 2020).rename("s2_2020")
-    s2_2025 = s2_availability(geom, 2025).rename("s2_2025")
+    return ee.Image.cat(bands).clip(geom)
 
-    return ee.Image.cat(
-        [
-            gain_binary.rename("gain_frac"),
-            ndvi_delta,
-            canopy,
-            s2_2017,
-            s2_2020,
-            s2_2025,
-        ]
-    ).clip(geom)
+
+def build_imagery_stats_image(geom: ee.Geometry) -> ee.Image:
+    """
+    Per-year S2 + S1 valid-pixel coverage fraction bands for every calendar
+    year in the active period (settings.period_years). Band naming:
+    s2_<year>, s1_<year>.
+    """
+    bands = []
+    for year in settings.period_years:
+        bands.append(s2_availability(geom, year).rename(f"s2_{year}"))
+        bands.append(s1_availability(geom, year).rename(f"s1_{year}"))
+    return ee.Image.cat(bands).clip(geom)
 
 
 def aggregate_to_tile_grid(
@@ -67,36 +62,14 @@ def aggregate_to_tile_grid(
     *,
     origin_x: float,
     origin_y: float,
+    zero_fill_bands: list[str],
+    no_gain_bands: list[str] | None = None,
 ) -> ee.Image:
-    """
-    Aggregate a 10m-resolution multi-band image to the tile grid (one
-    output pixel per tile), using a crsTransform anchored at
-    (origin_x, origin_y) so output pixel boundaries align exactly with
-    tile boundaries.
-
-    origin_x/origin_y must be the x_min_m / y_max_m of the
-    top-left-most tile in the region being sampled, i.e. a point that
-    lies exactly on the global tile grid.
-
-    A default projection is set on the input image at settings.scale
-    (10m) before reduceResolution, as EE requires a fixed native
-    resolution to aggregate from. Without this, reduceResolution raises
-    a projection error on composite images built from multiple sources.
-
-    ndvi_delta and canopy_mean are masked wherever a tile has zero
-    gain pixels (reduceResolution excludes masked inputs from the
-    mean and leaves the output pixel masked); these are unmasked to
-    NO_GAIN_SENTINEL afterwards so sampleRectangle returns a value for
-    every tile.
-    """
     sz = settings.tile_size_m
     crs_transform = [sz, 0, origin_x, 0, -sz, origin_y]
+    no_gain_bands = no_gain_bands or []
 
-    # Set default projection so reduceResolution knows the native resolution
-    stats = stats.setDefaultProjection(
-        crs=settings.crs_wkt,
-        scale=settings.scale,
-    )
+    stats = stats.setDefaultProjection(crs=settings.crs_wkt, scale=settings.scale)
 
     aggregated = stats.reduceResolution(
         reducer=ee.Reducer.mean(),
@@ -104,29 +77,23 @@ def aggregate_to_tile_grid(
         maxPixels=int((sz / settings.scale) ** 2) + 1,
     ).reproject(crs=settings.crs_wkt, crsTransform=crs_transform)
 
-    no_gain_bands = aggregated.select(["ndvi_delta", "canopy_mean"]).unmask(
-        NO_GAIN_SENTINEL
-    )
-    other_bands = aggregated.select(
-        ["gain_frac", "s2_2017", "s2_2020", "s2_2025"]
-    ).unmask(0)
+    pieces = [aggregated.select(zero_fill_bands).unmask(0)]
+    if no_gain_bands:
+        pieces.append(aggregated.select(no_gain_bands).unmask(NO_GAIN_SENTINEL))
 
-    return ee.Image.cat([other_bands, no_gain_bands]).select(BAND_NAMES)
+    return ee.Image.cat(pieces).select(zero_fill_bands + no_gain_bands)
 
 
-def fetch_tile_stats(
-    aoi_geom: ee.Geometry,
-    ds: Datasets,
+def _fetch_grid(
+    tile_grid: ee.Image,
+    band_names: list[str],
     *,
     origin_x: float,
     origin_y: float,
     n_cols: int,
     n_rows: int,
+    tile_scale: int = 4,
 ) -> dict[str, list]:
-
-    stats = build_tile_stats_image(aoi_geom, ds)
-    tile_grid = aggregate_to_tile_grid(stats, origin_x=origin_x, origin_y=origin_y)
-
     region = ee.Geometry.Rectangle(
         [
             origin_x,
@@ -138,19 +105,90 @@ def fetch_tile_stats(
         geodesic=False,
     )
 
+    reducer = ee.Reducer.toList().forEachBand(tile_grid)
+
     result = tile_grid.reduceRegion(
-        reducer=ee.Reducer.toList().repeat(len(BAND_NAMES)),
+        reducer=reducer,
         geometry=region,
         scale=settings.tile_size_m,
         maxPixels=1e13,
-        tileScale=4,
+        tileScale=tile_scale,
     ).getInfo()
 
     out = {}
-
-    for i, band in enumerate(BAND_NAMES):
+    for band in band_names:
+        if band not in result:
+            raise RuntimeError(
+                f"reduceRegion result missing band '{band}'; "
+                f"available keys={list(result.keys())}"
+            )
         flat = result[band]
-        # reshape into (n_rows, n_cols)
+        if len(flat) != n_cols * n_rows:
+            raise RuntimeError(
+                f"band '{band}' length mismatch: expected {n_cols*n_rows} "
+                f"values ({n_cols}x{n_rows}), got {len(flat)}"
+            )
         out[band] = [flat[r * n_cols : (r + 1) * n_cols] for r in range(n_rows)]
-
     return out
+
+
+def fetch_cheap_stats(
+    aoi_geom: ee.Geometry,
+    ds: Datasets,
+    *,
+    origin_x: float,
+    origin_y: float,
+    n_cols: int,
+    n_rows: int,
+) -> dict[str, list]:
+    stats = build_cheap_stats_image(aoi_geom, ds)
+
+    no_gain_bands = ["ndvi_delta"]
+    if settings.canopy_height_available:
+        no_gain_bands.append("canopy_mean")
+
+    tile_grid = aggregate_to_tile_grid(
+        stats,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        zero_fill_bands=["gain_frac"],
+        no_gain_bands=no_gain_bands,
+    )
+    return _fetch_grid(
+        tile_grid,
+        CHEAP_BAND_NAMES,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        n_cols=n_cols,
+        n_rows=n_rows,
+        tile_scale=2,  # lowered from 4: batches are now fixed-size, not
+        # whole-AOI, so there's headroom versus the original memory-limit
+        # failures this was tuned against. Raise back toward 4 if you see
+        # memory errors again at your current --batch-size.
+    )
+
+
+def fetch_imagery_stats(
+    aoi_geom: ee.Geometry,
+    *,
+    origin_x: float,
+    origin_y: float,
+    n_cols: int,
+    n_rows: int,
+) -> dict[str, list]:
+    stats = build_imagery_stats_image(aoi_geom)
+    tile_grid = aggregate_to_tile_grid(
+        stats,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        zero_fill_bands=IMAGERY_BAND_NAMES,
+    )
+    return _fetch_grid(
+        tile_grid,
+        IMAGERY_BAND_NAMES,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        n_cols=n_cols,
+        n_rows=n_rows,
+        tile_scale=8,
+    )

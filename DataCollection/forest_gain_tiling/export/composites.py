@@ -26,13 +26,34 @@ def _date_range(year: int) -> tuple[str, str]:
 
 
 def s2_availability(geom: ee.Geometry, year: int) -> ee.Image:
+    """
+    Coverage check only — uses settings.s2_check_bands (a small proxy
+    subset), NOT the full band list used for spectral analysis. See
+    s2_composite for the full-band version used in actual exports.
+    """
     start, end = _date_range(year)
     ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
         .map(_mask_s2_scl)
-        .select(["B2", "B3", "B4", "B5", "B6", "B7", "B8"])
+        .select(list(settings.s2_check_bands))
+    )
+    return ic.map(lambda i: i.mask().reduce(ee.Reducer.min())).reduce(ee.Reducer.max())
+
+
+def s1_availability(geom: ee.Geometry, year: int) -> ee.Image:
+    """
+    S1 counterpart to s2_availability — fraction-style valid-pixel presence
+    check using settings.s1_check_bands (VV, VH by default), IW mode only.
+    """
+    start, end = _date_range(year)
+    ic = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterDate(start, end)
+        .filterBounds(geom)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .select(list(settings.s1_check_bands))
     )
     return ic.map(lambda i: i.mask().reduce(ee.Reducer.min())).reduce(ee.Reducer.max())
 
@@ -73,7 +94,7 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     return reduced.select([b + "_p25" for b in bands], bands)
 
 
-def s2_peak(geom: ee.Geometry, year: int, ds: Datasets) -> ee.Image:  # noqa: ARG001
+def s2_peak(geom: ee.Geometry, year: int) -> ee.Image:
     centroid = ee.Geometry(geom).centroid(maxError=1)
     north = ee.Number(centroid.coordinates().get(1)).gt(0)
 

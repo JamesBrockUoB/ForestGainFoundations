@@ -7,6 +7,7 @@ import random
 from collections import Counter
 from typing import Any
 
+from config import settings
 from registry.store import iter_tiles
 
 
@@ -15,16 +16,22 @@ def filter_candidates(
     aoi_id: str | None = None,
     biome: str | None = None,
     region: str | None = None,
+    period: str | None = None,
     logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     """
     Stream and filter candidate tiles from database.
     Returns list after applying all filters (for compatibility with stratified_sample).
     Never materializes the entire grid - only the filtered results.
+
+    `period` defaults to settings.period.
     """
+    if period is None:
+        period = settings.period
+
     candidates = []
 
-    for tile in iter_tiles(status=status):
+    for tile in iter_tiles(status=status, period=period):
         # Filter by aoi_id
         if aoi_id and aoi_id not in tile.get("aoi_ids", []):
             continue
@@ -40,7 +47,10 @@ def filter_candidates(
         candidates.append(tile)
 
     if logger:
-        logger.info(f"Found {len(candidates):,} candidate tiles after filtering")
+        logger.info(
+            f"Found {len(candidates):,} candidate tiles after filtering "
+            f"(period={period})"
+        )
 
     return candidates
 

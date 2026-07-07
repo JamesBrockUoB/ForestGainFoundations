@@ -7,30 +7,10 @@ class Datasets:
     def __init__(self) -> None:
         self.esa_wc = ee.Image("ESA/WorldCover/v100/2020")
         self.esa_trees = self.esa_wc.eq(10).unmask(0)
-        self.esa_crop = self.esa_wc.eq(40).unmask(0)
 
-        self.gem_treecrop = (
-            ee.ImageCollection(
-                "projects/sat-io/open-datasets/GEM-Forest/GEM-Forest_2020"
-            )
-            .mosaic()
-            .select("b1")
-            .eq(2)
-            .unmask(0)
-            .toFloat()
-        )
-
-        self.jrc = ee.Image("JRC/GFC2020_subtypes/V1")
-
-        self.nat_forest = (
-            ee.ImageCollection(
-                "projects/nature-trace/assets/forest_typology/natural_forest_2020_v1_0_collection"
-            )
-            .mosaic()
-            .select("B0")
-            .divide(250)
-            .unmask(0)
-        )
+        self.forty = ee.ImageCollection(
+            "projects/nature-trace/assets/forest_typology/forest_typology_2020_v1_0_collection"
+        ).mosaic()
 
         self.meta_ch = (
             ee.ImageCollection(
@@ -56,3 +36,9 @@ class Datasets:
             .divide(2.55)
             .rename("tree_cover_pct")
         )
+
+        # p2 (2020->2024) not yet available: the 2024 cover mosaic hasn't
+        # been uploaded. Deliberately absent rather than pointed at a
+        # guessed asset path — build_gain_layer raises a clear error if
+        # something tries to run p2 before this is set.
+        self.dt_cover_2024 = None
