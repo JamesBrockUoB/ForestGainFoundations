@@ -265,7 +265,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
-    """Reset tile statuses for the active period (destructive)."""
+    """Reset tile statuses for the active period."""
     logger = setup_logging("reset")
 
     from registry.store import reset_tiles

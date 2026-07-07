@@ -46,7 +46,7 @@ class Settings:
             _ROOT_DIR / os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
         )
     )
-    hpc_base: str | None = field(default_factory=lambda: os.getenv("HPC_BASE"))
+    hpc_remote: str | None = field(default_factory=lambda: os.getenv("HPC_REMOTE"))
 
     # Optional override for the Earth Engine OAuth refresh-token file path.
     # If unset, gee/auth.py falls back to the library default
@@ -150,8 +150,8 @@ class Settings:
 
     @property
     def hpc_path(self) -> str | None:
-        if self.hpc_base:
-            return f"{self.hpc_base}/{self.drive_folder}"
+        if self.hpc_remote:
+            return f"{self.hpc_remote}/{self.drive_folder}"
         return None
 
     @property

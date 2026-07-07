@@ -69,8 +69,22 @@ def _poll_task(task: ee.batch.Task, tile_id: str, logger: logging.Logger) -> str
         state = task.status()["state"]
 
         if state == "COMPLETED":
-            if settings.hpc_path:
-                rclone_to_hpc(tile_id, settings.hpc_path, logger)
+            if not settings.hpc_path:
+                err = (
+                    "GEE export completed but HPC_PATH is not configured — "
+                    "file left on Drive, tile NOT marked complete."
+                )
+                logger.error(f"{tile_id}: {err}")
+                update_tile(tile_id, status=TileStatus.FAILED, error=err)
+                return str(TileStatus.FAILED)
+
+            moved = rclone_to_hpc(tile_id, settings.hpc_path, logger)
+            if not moved:
+                err = "rclone transfer to HPC failed — file left on Drive"
+                logger.error(f"{tile_id}: {err}")
+                update_tile(tile_id, status=TileStatus.FAILED, error=err)
+                return str(TileStatus.FAILED)
+
             update_tile(
                 tile_id,
                 status=TileStatus.COMPLETE,

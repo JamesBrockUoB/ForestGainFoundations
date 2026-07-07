@@ -31,14 +31,10 @@
 
     #### **Step 4**: Authorise GEE.
 
-    This pipeline uses a hybrid authentication model:
-    - **Service Account → Earth Engine computation (required everywhere)**
-    - **EE User Login (`ee.Authenticate`) → Google Drive exports**
+    - **EE User Login (`ee.Authenticate()` (one-time) + `ee.Initialize()`)
     - Both local and HPC run the same authentication logic — only credential *locations* differ
 
-    #### One-time Earth Engine OAuth (Drive access)
-
-    Required once per user account to enable `Export.image.toDrive`.
+    #### One-time Earth Engine OAuth
 
     Run locally (or any interactive machine):
 
@@ -55,71 +51,6 @@
 
     If using a HPC system - upload this file in an easy-to-access area for usage later.
 
-    #### Service Account Authentication (EE Compute)
-
-    This step is required to enable Earth Engine processing in both **local and HPC environments**.
-
-    The service account is used for:
-    - image processing
-    - batch exports
-    - all non-interactive Earth Engine computation
-
-    It is **separate from Google Drive authentication**.
-
-    ---
-
-    #### 1. Create a Google Cloud Service Account
-
-    Go to the Google Cloud Console:
-
-    https://console.cloud.google.com/
-
-    #### Steps:
-
-    1. Select or create a Google Cloud project
-    2. Navigate to: **IAM & Admin → Service Accounts**
-    3. Create a new service account (e.g. `gee-worker`)
-
-    ---
-
-    #### 2. Grant Required Permissions
-
-    You must ensure the service account has Earth Engine access.
-
-    In general:
-    - Earth Engine API must be enabled for the project:
-    - The service account must be associated with a project that has Earth Engine access
-
-    No additional configuration is typically required beyond this.
-
-    ---
-
-    #### 3. Generate Service Account Key
-
-    Create and download a **JSON key file**:
-
-    - Go to the service account
-    - Open the **Keys** section
-    - Create a new key (JSON format)
-    - Download the file
-
-    This file is your authentication credential for Earth Engine compute.
-
-    ---
-
-    #### 4. Store the Key Securely
-
-    Place the file somewhere stable:
-
-    #### Local machine
-
-    ~/.config/gee/service-account.json
-
-
-    #### HPC system
-
-    Place in a location near the project repo
-
     ### **Step 5**: Setup .env file.
     Create a file in the project root folder called `.env` with the following variables:
 
@@ -132,7 +63,7 @@
       - TILE_SCALE - 10
       - DRIVE_FOLDER - Your output folder for data to be collected in GDrive
       - DRIVE_REMOTE - gdrive
-      - HPC_REMOTE - Remote cluster connection and destination for file porting
+      - HPC_REMOTE - Remote cluster connection and destination for file porting - the path to the repo's data folder. ideally, set an alias for HPC connection
       - GOOGLE_APPLICATION_CREDENTIALS - Your service account credentials path + file name
       - DRIVE_AUTH_CREDENTIALS - Your Earth Engine credentials for GDrive authorisations
       - SEARCH_MODE - `asset` for limiting search area to geographic extent of deadtrees.earth product, or `global` for the whole world
