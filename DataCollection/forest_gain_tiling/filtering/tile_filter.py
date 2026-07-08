@@ -80,32 +80,12 @@ def evaluate_cheap_stats(
 ) -> tuple[str, str | None]:
     gain_pct = stats["gain_frac"] * 100.0
     ndvi_delta = stats["ndvi_delta"]
-    canopy_mean = stats["canopy_mean"]  # report-only — canopy height data is
-    # only available for 2020, so it can't gate viability for any period
-    # whose bounds don't line up with that (p1's 2017 endpoint, in
-    # particular). Still computed and returned in CHEAP_BAND_NAMES so it's
-    # visible on every tile row, just no longer part of the pass/fail
-    # decision below.
 
     if gain_pct == 0.0:
         return str(TileStatus.REJECTED), "no_gain"
 
     if gain_pct < settings.gain_pct_min:
         return str(TileStatus.REJECTED), "low_gain_pct"
-
-    if ndvi_delta == NO_GAIN_SENTINEL or canopy_mean == NO_GAIN_SENTINEL:
-        # Shouldn't happen: gain_pct >= gain_pct_min > 0 guarantees at least
-        # one gain pixel contributed to the same reduceResolution mean that
-        # ndvi_delta/canopy_mean are computed over. If this fires, the two
-        # bands disagreed about tile footprint — a real bug, not a normal
-        # rejection. Kept even though canopy no longer gates viability,
-        # since it still catches a genuine footprint-mismatch bug.
-        if logger:
-            logger.warning(
-                f"anomaly: gain_pct={gain_pct:.3f} but sentinel present "
-                f"(ndvi_delta={ndvi_delta}, canopy_mean={canopy_mean})"
-            )
-        return str(TileStatus.REJECTED), "anomaly_sentinel_mismatch"
 
     if ndvi_delta <= settings.ndvi_delta_min:
         if logger:
@@ -119,8 +99,7 @@ def evaluate_imagery_stats(
     stats: dict[str, float], logger: logging.Logger | None = None
 ) -> tuple[str, str | None]:
     """
-    Requires every per-year S1 and S2 band (see IMAGERY_BAND_NAMES, which
-    spans settings.period_years) to clear settings.imagery_min_valid_frac.
+    Requires every per-year S1 and S2 band to clear settings.imagery_min_valid_frac.
     """
     low = {b: v for b, v in stats.items() if v < settings.imagery_min_valid_frac}
     if low:
@@ -185,7 +164,7 @@ def filter_batch_cheap(
 
 
 def filter_batch_imagery(
-    tiles: list[dict], ds, logger: logging.Logger, batch_label: str = ""
+    tiles: list[dict], logger: logging.Logger, batch_label: str = ""
 ) -> dict[str, int]:
     """Stage 2: per-year S1+S2 availability. CHEAP_VALID -> VALID | REJECTED | FAILED."""
     extent = compute_batch_extent(tiles)

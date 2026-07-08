@@ -60,11 +60,11 @@ from datetime import datetime
 
 import ee
 from config import settings
-from datasets.registry import Datasets
 from enums import TileStatus
 from export.tasks import run_hpc, run_local
 from filtering.tasks import run_filter_hpc, run_filter_local
 from gee.auth import get_ee_credentials
+from gee_datasets.registry import Datasets
 from registry.store import registry_summary
 from tiling.grid import build_grid
 from tiling.selection import (
@@ -256,10 +256,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     if settings.use_hpc:
         logger.info(f"Mode: HPC | workers={settings.num_workers}")
-        run_hpc(candidates, ds, logger)
+        run_hpc(candidates, ds, logger, local_output=args.local_output)
     else:
         logger.info("Mode: local sequential")
-        run_local(candidates, ds, logger)
+        run_local(candidates, ds, logger, local_output=args.local_output)
 
     print(registry_summary(period=settings.period))
 
@@ -354,6 +354,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="prop",
         choices=["prop", "equal"],
         dest="stratify_mode",
+    )
+
+    run_p.add_argument(
+        "--local-output",
+        action="store_true",
+        help="Write exports and embeddings to DataCollection/data/test_tiles instead of HPC.",
     )
 
     _RESETTABLE_STATUSES = [

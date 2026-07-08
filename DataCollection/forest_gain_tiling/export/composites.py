@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ee
 from config import settings
-from datasets.registry import Datasets
 
 
 def _mask_s2_scl(img: ee.Image) -> ee.Image:
@@ -126,15 +125,6 @@ def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     return med.addBands(med.select("VV").divide(med.select("VH")).rename("VVVH"))
 
 
-def dw_composite(geom: ee.Geometry, year: int, ds: Datasets) -> ee.Image:
-    return (
-        ds.dw.filterDate(f"{year}-01-01", f"{year}-12-31")
-        .filterBounds(geom)
-        .select(["trees", "crops", "built"])
-        .median()
-    )
-
-
 _BAND_SUFFIXES = [
     "B2",
     "B3",
@@ -148,19 +138,51 @@ _BAND_SUFFIXES = [
     "VV",
     "VH",
     "VVVH",
-    "DW_trees",
-    "DW_crops",
-    "DW_built",
 ]
 
 
-def build_timestep_stack(
-    geom: ee.Geometry, year: int, prefix: str, ds: Datasets
-) -> ee.Image:
-    band_names = [f"{prefix}_{b}" for b in _BAND_SUFFIXES]
+def build_year_composite(geom: ee.Geometry, year: int) -> ee.Image:
+    """Combined S1+S2 composite for a single year — exported as its own
+    per-year file (composites/s1s2_<year>.tif)."""
     return (
         s2_composite(geom, year)
         .addBands(s1_composite(geom, year))
-        .addBands(dw_composite(geom, year, ds))
-        .rename(band_names)
+        .rename(list(_BAND_SUFFIXES))
     )
+
+
+def submit_composite_exports(
+    geom: ee.Geometry,
+    crs_transform: list[float],
+    full_valid: ee.Image,
+    tile_id: str,
+) -> dict[str, ee.batch.Task]:
+    """
+    Submit one export task per year in settings.period_years. Returns a
+    dict keyed "composites/s1s2_<year>" -> started ee.batch.Task, so the
+    caller can wait on / verify each product individually.
+    """
+    tasks: dict[str, ee.batch.Task] = {}
+
+    for year in settings.period_years:
+        image = build_year_composite(geom, year).updateMask(full_valid).toFloat()
+        name = f"s1s2_{year}"
+        key = f"composites/{name}"
+        prefix = f"{tile_id}__composites__{name}"
+
+        task = ee.batch.Export.image.toDrive(
+            image=image,
+            description=prefix,
+            folder=settings.drive_folder,
+            fileNamePrefix=prefix,
+            region=geom,
+            scale=settings.scale,
+            crs=settings.crs_wkt,
+            crsTransform=crs_transform,
+            maxPixels=10_000_000_000_000,
+            fileFormat="GeoTIFF",
+        )
+        task.start()
+        tasks[key] = task
+
+    return tasks

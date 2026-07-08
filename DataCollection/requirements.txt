@@ -6,5 +6,6 @@ matplotlib
 tqdm
 folium
 seaborn
-rasterio
 scipy
+geoai-py
+geotessera

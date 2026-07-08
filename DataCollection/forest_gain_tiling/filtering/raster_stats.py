@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import ee
 from config import settings
-from datasets.registry import Datasets
 from export.composites import s1_availability, s2_availability, s2_peak
+from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 
 NO_GAIN_SENTINEL = -9999.0
@@ -161,10 +161,7 @@ def fetch_cheap_stats(
         origin_y=origin_y,
         n_cols=n_cols,
         n_rows=n_rows,
-        tile_scale=2,  # lowered from 4: batches are now fixed-size, not
-        # whole-AOI, so there's headroom versus the original memory-limit
-        # failures this was tuned against. Raise back toward 4 if you see
-        # memory errors again at your current --batch-size.
+        tile_scale=2,
     )
 
 

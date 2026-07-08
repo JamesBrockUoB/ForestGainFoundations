@@ -8,7 +8,6 @@ from itertools import islice
 
 import ee
 from config import settings
-from datasets.registry import Datasets
 from enums import TileStatus
 from filtering.tile_batches import count_pending, iter_pending_tile_batches
 from filtering.tile_filter import filter_batch_cheap, filter_batch_imagery
@@ -16,11 +15,6 @@ from gee.auth import get_ee_credentials
 from tqdm import tqdm
 
 # Stage keys must match main.py's `--stage` choices (["cheap", "imagery"]).
-# NOTE: this used to be keyed "s2", which had drifted out of sync with
-# main.py's choices list — main.py never actually accepted "s2" as a valid
-# --stage value, so that mismatch would have surfaced as an argparse error
-# before ever reaching this dict. Renamed to "imagery" to match, and to
-# reflect that the stage now checks both S1 and S2.
 STAGES = {
     "cheap": {
         "input_status": str(TileStatus.PENDING),
@@ -40,7 +34,6 @@ def run_filter_local(
     limit_batches: int | None = None,
 ) -> None:
     cfg = STAGES[stage]
-    ds = Datasets()
     period = settings.period
 
     total_pending = count_pending(cfg["input_status"], period)
@@ -69,7 +62,7 @@ def run_filter_local(
             n_batches += 1
             n_tiles += len(tiles)
 
-            counts = cfg["fn"](tiles, ds, logger, batch_label=f"batch {n_batches}")
+            counts = cfg["fn"](tiles, logger, batch_label=f"batch {n_batches}")
             for k, v in counts.items():
                 totals[k] = totals.get(k, 0) + v
 
@@ -93,13 +86,12 @@ def _mp_worker(
     time.sleep(worker_id * 5)
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
-    ds = Datasets()
     fn = STAGES[stage]["fn"]
     logger = logging.getLogger(f"gee.filter.{stage}.worker.{worker_id}")
     logger.setLevel(logging.INFO)
-    from main import _attach_handlers  # or shared logging_setup module
-
-    _attach_handlers(logger, logfile, f"filter_{stage}.w{worker_id}")
+    fh = logging.FileHandler(logfile)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s"))
+    logger.addHandler(fh)
 
     while True:
         item = batch_queue.get()
@@ -107,7 +99,7 @@ def _mp_worker(
             break
         batch_idx, tiles = item
         t0 = time.time()
-        counts = fn(tiles, ds, logger, batch_label=f"batch {batch_idx}")
+        counts = fn(tiles, logger, batch_label=f"batch {batch_idx}")
         logger.debug(f"batch {batch_idx}: done in {time.time()-t0:.1f}s")
         result_queue.put((batch_idx, len(tiles), counts))
 

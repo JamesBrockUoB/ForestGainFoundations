@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ee
-from datasets.registry import Datasets
+from gee_datasets.registry import Datasets
 
 # ForTy quantized probability bands (uint8, 0-250) and their scale to [0,1].
 # https://developers.google.com/earth-engine/datasets/catalog/projects_nature-trace_assets_forest_typology_forest_typology_2020_v1_0_collection
