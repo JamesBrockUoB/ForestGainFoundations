@@ -38,8 +38,8 @@ def _xy2lonlat(x: float, y: float) -> tuple[float, float]:
 
 def tile_geom(tile: dict) -> ee.Geometry:
     return ee.Geometry.Rectangle(
-        [tile["min_lon"], tile["min_lat"], tile["max_lon"], tile["max_lat"]],
-        proj=ee.Projection("EPSG:4326"),
+        [tile["x_min_m"], tile["y_min_m"], tile["x_max_m"], tile["y_max_m"]],
+        proj=ee.Projection(settings.crs_wkt),
         geodesic=False,
     )
 

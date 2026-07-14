@@ -56,9 +56,9 @@
 
       - GEE_PROJECT - Your GEE project name
       - OUTPUT_DIR - data/
-      - BATCH_SIZE - 25
+      - BATCH_SIZE - 5
       - AOI_STEP - 0.25
-      - TILE_PIXELS - 128
+      - TILE_PIXELS - 256
       - NUM_WORKERS - 4
       - TILE_SCALE - 10
       - DRIVE_FOLDER - Your output folder for data to be collected in GDrive

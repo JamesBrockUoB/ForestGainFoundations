@@ -70,43 +70,60 @@ def s2_coverage_frac(geom: ee.Geometry, year: int) -> ee.Number:
     return ee.Number(ee.Algorithms.If(stats.get("valid"), stats.get("valid"), 0))
 
 
-def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
+def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
     start, end = _date_range(year)
-    bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "NDVI", "EVI"]
-    ic = (
+
+    s2 = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
+        .map(_mask_s2_scl)
+        .select(
+            [
+                "B2",
+                "B3",
+                "B4",
+                "B5",
+                "B6",
+                "B7",
+                "B8",
+            ]
+        )
         .map(_add_indices)
     )
-    fallback = (
-        ee.Image.constant([0] * 9)
-        .rename([b + "_p25" for b in bands])
-        .updateMask(ee.Image.constant(0))
-    )
-    reduced = ee.Image(
-        ee.Algorithms.If(
-            ic.size().eq(0), fallback, ic.reduce(ee.Reducer.percentile([25]))
-        )
-    )
-    return reduced.select([b + "_p25" for b in bands], bands)
+
+    return s2.median()
 
 
-def s2_peak(geom: ee.Geometry, year: int) -> ee.Image:
+def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
     centroid = ee.Geometry(geom).centroid(maxError=1)
     north = ee.Number(centroid.coordinates().get(1)).gt(0)
 
-    start = ee.String(ee.Algorithms.If(north, f"{year}-05-01", f"{year}-11-01"))
-    end = ee.String(ee.Algorithms.If(north, f"{year}-09-30", f"{year+1}-03-31"))
+    start = ee.String(
+        ee.Algorithms.If(
+            north,
+            f"{year}-05-01",
+            f"{year}-11-01",
+        )
+    )
+
+    end = ee.String(
+        ee.Algorithms.If(
+            north,
+            f"{year}-09-30",
+            f"{year+1}-03-31",
+        )
+    )
 
     return (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
+        .map(_mask_s2_scl)
         .map(_add_indices)
-        .select(["NDVI", "EVI"])
+        .select(["NDVI"])
         .median()
     )
 
@@ -159,8 +176,7 @@ def submit_composite_exports(
 ) -> dict[str, ee.batch.Task]:
     """
     Submit one export task per year in settings.period_years. Returns a
-    dict keyed "composites/s1s2_<year>" -> started ee.batch.Task, so the
-    caller can wait on / verify each product individually.
+    dict keyed "composites/s1s2_<year>" -> started ee.batch.Task.
     """
     tasks: dict[str, ee.batch.Task] = {}
 

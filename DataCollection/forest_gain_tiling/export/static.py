@@ -5,17 +5,19 @@ from config import settings
 
 
 def build_static_layers(geom: ee.Geometry) -> dict[str, ee.Image]:
-    """
-    Returns {"fabdem": ..., "slope": ...} as two separate images so each
-    lands as its own deterministically-named file under static/.
-    """
     fabdem = (
         ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
         .filterBounds(geom)
         .mosaic()
         .clip(geom)
     )
-    slope = ee.Terrain.slope(fabdem)
+
+    fabdem_native = fabdem.setDefaultProjection(crs="EPSG:4326", scale=30)
+    slope_native = ee.Terrain.slope(fabdem_native)
+
+    slope = slope_native.resample("bilinear").reproject(
+        crs=settings.crs_wkt, scale=settings.scale
+    )
 
     return {
         "fabdem": fabdem.rename("DEM"),

@@ -69,13 +69,16 @@ class Settings:
     # reset) is scoped to tiles tagged with this period.
     period: str = field(default_factory=lambda: os.getenv("PERIOD", "p1"))
 
-    registry_db_path: Path = field(default_factory=lambda: Path())
+    registry_db_path: Path = field(default_factory=Path)
     log_dir: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent / "logs"
     )
 
-    tile_pixels: int = 128
-    scale: int = 10
+    tile_pixels: int = field(
+        default_factory=lambda: int(os.getenv("TILE_PIXELS", "256"))
+    )
+    scale: int = field(default_factory=lambda: int(os.getenv("TILE_SCALE", "10")))
+
     crs: str = "EPSG:6933"
     crs_wkt: str = (
         'PROJCS["WGS 84 / NSIDC EASE-Grid 2.0 Global",'

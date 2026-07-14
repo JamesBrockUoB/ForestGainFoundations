@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ee
 from config import settings
-from export.composites import s1_availability, s2_availability, s2_peak
+from export.composites import s1_availability, s2_availability, s2_peak_ndvi
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 
@@ -30,9 +30,8 @@ def build_cheap_stats_image(geom: ee.Geometry, ds: Datasets) -> ee.Image:
     gm = gain_validated.selfMask()
 
     ndvi_delta = (
-        s2_peak(geom, settings.year_end)
-        .select("NDVI")
-        .subtract(s2_peak(geom, settings.year_start).select("NDVI"))
+        s2_peak_ndvi(geom, settings.year_end)
+        .subtract(s2_peak_ndvi(geom, settings.year_start))
         .updateMask(gm)
         .rename("ndvi_delta")
     )
@@ -57,135 +56,88 @@ def build_imagery_stats_image(geom: ee.Geometry) -> ee.Image:
     return ee.Image.cat(bands).clip(geom)
 
 
-def aggregate_to_tile_grid(
+def tiles_to_feature_collection(tiles: list[dict]) -> ee.FeatureCollection:
+    features = []
+
+    for t in tiles:
+        geom = ee.Geometry.Rectangle(
+            [
+                t["x_min_m"],
+                t["y_min_m"],
+                t["x_max_m"],
+                t["y_max_m"],
+            ],
+            proj=ee.Projection(settings.crs_wkt),
+            geodesic=False,
+        )
+
+        features.append(
+            ee.Feature(
+                geom,
+                {
+                    "tile_id": t["tile_id"],
+                },
+            )
+        )
+
+    return ee.FeatureCollection(features)
+
+
+def _reduce_tiles(
     stats: ee.Image,
-    *,
-    origin_x: float,
-    origin_y: float,
-    zero_fill_bands: list[str],
-    no_gain_bands: list[str] | None = None,
-) -> ee.Image:
-    sz = settings.tile_size_m
-    crs_transform = [sz, 0, origin_x, 0, -sz, origin_y]
-    no_gain_bands = no_gain_bands or []
-
-    stats = stats.setDefaultProjection(crs=settings.crs_wkt, scale=settings.scale)
-
-    aggregated = stats.reduceResolution(
-        reducer=ee.Reducer.mean(),
-        bestEffort=False,
-        maxPixels=int((sz / settings.scale) ** 2) + 1,
-    ).reproject(crs=settings.crs_wkt, crsTransform=crs_transform)
-
-    pieces = [aggregated.select(zero_fill_bands).unmask(0)]
-    if no_gain_bands:
-        pieces.append(aggregated.select(no_gain_bands).unmask(NO_GAIN_SENTINEL))
-
-    return ee.Image.cat(pieces).select(zero_fill_bands + no_gain_bands)
-
-
-def _fetch_grid(
-    tile_grid: ee.Image,
+    tiles: list[dict],
     band_names: list[str],
     *,
-    origin_x: float,
-    origin_y: float,
-    n_cols: int,
-    n_rows: int,
     tile_scale: int = 4,
-) -> dict[str, list]:
-    region = ee.Geometry.Rectangle(
-        [
-            origin_x,
-            origin_y - n_rows * settings.tile_size_m,
-            origin_x + n_cols * settings.tile_size_m,
-            origin_y,
-        ],
-        proj=ee.Projection(settings.crs_wkt),
-        geodesic=False,
+) -> dict[str, dict[str, float]]:
+    fc = tiles_to_feature_collection(tiles)
+
+    reduced = stats.reduceRegions(
+        collection=fc,
+        reducer=ee.Reducer.mean(),
+        scale=settings.scale,
+        tileScale=tile_scale,
     )
 
-    reducer = ee.Reducer.toList().forEachBand(tile_grid)
-
-    result = tile_grid.reduceRegion(
-        reducer=reducer,
-        geometry=region,
-        scale=settings.tile_size_m,
-        maxPixels=1e13,
-        tileScale=tile_scale,
-    ).getInfo()
+    result = reduced.getInfo()
 
     out = {}
-    for band in band_names:
-        if band not in result:
-            raise RuntimeError(
-                f"reduceRegion result missing band '{band}'; "
-                f"available keys={list(result.keys())}"
-            )
-        flat = result[band]
-        if len(flat) != n_cols * n_rows:
-            raise RuntimeError(
-                f"band '{band}' length mismatch: expected {n_cols*n_rows} "
-                f"values ({n_cols}x{n_rows}), got {len(flat)}"
-            )
-        out[band] = [flat[r * n_cols : (r + 1) * n_cols] for r in range(n_rows)]
+
+    for feature in result["features"]:
+        props = feature["properties"]
+        tile_id = props["tile_id"]
+
+        out[tile_id] = {band: props.get(band) for band in band_names}
+
     return out
 
 
 def fetch_cheap_stats(
-    aoi_geom: ee.Geometry,
+    tiles: list[dict],
     ds: Datasets,
-    *,
-    origin_x: float,
-    origin_y: float,
-    n_cols: int,
-    n_rows: int,
-) -> dict[str, list]:
-    stats = build_cheap_stats_image(aoi_geom, ds)
+) -> dict[str, dict[str, float]]:
+    geom = tiles_to_feature_collection(tiles).geometry()
 
-    no_gain_bands = ["ndvi_delta"]
-    if settings.canopy_height_available:
-        no_gain_bands.append("canopy_mean")
+    stats = build_cheap_stats_image(geom, ds)
 
-    tile_grid = aggregate_to_tile_grid(
+    return _reduce_tiles(
         stats,
-        origin_x=origin_x,
-        origin_y=origin_y,
-        zero_fill_bands=["gain_frac"],
-        no_gain_bands=no_gain_bands,
-    )
-    return _fetch_grid(
-        tile_grid,
+        tiles,
         CHEAP_BAND_NAMES,
-        origin_x=origin_x,
-        origin_y=origin_y,
-        n_cols=n_cols,
-        n_rows=n_rows,
         tile_scale=2,
     )
 
 
 def fetch_imagery_stats(
-    aoi_geom: ee.Geometry,
-    *,
-    origin_x: float,
-    origin_y: float,
-    n_cols: int,
-    n_rows: int,
-) -> dict[str, list]:
-    stats = build_imagery_stats_image(aoi_geom)
-    tile_grid = aggregate_to_tile_grid(
+    tiles: list[dict],
+) -> dict[str, dict[str, float]]:
+    geom = tiles_to_feature_collection(tiles).geometry()
+
+    stats = build_imagery_stats_image(geom)
+
+    return _reduce_tiles(
         stats,
-        origin_x=origin_x,
-        origin_y=origin_y,
-        zero_fill_bands=IMAGERY_BAND_NAMES,
-    )
-    return _fetch_grid(
-        tile_grid,
+        tiles,
         IMAGERY_BAND_NAMES,
-        origin_x=origin_x,
-        origin_y=origin_y,
-        n_cols=n_cols,
-        n_rows=n_rows,
         tile_scale=8,
     )

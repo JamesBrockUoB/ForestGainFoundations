@@ -116,12 +116,12 @@ def process_tile(
         full_valid = build_full_valid(geom)
 
         tasks: dict[str, ee.batch.Task] = {}
-        # tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
-        # tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
+        tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
+        tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
         tasks.update(submit_aee_exports(geom, ct, full_valid, tile_id))
-        # tasks.update(
-        #    submit_label_exports(geom, ct, full_valid, ds, gain_validated, tile_id)
-        # )
+        tasks.update(
+            submit_label_exports(geom, ct, full_valid, ds, gain_validated, tile_id)
+        )
 
         update_tile(
             tile_id,

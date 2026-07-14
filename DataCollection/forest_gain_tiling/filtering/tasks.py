@@ -12,6 +12,7 @@ from enums import TileStatus
 from filtering.tile_batches import count_pending, iter_pending_tile_batches
 from filtering.tile_filter import filter_batch_cheap, filter_batch_imagery
 from gee.auth import get_ee_credentials
+from gee_datasets.registry import Datasets
 from tqdm import tqdm
 
 # Stage keys must match main.py's `--stage` choices (["cheap", "imagery"]).
@@ -35,6 +36,7 @@ def run_filter_local(
 ) -> None:
     cfg = STAGES[stage]
     period = settings.period
+    ds = Datasets() if stage == "cheap" else None  # <-- build once, reused every batch
 
     total_pending = count_pending(cfg["input_status"], period)
     total_batches = -(-total_pending // batch_size)  # ceil division
@@ -62,7 +64,11 @@ def run_filter_local(
             n_batches += 1
             n_tiles += len(tiles)
 
-            counts = cfg["fn"](tiles, logger, batch_label=f"batch {n_batches}")
+            if stage == "cheap":
+                counts = cfg["fn"](tiles, ds, logger, batch_label=f"batch {n_batches}")
+            else:
+                counts = cfg["fn"](tiles, logger, batch_label=f"batch {n_batches}")
+
             for k, v in counts.items():
                 totals[k] = totals.get(k, 0) + v
 
@@ -85,6 +91,7 @@ def _mp_worker(
 ) -> None:
     time.sleep(worker_id * 5)
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
+    ds = Datasets() if stage == "cheap" else None  # <-- build once per worker
 
     fn = STAGES[stage]["fn"]
     logger = logging.getLogger(f"gee.filter.{stage}.worker.{worker_id}")
@@ -99,7 +106,10 @@ def _mp_worker(
             break
         batch_idx, tiles = item
         t0 = time.time()
-        counts = fn(tiles, logger, batch_label=f"batch {batch_idx}")
+        if stage == "cheap":
+            counts = fn(tiles, ds, logger, batch_label=f"batch {batch_idx}")
+        else:
+            counts = fn(tiles, logger, batch_label=f"batch {batch_idx}")
         logger.debug(f"batch {batch_idx}: done in {time.time()-t0:.1f}s")
         result_queue.put((batch_idx, len(tiles), counts))
 
