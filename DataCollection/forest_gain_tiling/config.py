@@ -113,6 +113,8 @@ class Settings:
     use_hpc: bool = field(default_factory=lambda: os.getenv("USE_HPC", "0") == "1")
     num_workers: int = field(default_factory=lambda: int(os.getenv("NUM_WORKERS", "4")))
 
+    aee_source: str = field(default_factory=lambda: os.getenv("AEE_SOURCE", "gee"))
+
     filter_batch_size: int = 100
 
     def __post_init__(self) -> None:
@@ -134,7 +136,7 @@ class Settings:
         object.__setattr__(
             self,
             "valid_aois_path",
-            self.data_dir / "aois" / f"valid_aois_{self.period}.json",
+            self.data_dir / "aois" / f"valid_aois_clearer_{self.period}.json",
         )
 
     @property

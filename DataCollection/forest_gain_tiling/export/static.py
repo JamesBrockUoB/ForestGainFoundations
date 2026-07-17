@@ -14,7 +14,6 @@ def build_static_layers(geom: ee.Geometry) -> dict[str, ee.Image]:
 
     fabdem_native = fabdem.setDefaultProjection(crs="EPSG:4326", scale=30)
     slope_native = ee.Terrain.slope(fabdem_native)
-
     slope = slope_native.resample("bilinear").reproject(
         crs=settings.crs_wkt, scale=settings.scale
     )

@@ -21,7 +21,7 @@ def _add_indices(img: ee.Image) -> ee.Image:
 
 
 def _date_range(year: int) -> tuple[str, str]:
-    return f"{year}-01-01", f"{year}-12-31"
+    return f"{year}-01-01", f"{year+1}-01-01"
 
 
 def s2_availability(geom: ee.Geometry, year: int) -> ee.Image:
@@ -131,7 +131,7 @@ def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
 def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     med = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterDate(f"{year}-01-01", f"{year}-12-31")
+        .filterDate(f"{year}-01-01", f"{year+1}-01-01")
         .filterBounds(geom)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
@@ -197,6 +197,7 @@ def submit_composite_exports(
             crsTransform=crs_transform,
             maxPixels=10_000_000_000_000,
             fileFormat="GeoTIFF",
+            skipEmptyTiles=True,
         )
         task.start()
         tasks[key] = task

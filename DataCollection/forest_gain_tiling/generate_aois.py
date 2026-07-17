@@ -4,32 +4,32 @@ generate_aois.py
 AOI generation with basic sanity checks.
 
 Runs in two modes controlled by the USE_HPC environment variable:
-  USE_HPC=0 (default) — single-process, sequential batches, suitable for local dev
-  USE_HPC=1           — multiprocess workers + dedicated writer thread for HPC/SLURM
+USE_HPC=0 (default) — single-process, sequential batches, suitable for local dev
+USE_HPC=1           — multiprocess workers + dedicated writer thread for HPC/SLURM
 
 Period is controlled by the PERIOD environment variable:
-  PERIOD=p1 (default) — 2017 → 2020
-  PERIOD=p2           — 2020 → 2024
+PERIOD=p1 (default) — 2017 → 2020
+PERIOD=p2           — 2020 → 2024
 
 Usage:
-  # Local
-  PERIOD=p1 python generate_aois.py
+# Local
+PERIOD=p1 python generate_aois.py
 
-  # HPC
-  PERIOD=p2 USE_HPC=1 NUM_WORKERS=32 sbatch submit_aoi_generation.sh
+# HPC
+PERIOD=p2 USE_HPC=1 NUM_WORKERS=32 sbatch submit_aoi_generation.sh
 
 Validity checks
 ────────────────────────────────────────────────────────────────────────────────
 1. Has land          USDOS/LSIB_SIMPLE/2017 — excludes open ocean
 2. Has vegetation    ESA WorldCover trees (10) or mangrove (95) ≥ 1%
 3. Has imagery       S2 (COPERNICUS/S2_SR_HARMONIZED) and S1 (COPERNICUS/S1_GRD)
-                     — every calendar year in the active period must clear 5%
-                     valid-pixel coverage for both sensors
-                     PERIOD=p1 → 2017,2018,2019,2020
-                     PERIOD=p2 → 2020,2021,2022,2023,2024
+                    — every calendar year in the active period must clear 5%
+                    valid-pixel coverage for both sensors
+                    PERIOD=p1 → 2017,2018,2019,2020
+                    PERIOD=p2 → 2020,2021,2022,2023,2024
 4. Has forest gain   DT year_start→year_end for the active period — at least 0.1%
-                     of cell must show tree cover gain with over 50% confidence
-                     counting as tree cover
+                    of cell must show tree cover gain with over 50% confidence
+                    counting as tree cover
 
 Output fields per AOI
 ────────────────────────────────────────────────────────────────────────────────
@@ -51,9 +51,9 @@ import time
 from pathlib import Path
 
 import ee
+from config import settings
 from dotenv import load_dotenv
-from forest_gain_tiling.config import settings
-from forest_gain_tiling.gee.auth import get_ee_credentials
+from gee.auth import get_ee_credentials
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
@@ -73,9 +73,13 @@ if PERIOD not in PERIOD_YEARS:
 
 YEAR_START, YEAR_END = PERIOD_YEARS[PERIOD]
 
-OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois_{PERIOD}.json"
-REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"rejected_aois_{PERIOD}.json"
-CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / f"aoi_filter_checkpoint_{PERIOD}.json"
+OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois_clearer_{PERIOD}.json"
+REJECTED_OUTPUT_FILE = (
+    PROJECT_ROOT / OUTPUT_DIR / f"aois/rejected_aois_clearer_{PERIOD}.json"
+)
+CHECKPOINT = (
+    PROJECT_ROOT / OUTPUT_DIR / f"aois/aoi_filter_checkpoint_clearer_{PERIOD}.json"
+)
 
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -104,7 +108,7 @@ S1_BANDS = ["VV", "VH"]
 
 # AOI_LIST_CACHE is intentionally NOT period-namespaced: the raw 0.25° grid
 # of candidate land cells is identical regardless of which period is active.
-AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "all_aois.json"
+AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "aois/all_aois_clearer.json"
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -113,7 +117,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "aoi_generation.log"),
+        logging.FileHandler(LOG_DIR / "aoi_generation_clearer.log"),
         logging.StreamHandler(),
     ],
 )
@@ -154,7 +158,7 @@ def _build_gee_datasets():
     _cover_start = load_dt_mosaic(YEAR_START)
     _cover_end = load_dt_mosaic(YEAR_END)
 
-    _forest_start = _cover_start.gt(50).unmask(0)
+    _forest_start = _cover_start.gt(20).unmask(0)
     _forest_end = _cover_end.gt(50).unmask(0)
 
     _gain_mask = _forest_start.Not().And(_forest_end).rename("gain").unmask(0)
@@ -246,6 +250,14 @@ def _year_valid_fraction(collection_id, geom, start, end, bands, mask_fn=None):
     """
     col = ee.ImageCollection(collection_id).filterDate(start, end).filterBounds(geom)
 
+    if "S1_GRD" in collection_id:
+        col = col.filter(
+            ee.Filter.listContains("transmitterReceiverPolarisation", "VV")
+        )
+        col = col.filter(
+            ee.Filter.listContains("transmitterReceiverPolarisation", "VH")
+        )
+
     if mask_fn is not None:
         col = col.map(mask_fn)
 
@@ -275,7 +287,7 @@ def has_usable_imagery(geom, min_frac=MIN_IMAGERY_FRACTION):
     conditions = []
 
     for year in range(YEAR_START, YEAR_END + 1):
-        start, end = f"{year}-01-01", f"{year}-12-31"
+        start, end = f"{year}-01-01", f"{year+1}-01-01"
 
         s2_frac = safe_num(
             _year_valid_fraction(
@@ -432,44 +444,37 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
 
     fc = ee.FeatureCollection(features)
 
-    def add_geometry_metadata(f):
+    def add_all_properties(f):
         geom = f.geometry()
 
         area_km2 = geom.area().divide(1e6)
-
         centroid = geom.centroid(1)
-
         coords = ee.List(centroid.coordinates())
 
-        lon = ee.Number(coords.get(0))
-        lat = ee.Number(coords.get(1))
+        lf = land_fraction(_land_raster, geom)
+        has_land = lf.gte(MIN_LAND_FRACTION)
 
-        return f.set(
-            "aoi_area_km2",
-            area_km2,
-            "centroid_lon",
-            lon,
-            "centroid_lat",
-            lat,
+        vf = safe_num(
+            _esa_veg.reduceRegion(
+                ee.Reducer.mean(), geometry=geom, scale=1000, maxPixels=1e9
+            ).get("esa_veg"),
+            0,
         )
+        has_veg = vf.gte(MIN_VEG_FRACTION)
 
-    fc = fc.map(add_geometry_metadata)
+        fg = forest_gain_fraction_dt(_gain_mask, geom)
+        has_gain = fg.gte(MIN_GAIN_FRACTION)
 
-    def add_ecoregion_metadata(f):
-        geom = f.geometry()
+        has_img = has_usable_imagery(geom)
 
         intersecting = _ecoregions.filterBounds(geom)
-
-        # compute eco area once (cheap vs intersection per pair)
         eco_with_area = intersecting.map(
             lambda e: e.set("eco_area", e.geometry().area(1))
         )
-
         ranked = eco_with_area.sort("eco_area", True)
-
-        has_match = ranked.size().gt(0)
-
-        eco = ee.Feature(ee.Algorithms.If(has_match, ranked.first(), ee.Feature(None)))
+        eco = ee.Feature(
+            ee.Algorithms.If(ranked.size().gt(0), ranked.first(), ee.Feature(None))
+        )
 
         biome_name_raw = eco.get("BIOME_NAME")
         biome_num_raw = eco.get("BIOME_NUM")
@@ -496,7 +501,6 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
                 ee.Algorithms.IsEqual(biome_num_raw, None), -1, biome_num_raw
             )
         )
-
         realm = ee.String(
             ee.Algorithms.If(
                 ee.Algorithms.IsEqual(realm_raw, None),
@@ -505,96 +509,80 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
                     ee.Algorithms.IsEqual(realm_raw, "N/A"),
                     "Unknown",
                     ee.Algorithms.If(
-                        ee.Algorithms.IsEqual(realm_raw, ""),
-                        "Unknown",
-                        realm_raw,
+                        ee.Algorithms.IsEqual(realm_raw, ""), "Unknown", realm_raw
                     ),
                 ),
             )
         )
 
         is_rock_ice = biome_num.eq(11)
-
         biome_name = ee.String(
             ee.Algorithms.If(is_rock_ice, "Rock and Ice", biome_name)
         )
-
         realm = ee.String(ee.Algorithms.If(is_rock_ice, "Global", realm))
 
-        return f.set("biome_name", biome_name, "biome_num", biome_num, "region", realm)
-
-    fc = fc.map(add_ecoregion_metadata)
-
-    def add_land(f):
-        lf = land_fraction(_land_raster, f.geometry())
-        return f.set("land_frac", lf, "has_land", lf.gte(MIN_LAND_FRACTION))
-
-    fc = fc.map(add_land)
-    has_land_fc = fc.filter(ee.Filter.eq("has_land", 1))
-    no_land_fc = fc.filter(ee.Filter.eq("has_land", 0))
-
-    def add_veg(f):
-        vf = safe_num(
-            _esa_veg.reduceRegion(
-                ee.Reducer.mean(), geometry=f.geometry(), scale=1000, maxPixels=1e9
-            ).get("esa_veg"),
-            0,
-        )
-        return f.set("veg_fraction", vf, "has_veg", vf.gte(MIN_VEG_FRACTION))
-
-    has_land_fc = has_land_fc.map(add_veg)
-    has_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 1))
-    no_veg_fc = has_land_fc.filter(ee.Filter.eq("has_veg", 0))
-
-    def add_gain(f):
-        fg = forest_gain_fraction_dt(_gain_mask, f.geometry())
-        return f.set("forest_gain_frac", fg, "has_gain", fg.gte(MIN_GAIN_FRACTION))
-
-    has_veg_fc = has_veg_fc.map(add_gain)
-    has_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 1))
-    no_gain_fc = has_veg_fc.filter(ee.Filter.eq("has_gain", 0))
-
-    def add_imagery(f):
-        return f.set("has_imagery", has_usable_imagery(f.geometry()))
-
-    has_gain_fc = has_gain_fc.map(add_imagery)
-    valid_fc = has_gain_fc.filter(ee.Filter.eq("has_imagery", 1))
-    no_imagery_fc = has_gain_fc.filter(ee.Filter.eq("has_imagery", 0))
-
-    no_land_fc = no_land_fc.map(
-        lambda f: f.set(
-            "rejection_reason",
-            "no_land",
-            "valid",
-            0,
+        return f.set(
+            "aoi_area_km2",
+            area_km2,
+            "centroid_lon",
+            ee.Number(coords.get(0)),
+            "centroid_lat",
+            ee.Number(coords.get(1)),
+            "land_frac",
+            lf,
+            "has_land",
+            has_land,
             "veg_fraction",
-            0,
+            vf,
+            "has_veg",
+            has_veg,
             "forest_gain_frac",
-            0,
+            fg,
+            "has_gain",
+            has_gain,
+            "has_imagery",
+            has_img,
+            "biome_name",
+            biome_name,
+            "biome_num",
+            biome_num,
+            "region",
+            realm,
         )
-    )
-    no_veg_fc = no_veg_fc.map(
-        lambda f: f.set(
-            "rejection_reason",
-            "insufficient_veg",
-            "valid",
-            0,
-            "forest_gain_frac",
-            0,
+
+    fc = fc.map(add_all_properties)
+
+    def add_validity(f):
+        has_land = ee.Number(f.get("has_land"))
+        has_veg = ee.Number(f.get("has_veg"))
+        has_gain = ee.Number(f.get("has_gain"))
+        has_img = ee.Number(f.get("has_imagery"))
+
+        valid = has_land.And(has_veg).And(has_gain).And(has_img)
+
+        reason = ee.String(
+            ee.Algorithms.If(
+                valid.eq(0),
+                ee.Algorithms.If(
+                    has_land.eq(0),
+                    "no_land",
+                    ee.Algorithms.If(
+                        has_veg.eq(0),
+                        "insufficient_veg",
+                        ee.Algorithms.If(
+                            has_gain.eq(0), "no_forest_gain", "missing_imagery"
+                        ),
+                    ),
+                ),
+                "valid",
+            )
         )
-    )
-    no_gain_fc = no_gain_fc.map(
-        lambda f: f.set("rejection_reason", "no_forest_gain", "valid", 0)
-    )
-    no_imagery_fc = no_imagery_fc.map(
-        lambda f: f.set("rejection_reason", "missing_imagery", "valid", 0)
-    )
-    valid_fc = valid_fc.map(lambda f: f.set("rejection_reason", "valid", "valid", 1))
 
-    all_rejected = no_land_fc.merge(no_veg_fc).merge(no_gain_fc).merge(no_imagery_fc)
+        return f.set("valid", valid, "rejection_reason", reason)
 
-    all_fc = valid_fc.merge(all_rejected)
-    all_results = all_fc.getInfo()["features"]
+    fc = fc.map(add_validity)
+
+    all_results = fc.getInfo()["features"]
 
     valid_out = [f for f in all_results if f["properties"].get("valid") == 1]
     rejected_out = [f for f in all_results if f["properties"].get("valid") == 0]

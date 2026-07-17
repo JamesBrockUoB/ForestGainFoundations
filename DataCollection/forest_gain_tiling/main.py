@@ -256,7 +256,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     if settings.use_hpc:
         logger.info(f"Mode: HPC | workers={settings.num_workers}")
-        run_hpc(candidates, ds, logger, local_output=args.local_output)
+        run_hpc(candidates, logger, local_output=args.local_output)
     else:
         logger.info("Mode: local sequential")
         run_local(candidates, ds, logger, local_output=args.local_output)

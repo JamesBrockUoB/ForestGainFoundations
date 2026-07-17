@@ -60,6 +60,7 @@ def submit_label_exports(
             crsTransform=crs_transform,
             maxPixels=10_000_000_000_000,
             fileFormat="GeoTIFF",
+            skipEmptyTiles=True,
         )
         task.start()
         tasks[key] = task

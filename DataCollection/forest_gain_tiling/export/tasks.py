@@ -11,7 +11,7 @@ from typing import Any
 
 import ee
 from config import settings
-from embeddings.tasks import process_tessera_with_retry
+from embeddings.tasks import process_all_embeddings_with_retry
 from enums import TileStatus
 from export.aee import submit_aee_exports
 from export.composites import submit_composite_exports
@@ -118,10 +118,12 @@ def process_tile(
         tasks: dict[str, ee.batch.Task] = {}
         tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
-        tasks.update(submit_aee_exports(geom, ct, full_valid, tile_id))
         tasks.update(
             submit_label_exports(geom, ct, full_valid, ds, gain_validated, tile_id)
         )
+
+        if settings.aee_source == "gee":
+            tasks.update(submit_aee_exports(geom, ct, tile_id))
 
         update_tile(
             tile_id,
@@ -159,7 +161,7 @@ def process_tile(
             )
             return str(TileStatus.FAILED)
 
-        if not process_tessera_with_retry(tile, output_dir, logger):
+        if not process_all_embeddings_with_retry(tile, output_dir, logger):
             update_tile(
                 tile_id,
                 status=TileStatus.FAILED,
@@ -269,7 +271,6 @@ def _mp_writer(result_queue: mp.Queue, total: int, logger: logging.Logger) -> No
 
 def run_hpc(
     candidates: list[dict],
-    ds: Datasets,
     logger: logging.Logger,
     local_output: bool = False,
 ) -> None:

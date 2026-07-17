@@ -3,19 +3,11 @@ from __future__ import annotations
 import ee
 from config import settings
 
-AEE_COLLECTION = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
 
-
-def aee_composite(geom: ee.Geometry, year: int) -> ee.Image:
-    """
-    Google DeepMind AlphaEarth Foundations annual embedding for `year`,
-    clipped to geom.
-    """
-    start = f"{year}-01-01"
-    end = f"{year + 1}-01-01"
+def build_year_aee(geom: ee.Geometry, year: int) -> ee.Image:
     return (
-        ee.ImageCollection(AEE_COLLECTION)
-        .filterDate(start, end)
+        ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")
+        .filterDate(f"{year}-01-01", f"{year + 1}-01-01")
         .filterBounds(geom)
         .mosaic()
         .clip(geom)
@@ -25,24 +17,24 @@ def aee_composite(geom: ee.Geometry, year: int) -> ee.Image:
 def submit_aee_exports(
     geom: ee.Geometry,
     crs_transform: list[float],
-    full_valid: ee.Image,
     tile_id: str,
 ) -> dict[str, ee.batch.Task]:
     """
-    One export task per year in settings.period_years — same pattern as
-    submit_composite_exports / submit_static_exports / submit_label_exports.
-    Lands at embeddings/aee_<year>.tif via the same Drive->rclone path as
-    every other product, so _verify_tile_outputs' existing expectations
-    (embeddings/aee_<year>.tif) are unchanged.
+    One Drive export task per year, landing at embeddings/aee_<year>.tif
+    via the same Export->Drive->rclone path as composites/static/labels.
+    Only submitted when settings.aee_source == "gee" — the default
+    ("geoai") fetches AEE via direct HTTPS reads in the synchronous
+    embeddings step instead (see embeddings/aee.py), costing no GEE
+    task-queue quota. Not masked by full_valid — AEE is an independent
+    embedding source, not derived from S1/S2 coverage.
     """
     tasks: dict[str, ee.batch.Task] = {}
 
     for year in settings.period_years:
+        image = build_year_aee(geom, year).toFloat()
         name = f"aee_{year}"
         key = f"embeddings/{name}"
         prefix = f"{tile_id}__embeddings__{name}"
-
-        image = aee_composite(geom, year).updateMask(full_valid).toFloat()
 
         task = ee.batch.Export.image.toDrive(
             image=image,
