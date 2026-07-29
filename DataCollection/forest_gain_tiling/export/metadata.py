@@ -21,12 +21,6 @@ ERA5_YEARLY_BANDS = [
     "temp_mean",
     "temp_min",
     "temp_max",
-    "lai_high_veg_mean",
-    "lai_high_veg_min",
-    "lai_high_veg_max",
-    "lai_low_veg_mean",
-    "lai_low_veg_min",
-    "lai_low_veg_max",
 ]
 
 
@@ -37,17 +31,26 @@ def _fetch_soil(geom: ee.Geometry) -> dict[str, float | None]:
     interpolation artifact rather than real spatial signal. Static,
     single value, no period dependency.
 
-    NOTE: SoilGrids band scale factors are NOT yet verified against the
-    projects/soilgrids-isric asset docs -- treat these as provisional
-    until checked against .getInfo() band descriptions.
+    SoilGrids stores values as scaled integers ("mapped" units) to save
+    space; divide by the documented conversion factor to get real-world
+    ("conventional") units. clay/soc/phh2o all use factor 10:
+    clay -> g/100g (%), soc -> g/kg, phh2o (pH*10) -> pH.
     """
-    soil = ee.Image.cat(
-        [
-            ee.Image("projects/soilgrids-isric/soc_mean").select("soc_0-5cm_mean"),
-            ee.Image("projects/soilgrids-isric/clay_mean").select("clay_0-5cm_mean"),
-            ee.Image("projects/soilgrids-isric/phh2o_mean").select("phh2o_0-5cm_mean"),
-        ]
-    ).rename(SOIL_BANDS)
+    soil = (
+        ee.Image.cat(
+            [
+                ee.Image("projects/soilgrids-isric/soc_mean").select("soc_0-5cm_mean"),
+                ee.Image("projects/soilgrids-isric/clay_mean").select(
+                    "clay_0-5cm_mean"
+                ),
+                ee.Image("projects/soilgrids-isric/phh2o_mean").select(
+                    "phh2o_0-5cm_mean"
+                ),
+            ]
+        )
+        .rename(SOIL_BANDS)
+        .divide(10.0)
+    )
 
     stats = soil.reduceRegion(
         reducer=ee.Reducer.mean(),
@@ -64,19 +67,22 @@ def _fetch_soil(geom: ee.Geometry) -> dict[str, float | None]:
     }
 
 
-def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, float | None]:
+def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
     """
-    One year of ERA5-Land Monthly Aggregated stats -- precipitation,
-    2m air temperature, and leaf area index (high/low vegetation),
-    each as mean/min/max across the year's 12 monthly values. The
-    dataset's own precomputed _min/_max bands are genuine within-month
-    extremes (not derived from already-smoothed monthly means), so
-    min-of-mins / max-of-maxes across the 12 months preserves real
-    extreme events rather than smoothing them away.
+    One year of ERA5-Land Monthly Aggregated stats -- precipitation and
+    2m air temperature, each as mean/min/max across the year's 12
+    monthly values.
 
-    temperature_2m bands are Kelvin; converted to Celsius after
-    reduction (linear, so order doesn't matter). LAI is a unitless
-    area-fraction index, no conversion needed.
+    ERA5-Land masks ocean at its own (~9km) native landmask resolution --
+    a coastal tile can be unambiguously on land at Sentinel-2 resolution
+    while still landing on an ERA5-Land cell classified as sea and
+    masked out. Filled from nearby valid (land) cells via focal_mean
+    before sampling -- GEE's focal_mean only averages over unmasked
+    neighbors within the kernel, so a masked coastal cell gets filled
+    from whichever real land cells surround it, without pulling sea
+    values into the average. Whether a given year/tile needed filling is
+    recorded via climate_source, so a real per-pixel reading is never
+    silently conflated with a filled one.
     """
     ic = (
         ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR")
@@ -89,12 +95,6 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, float | None]
                 "temperature_2m",
                 "temperature_2m_min",
                 "temperature_2m_max",
-                "leaf_area_index_high_vegetation",
-                "leaf_area_index_high_vegetation_min",
-                "leaf_area_index_high_vegetation_max",
-                "leaf_area_index_low_vegetation",
-                "leaf_area_index_low_vegetation_min",
-                "leaf_area_index_low_vegetation_max",
             ]
         )
     )
@@ -119,30 +119,12 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, float | None]
             ic.select("temperature_2m").mean().subtract(273.15).rename("temp_mean"),
             ic.select("temperature_2m_min").min().subtract(273.15).rename("temp_min"),
             ic.select("temperature_2m_max").max().subtract(273.15).rename("temp_max"),
-            ic.select("leaf_area_index_high_vegetation")
-            .mean()
-            .rename("lai_high_veg_mean"),
-            ic.select("leaf_area_index_high_vegetation_min")
-            .min()
-            .rename("lai_high_veg_min"),
-            ic.select("leaf_area_index_high_vegetation_max")
-            .max()
-            .rename("lai_high_veg_max"),
-            ic.select("leaf_area_index_low_vegetation")
-            .mean()
-            .rename("lai_low_veg_mean"),
-            ic.select("leaf_area_index_low_vegetation_min")
-            .min()
-            .rename("lai_low_veg_min"),
-            ic.select("leaf_area_index_low_vegetation_max")
-            .max()
-            .rename("lai_low_veg_max"),
         ]
     )
 
     point = geom.centroid(1)
 
-    stats = stacked.reduceRegion(
+    raw_stats = stacked.reduceRegion(
         reducer=ee.Reducer.first(),
         geometry=point,
         scale=11132,
@@ -150,9 +132,36 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, float | None]
         maxPixels=1_000_000_000,
     ).getInfo()
 
+    if all(raw_stats.get(b) is not None for b in ERA5_YEARLY_BANDS):
+        return {
+            **{band: float(raw_stats[band]) for band in ERA5_YEARLY_BANDS},
+            "climate_source": "ERA5_LAND",
+        }
+
+    # Masked (sea) cell -- fill from nearby land cells. Radius is in
+    # pixel units of stacked's own (~11.1km) resolution; try progressively
+    # wider radii rather than committing to one that might not reach land
+    # for a tile in a small bay/inlet.
+    for radius_px in (3, 6, 10):
+        filled = stacked.focal_mean(
+            radius=radius_px, kernelType="square", units="pixels"
+        )
+        stats = filled.reduceRegion(
+            reducer=ee.Reducer.first(),
+            geometry=point,
+            scale=11132,
+            bestEffort=True,
+            maxPixels=1_000_000_000,
+        ).getInfo()
+        if all(stats.get(b) is not None for b in ERA5_YEARLY_BANDS):
+            return {
+                **{band: float(stats[band]) for band in ERA5_YEARLY_BANDS},
+                "climate_source": f"ERA5_LAND_FILLED_r{radius_px}",
+            }
+
     return {
-        band: (float(stats[band]) if stats.get(band) is not None else None)
-        for band in ERA5_YEARLY_BANDS
+        **{band: None for band in ERA5_YEARLY_BANDS},
+        "climate_source": "MISSING",
     }
 
 
@@ -165,8 +174,8 @@ def _fetch_yearly_climate(
 def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
     with rasterio.open(output_dir / "labels" / "gain_confidence.tif") as src:
         gain = src.read(1)
-    valid = ~np.isnan(gain)
-    gain_frac = float(np.nansum(gain) / valid.sum()) if valid.sum() > 0 else None
+
+    gain_pixels = np.isfinite(gain) & (gain > 0)
 
     metadata: dict[str, Any] = {
         "tile_id": tile["tile_id"],
@@ -184,8 +193,7 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
             "max_lon": tile["max_lon"],
             "max_lat": tile["max_lat"],
         },
-        "gain_frac": gain_frac,
-        "full_valid_coverage_frac": float(valid.sum() / gain.size),
+        "gain_pct": float(gain_pixels.mean()) * 100,
         "exported_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -213,7 +221,16 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
 
         gain_bool = np.nan_to_num(gain, nan=0.0) > 0
 
-        pseudo_valid = gain_bool & np.isfinite(dominant) & np.isfinite(confidence)
+        # -9999 is the sentinel written for "gain pixel with no
+        # pseudo-label" and is a finite value, so np.isfinite alone
+        # doesn't exclude it — that's what was letting -9999 through into
+        # dominant[pseudo_valid].astype(int) and then into bincount below,
+        # which rejects negative values.
+        labelled = (dominant != -9999) & (confidence != -9999)
+
+        pseudo_valid = (
+            gain_bool & labelled & np.isfinite(dominant) & np.isfinite(confidence)
+        )
 
         class_names = PseudoLabel._member_names_
 

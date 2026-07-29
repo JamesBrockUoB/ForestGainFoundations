@@ -8,7 +8,13 @@ from labels.gain import build_gain_layer
 
 NO_GAIN_SENTINEL = -9999.0
 
-CHEAP_BAND_NAMES = ["gain_frac", "ndvi_delta"]
+CHEAP_BAND_NAMES = [
+    "gain_frac",
+    "ndvi_delta",
+]
+
+if settings.period == "p1":
+    CHEAP_BAND_NAMES.append("pseudo_gain_frac")
 
 # Per-year S2 + S1 availability bands for the active period (settings.period,
 # fixed for the process lifetime via the PERIOD env var).
@@ -19,18 +25,47 @@ S1_BAND_NAMES = [f"s1_{y}" for y in settings.period_years]
 IMAGERY_BAND_NAMES = S2_BAND_NAMES + S1_BAND_NAMES
 
 
-def build_cheap_stats_image(geom: ee.Geometry, ds: Datasets) -> ee.Image:
-    gain_validated, gain_binary = build_gain_layer(geom, ds)
-    gm = gain_validated.selfMask()
+def build_cheap_stats_image(
+    geom: ee.Geometry,
+    ds: Datasets,
+) -> ee.Image:
+
+    gain_validated, gain_binary, _ = build_gain_layer(geom, ds)
+
+    gain_mask = gain_validated.selfMask()
 
     ndvi_delta = (
         s2_peak_ndvi(geom, settings.year_end)
         .subtract(s2_peak_ndvi(geom, settings.year_start))
-        .updateMask(gm)
+        .updateMask(gain_mask)
         .rename("ndvi_delta")
     )
 
-    bands = [gain_binary.rename("gain_frac"), ndvi_delta]
+    forty = ds.forty.clip(geom)
+
+    forty_valid = (
+        ee.Image.cat(
+            [
+                forty.select("TreeCropsAndAgroforestry"),
+                forty.select("NaturallyRegeneratingForest"),
+                forty.select("PlantationForest"),
+                forty.select("PlantedForest"),
+            ]
+        )
+        .reduce(ee.Reducer.sum())
+        .gt(0)
+    )
+
+    pseudo_gain = gain_mask.And(forty_valid).rename("pseudo_gain")
+
+    bands = [
+        gain_binary.rename("gain_frac"),
+        ndvi_delta,
+    ]
+
+    # Only needed for P1
+    if settings.period == "p1":
+        bands.append(pseudo_gain.rename("pseudo_gain_frac"))
 
     return ee.Image.cat(bands).clip(geom)
 

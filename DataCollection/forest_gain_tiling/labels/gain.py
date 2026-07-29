@@ -4,19 +4,13 @@ import ee
 from config import settings
 from gee_datasets.registry import Datasets
 
-TREE_THRESHOLD = 50  # % canopy cover
 
+def _cover_image(
+    ds: Datasets,
+    year: int,
+) -> ee.Image:
 
-def _cover_image(ds: Datasets, year: int) -> ee.Image:
-    image = ds.dt_cover.get(year)
-    if image is None:
-        raise RuntimeError(
-            f"Canopy-cover asset for year {year} is not available yet — "
-            f"cannot run build_gain_layer for period={settings.period} "
-            f"({settings.year_start}->{settings.year_end}) until it's "
-            f"uploaded and wired into gee_datasets/registry.py."
-        )
-    return image
+    return ds.get_dt_cover(year)
 
 
 def build_gain_layer(
@@ -24,53 +18,73 @@ def build_gain_layer(
     ds: Datasets,
 ) -> tuple[ee.Image, ee.Image, ee.Image]:
     """
-    Forest gain defined as:
-        canopy <20% in settings.year_start (not-yet-forest at period start)
-        canopy >50% in settings.year_end
-        AND, once a pixel is first observed as forest in some intervening
-        year, it does not revert to non-forest afterward — tolerating up
-        to settings.gain_sustain_dropout_tolerance such reversions among
-        strictly-intermediate years only.
+    Forest gain:
 
-    Crucially, non-forest readings *before* a pixel's first forest
-    crossing are not reversions and never consume tolerance budget — a
-    pixel that stays below threshold for several years and then grows in
-    late is a valid gain pixel, not noise. Only a *later* drop back below
-    threshold, after having already read forest, counts as a dip.
+    1. Start:
+        canopy <20%
+
+    2. End:
+        canopy >50%
+
+    3. Intermediate years:
+        monotonic forest establishment,
+        allowing configured dropout tolerance
+
+    Returns:
+        validated gain mask
+        binary gain raster
+        final canopy confidence
     """
+
     cover_start = _cover_image(ds, settings.year_start).clip(geom)
+
     cover_end = _cover_image(ds, settings.year_end).clip(geom)
 
-    forest_start = cover_start.gt(TREE_THRESHOLD)
-    forest_end = cover_end.gt(TREE_THRESHOLD)
+    forest_start = cover_start.lt(settings.non_tree_threshold_frac)
 
-    gain_candidate = forest_start.Not().And(forest_end)
+    forest_end = cover_end.gt(settings.min_tree_threshold_frac)
 
-    # Strictly-intermediate years, chronological order matters here —
-    # the cumulative "have we ever been forest yet" scan depends on it.
+    gain_candidate = forest_start.And(forest_end)
+
     intervening_years = sorted(
         y
         for y in settings.period_years
-        if y not in (settings.year_start, settings.year_end)
+        if y
+        not in (
+            settings.year_start,
+            settings.year_end,
+        )
     )
 
-    ever_forest_before = ee.Image.constant(0)  # boolean-as-int, starts false
-    non_forest_hits = ee.Image.constant(0)
+    ever_forest = ee.Image.constant(0)
+
+    dropout_count = ee.Image.constant(0)
+
     for year in intervening_years:
-        forest_y = _cover_image(ds, year).clip(geom).gt(TREE_THRESHOLD)
-        reverted = ever_forest_before.And(forest_y.Not())
-        non_forest_hits = non_forest_hits.add(reverted)
-        ever_forest_before = ever_forest_before.Or(forest_y)
+
+        cover = _cover_image(
+            ds,
+            year,
+        ).clip(geom)
+
+        forest = cover.gt(settings.min_tree_threshold_frac)
+        dropout = ever_forest.And(forest.Not())
+        dropout_count = dropout_count.add(dropout)
+
+        ever_forest = ever_forest.Or(forest)
 
     sustained = forest_end.And(
-        non_forest_hits.lte(settings.gain_sustain_dropout_tolerance)
+        dropout_count.lte(settings.gain_sustain_dropout_tolerance)
     )
 
     gain = gain_candidate.And(sustained)
 
-    clean = gain.updateMask(gain).focal_max(1).focal_min(1)
-    validated = clean.And(ds.esa_trees.clip(geom))
+    validated = gain.selfMask()
 
     forest_confidence = cover_end.updateMask(validated).rename("forest_confidence")
 
-    return (validated, validated.unmask(0).rename("gain"), forest_confidence)
+    return (
+        validated.rename("validated_gain"),
+        validated.unmask(0).rename("gain"),
+        forest_confidence,
+    )

@@ -21,7 +21,9 @@ PERIOD=p2 USE_HPC=1 NUM_WORKERS=32 sbatch submit_aoi_generation.sh
 Validity checks
 ────────────────────────────────────────────────────────────────────────────────
 1. Has land          USDOS/LSIB_SIMPLE/2017 — excludes open ocean
-2. Has vegetation    ESA WorldCover trees (10) or mangrove (95) ≥ 1%
+2. Has vegetation    Dynamic World (GOOGLE/DYNAMICWORLD/V1), median composite
+                     for the active period's year_start — top class is trees,
+                     grass, flooded_vegetation, crops, or shrub_and_scrub ≥ 1%.
 3. Has imagery       S2 (COPERNICUS/S2_SR_HARMONIZED) and S1 (COPERNICUS/S1_GRD)
                     — every calendar year in the active period must clear 5%
                     valid-pixel coverage for both sensors
@@ -106,6 +108,9 @@ S2_BANDS = [
 ]  # blue + red + NIR, 10m — strong proxy for full-scene coverage
 S1_BANDS = ["VV", "VH"]
 
+DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
+DW_VEGETATED_LABELS = [1, 2, 3, 4, 5]  # trees, grass, flooded_veg, crops, shrub/scrub
+
 # AOI_LIST_CACHE is intentionally NOT period-namespaced: the raw 0.25° grid
 # of candidate land cells is identical regardless of which period is active.
 AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "aois/all_aois_clearer.json"
@@ -136,14 +141,29 @@ logger.info(
 )
 
 
+def _dw_vegetation_mask(year):
+    start = f"{year}-01-01"
+    end = f"{year + 1}-01-01"
+
+    dw = ee.ImageCollection(DW_COLLECTION).filterDate(start, end).median()
+
+    return (
+        dw.select("label")
+        .remap(
+            [1, 2, 3, 4, 5],  # trees, grass, flooded vegetation, crops, shrub/scrub
+            [1, 1, 1, 1, 1],
+            0,
+        )
+        .rename("dw_veg")
+        .unmask(0)
+    )
+
+
 def _build_gee_datasets():
     _land_fc = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
     _land_raster = ee.Image(0).paint(_land_fc, 1).unmask(0).rename("land")
 
-    _esa_wc = ee.Image("ESA/WorldCover/v100/2020")
-    _esa_trees = _esa_wc.eq(10).unmask(0)
-    _esa_mangrove = _esa_wc.eq(95).unmask(0)
-    _esa_veg = _esa_trees.Or(_esa_mangrove).unmask(0).rename("esa_veg")
+    _dw_veg = _dw_vegetation_mask(YEAR_START).rename("dw_veg")
 
     def load_dt_mosaic(year):
         return (
@@ -158,14 +178,14 @@ def _build_gee_datasets():
     _cover_start = load_dt_mosaic(YEAR_START)
     _cover_end = load_dt_mosaic(YEAR_END)
 
-    _forest_start = _cover_start.gt(20).unmask(0)
-    _forest_end = _cover_end.gt(50).unmask(0)
+    _forest_start = _cover_start.gt(settings.non_tree_threshold_frac).unmask(0)
+    _forest_end = _cover_end.gt(settings.min_tree_threshold_frac).unmask(0)
 
     _gain_mask = _forest_start.Not().And(_forest_end).rename("gain").unmask(0)
 
     _ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
 
-    return _land_raster, _esa_veg, _gain_mask, _ecoregions
+    return _land_raster, _dw_veg, _gain_mask, _ecoregions
 
 
 def get_asset_bounds(year_start=2017, year_end=2020, padding=0.5):
@@ -287,7 +307,7 @@ def has_usable_imagery(geom, min_frac=MIN_IMAGERY_FRACTION):
     conditions = []
 
     for year in range(YEAR_START, YEAR_END + 1):
-        start, end = f"{year}-01-01", f"{year+1}-01-01"
+        start, end = f"{year}-01-01", f"{year + 1}-01-01"
 
         s2_frac = safe_num(
             _year_valid_fraction(
@@ -432,7 +452,7 @@ def generate_aois(
     return valid
 
 
-def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
+def process_batch(_land_raster, _dw_veg, _gain_mask, _ecoregions, batch):
     batch = [a.get("properties", a) if isinstance(a, dict) else a for a in batch]
     features = [
         ee.Feature(
@@ -455,11 +475,15 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
         has_land = lf.gte(MIN_LAND_FRACTION)
 
         vf = safe_num(
-            _esa_veg.reduceRegion(
-                ee.Reducer.mean(), geometry=geom, scale=1000, maxPixels=1e9
-            ).get("esa_veg"),
+            _dw_veg.reduceRegion(
+                ee.Reducer.mean(),
+                geometry=geom,
+                scale=1000,
+                maxPixels=1e9,
+            ).get("dw_veg"),
             0,
         )
+
         has_veg = vf.gte(MIN_VEG_FRACTION)
 
         fg = forest_gain_fraction_dt(_gain_mask, geom)
@@ -591,7 +615,7 @@ def process_batch(_land_raster, _esa_veg, _gain_mask, _ecoregions, batch):
 
 
 def run_local(remaining, loaded_valid, loaded_rejected):
-    _land_raster, _esa_veg, _gain_mask, _ecoregions = _build_gee_datasets()
+    _land_raster, _dw_veg, _gain_mask, _ecoregions = _build_gee_datasets()
 
     valid_aois = []
     rejected_aois = []
@@ -601,7 +625,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
         try:
             valid_batch, rejected_batch = process_batch(
-                _land_raster, _esa_veg, _gain_mask, _ecoregions, batch
+                _land_raster, _dw_veg, _gain_mask, _ecoregions, batch
             )
             valid_aois.extend([f["properties"] for f in valid_batch])
             rejected_aois.extend([f["properties"] for f in rejected_batch])
@@ -634,7 +658,7 @@ def _worker(batch_queue, result_queue, worker_id):
     # process needs its own ee.Initialize call since GEE state isn't
     # inherited across the multiprocessing fork/spawn boundary.
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
-    _land_raster, _esa_veg, _gain_mask, _ecoregions = _build_gee_datasets()
+    _land_raster, _dw_veg, _gain_mask, _ecoregions = _build_gee_datasets()
 
     while True:
         item = batch_queue.get()
@@ -647,7 +671,7 @@ def _worker(batch_queue, result_queue, worker_id):
         for attempt in range(8):
             try:
                 valid, rejected = process_batch(
-                    _land_raster, _esa_veg, _gain_mask, _ecoregions, batch
+                    _land_raster, _dw_veg, _gain_mask, _ecoregions, batch
                 )
                 result_queue.put(("batch_result", batch_idx, valid, rejected))
                 time.sleep(random.uniform(1, 3))

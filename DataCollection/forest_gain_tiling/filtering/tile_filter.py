@@ -13,8 +13,10 @@ from registry.store import update_tile
 
 
 def evaluate_cheap_stats(
-    stats: dict[str, float], logger: logging.Logger | None = None
+    stats: dict[str, float],
+    logger: logging.Logger | None = None,
 ) -> tuple[str, str | None]:
+
     gain_pct = stats["gain_frac"] * 100.0
     ndvi_delta = stats["ndvi_delta"]
 
@@ -25,9 +27,26 @@ def evaluate_cheap_stats(
         return str(TileStatus.REJECTED), "low_gain_pct"
 
     if ndvi_delta <= settings.ndvi_delta_min:
-        if logger:
-            logger.debug(f"low_viability: ndvi_delta={ndvi_delta:.4f}")
         return str(TileStatus.REJECTED), "low_viability"
+
+    if settings.period == "p1":
+
+        pseudo_frac = stats.get("pseudo_gain_frac")
+
+        if pseudo_frac is None:
+            return (
+                str(TileStatus.REJECTED),
+                "missing_pseudo_gain_stats",
+            )
+
+        if pseudo_frac < settings.min_pseudo_gain_frac:
+            if logger:
+                logger.debug(f"low_pseudo_coverage: " f"{pseudo_frac:.3f}")
+
+            return (
+                str(TileStatus.REJECTED),
+                "low_pseudo_gain_coverage",
+            )
 
     return str(TileStatus.CHEAP_VALID), None
 

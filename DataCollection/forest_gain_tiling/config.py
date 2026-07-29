@@ -88,6 +88,11 @@ class Settings:
     gain_pct_min: float = 1.0
     ndvi_delta_min: float = 0.0
     gain_sustain_dropout_tolerance: int = 1
+    min_pseudo_gain_frac: float = 0.5
+
+    non_tree_threshold_frac: int = 20
+    min_tree_threshold_frac: int = 50
+
     # Allowed post-crossing reversions to non-forest in intermediate years
     # (never applies to year_end). See labels/gain.py.
 

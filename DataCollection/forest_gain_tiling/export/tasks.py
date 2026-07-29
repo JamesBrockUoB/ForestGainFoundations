@@ -20,6 +20,7 @@ from export.labels import submit_label_exports
 from export.metadata import write_tile_metadata
 from export.static import submit_static_exports
 from gee.auth import get_ee_credentials
+from gee.cleanup import _cleanup_failed_tile
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 from registry.store import update_tile
@@ -113,11 +114,15 @@ def process_tile(
     geom = tile_geom(tile)
     ct = crs_transform(tile)
 
+    tasks: dict[str, ee.batch.Task] = {}
+    output_dir: Path | None = None
+    cancel_event = threading.Event()
+    t_embeddings: threading.Thread | None = None
+
     try:
         _, _, gain_confidence = build_gain_layer(geom, ds)
         full_valid = build_full_valid(geom)
 
-        tasks: dict[str, ee.batch.Task] = {}
         tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
         tasks.update(
@@ -139,9 +144,7 @@ def process_tile(
             dest_root = str(output_dir.parent)
         else:
             if not settings.hpc_path:
-                err = "HPC_PATH is not configured"
-                update_tile(tile_id, status=TileStatus.FAILED, error=err)
-                return str(TileStatus.FAILED)
+                raise RuntimeError("HPC_PATH is not configured")
             output_dir = Path(settings.hpc_path) / tile_id
             dest_root = settings.hpc_path
 
@@ -156,52 +159,40 @@ def process_tile(
 
         def _run_embeddings() -> None:
             embeddings_result["ok"] = process_all_embeddings_with_retry(
-                tile, output_dir, logger
+                tile,
+                output_dir,
+                logger,
+                cancel_event,
             )
 
         t_embeddings = threading.Thread(target=_run_embeddings)
         t_embeddings.start()
 
         if not _wait_for_all(tasks, logger, tile_id):
-            t_embeddings.join()  # don't return with a background thread still writing files
-            update_tile(
-                tile_id,
-                status=TileStatus.FAILED,
-                error="one or more GEE export tasks failed",
-            )
-            return str(TileStatus.FAILED)
+            raise RuntimeError("one or more GEE export tasks failed")
 
         logger.info(f"{tile_id} | all exports complete")
 
+        logger.info(f"{tile_id} | rcloning data")
         products = [tuple(key.split("/", 1)) for key in tasks.keys()]
         rclone_ok = rclone_all_products(tile_id, products, dest_root, logger)
 
         # Embeddings has been running since before _wait_for_all started --
         # by this point it's very likely already finished (or close to
-        # it), so this join is typically near-instant rather than a real
-        # wait, unlike the old structure where it started from zero here.
+        # it), so this join is typically near-instant
         t_embeddings.join()
 
         if not rclone_ok:
-            update_tile(
-                tile_id, status=TileStatus.FAILED, error="rclone transfer failed"
-            )
-            return str(TileStatus.FAILED)
+            raise RuntimeError("rclone transfer failed")
 
         if not embeddings_result.get("ok"):
-            update_tile(
-                tile_id,
-                status=TileStatus.FAILED,
-                error="embedding acquisition failed",
-            )
-            return str(TileStatus.FAILED)
+            raise RuntimeError("embedding acquisition failed")
 
         missing = _verify_tile_outputs(output_dir, list(tasks.keys()))
         if missing:
-            err = f"missing outputs after processing: {missing}"
-            logger.error(f"{tile_id} | {err}")
-            update_tile(tile_id, status=TileStatus.FAILED, error=err)
-            return str(TileStatus.FAILED)
+            raise RuntimeError(f"missing outputs after processing: {missing}")
+
+        logger.info(f"{tile_id} | rcloning complete")
 
         write_tile_metadata(tile, output_dir, logger)
 
@@ -214,9 +205,17 @@ def process_tile(
         return str(TileStatus.COMPLETE)
 
     except Exception as exc:
-        logger.error(f"error processing {tile_id}: {exc}")
-        update_tile(tile_id, status=TileStatus.FAILED, error=str(exc))
-        return str(TileStatus.FAILED)
+        logger.exception(f"{tile_id} | processing failed")
+
+        return _cleanup_failed_tile(
+            tile_id=tile_id,
+            reason=str(exc),
+            logger=logger,
+            tasks=tasks,
+            output_dir=output_dir,
+            embeddings_thread=t_embeddings,
+            cancel_event=cancel_event,
+        )
 
 
 def run_local(

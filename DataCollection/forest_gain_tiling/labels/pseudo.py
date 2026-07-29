@@ -64,5 +64,6 @@ def build_pseudo_labels(
             ]
         )
         .updateMask(output_mask)
+        .unmask(-9999)
         .toFloat()
     )

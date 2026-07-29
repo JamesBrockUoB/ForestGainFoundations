@@ -5,14 +5,10 @@ import ee
 
 class Datasets:
     def __init__(self) -> None:
-        self.esa_wc = ee.Image("ESA/WorldCover/v100/2020")
-        self.esa_trees = self.esa_wc.eq(10).unmask(0)
-
         self.forty = ee.ImageCollection(
             "projects/nature-trace/assets/forest_typology/forest_typology_2020_v1_0_collection"
         ).mosaic()
 
-        # p1 (2017->2020): yearly tree-cover mosaics, all uploaded.
         self.dt_cover: dict[int, ee.Image | None] = {
             year: (
                 ee.Image(
@@ -22,7 +18,12 @@ class Datasets:
                 .divide(2.55)
                 .rename("tree_cover_pct")
             )
-            for year in [2017, 2018, 2019, 2020]
+            for year in [
+                2017,
+                2018,
+                2019,
+                2020,
+            ]
         }
 
         # p2 (2020->2024): not yet uploaded. Uncomment and fill in the
@@ -40,3 +41,11 @@ class Datasets:
         #         .divide(2.55)
         #         .rename("tree_cover_pct")
         #     )
+
+    def get_dt_cover(self, year: int) -> ee.Image:
+        image = self.dt_cover.get(year)
+
+        if image is None:
+            raise RuntimeError(f"Canopy-cover asset for {year} is not available yet")
+
+        return image

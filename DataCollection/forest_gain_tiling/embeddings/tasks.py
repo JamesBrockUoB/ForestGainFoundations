@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
+from threading import Event
 from typing import Any, Callable
 
 from config import settings
@@ -34,37 +34,84 @@ def _process_embedding_source_with_retry(
     tile: dict[str, Any],
     output_dir: Path,
     logger: logging.Logger,
+    cancel_event: Event,
     retries: int = 5,
 ) -> bool:
     tile_id = tile["tile_id"]
+
     for attempt in range(retries):
-        if _process_embedding_source(name, download_fn, tile, output_dir, logger):
+
+        if cancel_event.is_set():
+            logger.warning(f"{tile_id} | {name} cancelled")
+            return False
+
+        if _process_embedding_source(
+            name,
+            download_fn,
+            tile,
+            output_dir,
+            logger,
+        ):
             return True
-        wait = (2**attempt) + 1
-        logger.warning(f"{tile_id} | {name} retry {attempt + 1}/{retries} in {wait}s")
-        time.sleep(wait)
+
+        if attempt < retries - 1:
+            wait = (2**attempt) + 1
+
+            logger.warning(
+                f"{tile_id} | {name} retry {attempt + 1}/{retries} in {wait}s"
+            )
+
+            # Interruptible sleep
+            if cancel_event.wait(wait):
+                logger.warning(f"{tile_id} | {name} cancelled during retry wait")
+                return False
+
     logger.error(f"{tile_id} | {name} exhausted retries")
     return False
 
 
 def process_tessera_with_retry(
-    tile: dict[str, Any], output_dir: Path, logger: logging.Logger, retries: int = 5
+    tile: dict[str, Any],
+    output_dir: Path,
+    logger: logging.Logger,
+    cancel_event: Event,
+    retries: int = 5,
 ) -> bool:
     return _process_embedding_source_with_retry(
-        "TESSERA", download_tessera, tile, output_dir, logger, retries
+        "TESSERA",
+        download_tessera,
+        tile,
+        output_dir,
+        logger,
+        cancel_event,
+        retries,
     )
 
 
 def process_aee_with_retry(
-    tile: dict[str, Any], output_dir: Path, logger: logging.Logger, retries: int = 5
+    tile: dict[str, Any],
+    output_dir: Path,
+    logger: logging.Logger,
+    cancel_event: Event,
+    retries: int = 5,
 ) -> bool:
     return _process_embedding_source_with_retry(
-        "AEE", download_aee, tile, output_dir, logger, retries
+        "AEE",
+        download_aee,
+        tile,
+        output_dir,
+        logger,
+        cancel_event,
+        retries,
     )
 
 
 def process_all_embeddings_with_retry(
-    tile: dict[str, Any], output_dir: Path, logger: logging.Logger, retries: int = 5
+    tile: dict[str, Any],
+    output_dir: Path,
+    logger: logging.Logger,
+    cancel_event: Event,
+    retries: int = 5,
 ) -> bool:
     """
     TESSERA always runs here. AEE only runs here when
@@ -74,10 +121,28 @@ def process_all_embeddings_with_retry(
     has already landed on disk via rclone by the time this function
     runs; calling download_aee again here would be redundant.
     """
-    tessera_ok = process_tessera_with_retry(tile, output_dir, logger, retries)
+
+    tessera_ok = process_tessera_with_retry(
+        tile,
+        output_dir,
+        logger,
+        cancel_event,
+        retries,
+    )
+
+    if not tessera_ok:
+        return False
+
     aee_ok = (
-        process_aee_with_retry(tile, output_dir, logger, retries)
+        process_aee_with_retry(
+            tile,
+            output_dir,
+            logger,
+            cancel_event,
+            retries,
+        )
         if settings.aee_source == "geoai"
         else True
     )
-    return tessera_ok and aee_ok
+
+    return aee_ok

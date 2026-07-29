@@ -112,7 +112,7 @@ def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
         ee.Algorithms.If(
             north,
             f"{year}-09-30",
-            f"{year+1}-03-31",
+            f"{year + 1}-03-31",
         )
     )
 
@@ -129,14 +129,19 @@ def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
 
 
 def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
+    def _mask_edge(img):
+        edge = img.lt(-30.0)
+        return img.updateMask(img.mask().And(edge.Not()))
+
     med = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterDate(f"{year}-01-01", f"{year+1}-01-01")
+        .filterDate(f"{year}-01-01", f"{year + 1}-01-01")
         .filterBounds(geom)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
         .select(["VV", "VH"])
+        .map(_mask_edge)
         .median()
     )
     return med.addBands(med.select("VV").divide(med.select("VH")).rename("VVVH"))
