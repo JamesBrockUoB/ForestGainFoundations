@@ -27,11 +27,7 @@ Commands
 Filter flags
 ------------
   --stage      cheap | imagery   which filter stage to run
-                 cheap:   PENDING -> CHEAP_VALID | REJECTED (gain/NDVI thresholds;
-                          canopy_mean is still computed and reported per tile but
-                          no longer gates pass/fail — canopy height data is only
-                          available for 2020, so it can't gate viability across
-                          a full period like p1's 2017 endpoint)
+                 cheap:   PENDING -> CHEAP_VALID | REJECTED (gain/NDVI thresholds)
                  imagery: CHEAP_VALID -> VALID | REJECTED (per-year S1+S2 availability
                           over every year in the active period)
   --limit      N            max number of AOIs to process (for testing)
@@ -199,7 +195,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
         )
     else:
         logger.info(
-            f"Mode: local sequential | stage={args.stage} | period={settings.period} "
+            f"Mode: local | stage={args.stage} | period={settings.period} "
             f"| batch_size={args.batch_size} | Filtering tiles"
         )
         run_filter_local(
@@ -258,7 +254,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.info(f"Mode: HPC | workers={settings.num_workers}")
         run_hpc(candidates, logger, local_output=args.local_output)
     else:
-        logger.info("Mode: local sequential")
+        logger.info("Mode: local")
         run_local(candidates, ds, logger, local_output=args.local_output)
 
     print(registry_summary(period=settings.period))

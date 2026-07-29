@@ -1,6 +1,6 @@
 <div align="center">
     
-<h1>Forest Gain Foundations: Vision foundation model for distinguishing forest growth typology and restoration site informatics</h1>
+<h1>Forest Gain Foundations: Vision foundation model for identifying forest gain areas and tile-level gain typology</h1>
 
 </div align="center">
 

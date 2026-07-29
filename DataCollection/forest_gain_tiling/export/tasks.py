@@ -17,6 +17,7 @@ from export.aee import submit_aee_exports
 from export.composites import submit_composite_exports
 from export.drive import rclone_all_products
 from export.labels import submit_label_exports
+from export.metadata import write_tile_metadata
 from export.static import submit_static_exports
 from gee.auth import get_ee_credentials
 from gee_datasets.registry import Datasets
@@ -101,27 +102,27 @@ def process_tile(
     local_output: bool = False,
 ) -> str:
     """
-    Process one tile: submit every GEE export (composites/static/labels),
-    wait for ALL of them, move every product to its destination, download
-    embeddings, verify everything landed, then mark complete. A tile is
-    only ever marked COMPLETE after every product has been confirmed on
-    disk — no partial-success path.
+    Process one tile: submit every GEE export (composites/static/labels/
+    [aee if aee_source=="gee"]), start embeddings downloading IMMEDIATELY
+    in parallel (TESSERA, and AEE if aee_source=="geoai" -- neither
+    depends on GEE task state), wait for all GEE tasks, rclone, then join
+    the embeddings thread and verify everything landed. A tile is only
+    ever marked COMPLETE after every product has been confirmed on disk.
     """
     tile_id = tile["tile_id"]
     geom = tile_geom(tile)
     ct = crs_transform(tile)
 
     try:
-        gain_validated, _ = build_gain_layer(geom, ds)
+        _, _, gain_confidence = build_gain_layer(geom, ds)
         full_valid = build_full_valid(geom)
 
         tasks: dict[str, ee.batch.Task] = {}
         tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
         tasks.update(
-            submit_label_exports(geom, ct, full_valid, ds, gain_validated, tile_id)
+            submit_label_exports(geom, ct, full_valid, ds, gain_confidence, tile_id)
         )
-
         if settings.aee_source == "gee":
             tasks.update(submit_aee_exports(geom, ct, tile_id))
 
@@ -133,7 +134,36 @@ def process_tile(
         )
         logger.info(f"{tile_id} | submitted {len(tasks)} export tasks")
 
+        if local_output:
+            output_dir = get_local_output_dir(tile_id)
+            dest_root = str(output_dir.parent)
+        else:
+            if not settings.hpc_path:
+                err = "HPC_PATH is not configured"
+                update_tile(tile_id, status=TileStatus.FAILED, error=err)
+                return str(TileStatus.FAILED)
+            output_dir = Path(settings.hpc_path) / tile_id
+            dest_root = settings.hpc_path
+
+        # Embeddings (TESSERA always, + AEE when aee_source=="geoai") has
+        # no dependency on GEE task state -- start it now so it overlaps
+        # the entire _wait_for_all polling window below, not just the
+        # rclone step after. process_all_embeddings_with_retry already
+        # skips the geoai-AEE download when aee_source=="gee" (that AEE
+        # went into `tasks` above instead), so this is always safe to
+        # start unconditionally here regardless of aee_source.
+        embeddings_result: dict[str, bool] = {}
+
+        def _run_embeddings() -> None:
+            embeddings_result["ok"] = process_all_embeddings_with_retry(
+                tile, output_dir, logger
+            )
+
+        t_embeddings = threading.Thread(target=_run_embeddings)
+        t_embeddings.start()
+
         if not _wait_for_all(tasks, logger, tile_id):
+            t_embeddings.join()  # don't return with a background thread still writing files
             update_tile(
                 tile_id,
                 status=TileStatus.FAILED,
@@ -143,25 +173,22 @@ def process_tile(
 
         logger.info(f"{tile_id} | all exports complete")
 
-        if local_output:
-            output_dir = get_local_output_dir(tile_id)
-            dest_root = str(output_dir.parent)
-        else:
-            if not settings.hpc_path:
-                err = "GEE exports completed but HPC_PATH is not configured"
-                update_tile(tile_id, status=TileStatus.FAILED, error=err)
-                return str(TileStatus.FAILED)
-            output_dir = Path(settings.hpc_path) / tile_id
-            dest_root = settings.hpc_path
-
         products = [tuple(key.split("/", 1)) for key in tasks.keys()]
-        if not rclone_all_products(tile_id, products, dest_root, logger):
+        rclone_ok = rclone_all_products(tile_id, products, dest_root, logger)
+
+        # Embeddings has been running since before _wait_for_all started --
+        # by this point it's very likely already finished (or close to
+        # it), so this join is typically near-instant rather than a real
+        # wait, unlike the old structure where it started from zero here.
+        t_embeddings.join()
+
+        if not rclone_ok:
             update_tile(
                 tile_id, status=TileStatus.FAILED, error="rclone transfer failed"
             )
             return str(TileStatus.FAILED)
 
-        if not process_all_embeddings_with_retry(tile, output_dir, logger):
+        if not embeddings_result.get("ok"):
             update_tile(
                 tile_id,
                 status=TileStatus.FAILED,
@@ -175,6 +202,8 @@ def process_tile(
             logger.error(f"{tile_id} | {err}")
             update_tile(tile_id, status=TileStatus.FAILED, error=err)
             return str(TileStatus.FAILED)
+
+        write_tile_metadata(tile, output_dir, logger)
 
         update_tile(
             tile_id,

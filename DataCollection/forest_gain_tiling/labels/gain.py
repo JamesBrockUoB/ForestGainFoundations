@@ -22,11 +22,11 @@ def _cover_image(ds: Datasets, year: int) -> ee.Image:
 def build_gain_layer(
     geom: ee.Geometry,
     ds: Datasets,
-) -> tuple[ee.Image, ee.Image]:
+) -> tuple[ee.Image, ee.Image, ee.Image]:
     """
     Forest gain defined as:
-        canopy <50% in settings.year_start (not-yet-forest at period start)
-        canopy >50% in settings.year_end (strict — no tolerance)
+        canopy <20% in settings.year_start (not-yet-forest at period start)
+        canopy >50% in settings.year_end
         AND, once a pixel is first observed as forest in some intervening
         year, it does not revert to non-forest afterward — tolerating up
         to settings.gain_sustain_dropout_tolerance such reversions among
@@ -71,7 +71,6 @@ def build_gain_layer(
     clean = gain.updateMask(gain).focal_max(1).focal_min(1)
     validated = clean.And(ds.esa_trees.clip(geom))
 
-    return (
-        validated,
-        validated.unmask(0).rename("gain"),
-    )
+    forest_confidence = cover_end.updateMask(validated).rename("forest_confidence")
+
+    return (validated, validated.unmask(0).rename("gain"), forest_confidence)

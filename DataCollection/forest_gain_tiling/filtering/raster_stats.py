@@ -8,13 +8,7 @@ from labels.gain import build_gain_layer
 
 NO_GAIN_SENTINEL = -9999.0
 
-# canopy_mean only included when the active period's end year matches the
-# canopy-height snapshot (see settings.canopy_height_available) — tracked
-# when available, but see tile_filter.evaluate_cheap_stats for why it's
-# reporting-only, not a rejection gate.
 CHEAP_BAND_NAMES = ["gain_frac", "ndvi_delta"]
-if settings.canopy_height_available:
-    CHEAP_BAND_NAMES = CHEAP_BAND_NAMES + ["canopy_mean"]
 
 # Per-year S2 + S1 availability bands for the active period (settings.period,
 # fixed for the process lifetime via the PERIOD env var).
@@ -37,8 +31,6 @@ def build_cheap_stats_image(geom: ee.Geometry, ds: Datasets) -> ee.Image:
     )
 
     bands = [gain_binary.rename("gain_frac"), ndvi_delta]
-    if settings.canopy_height_available:
-        bands.append(ds.meta_ch.updateMask(gm).rename("canopy_mean"))
 
     return ee.Image.cat(bands).clip(geom)
 

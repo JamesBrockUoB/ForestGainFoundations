@@ -9,30 +9,15 @@ _FORTY_SCALE = 0.004  # 0-250 -> 0.0-1.0 probability
 
 
 def build_pseudo_labels(
-    geom: ee.Geometry, gain_validated: ee.Image, ds: Datasets
+    geom: ee.Geometry, gain_confidence: ee.Image, ds: Datasets
 ) -> ee.Image:
     """
-    Pseudo-labels sourced directly from ForTy's per-class probability
-    map, restricted to validated gain pixels.
+    Build pseudo labels from ForTy probabilities over validated gain pixels.
 
-    ForTy's 6-class typology is remapped onto this project's 4-class
-    PseudoLabel enum (band order intentionally matches enum values so
-    dominant_class == PseudoLabel.value):
-
-        0 AGROCROP    <- TreeCropsAndAgroforestry
-        1 NAT_REGEN   <- NaturallyRegeneratingForest
-        2 PLANTATION  <- PlantationForest   (rotation <= 40y, intensive)
-        3 RESTORATION <- PlantedForest      (rotation > 40y; best proxy
-                                              available for restoration
-                                              plantings)
-
-    ForTy is a fixed 2020 snapshot — callers should only invoke this for
-    periods where settings.pseudo_labels_available is True (see
-    stack/stacks.py, which gates the call site rather than this function
-    gating itself).
+    ForTy coverage is independent from gain coverage: only pixels with
+    actual ForTy probabilities receive pseudo labels.
     """
-    gm = gain_validated.selfMask()
-    forty = ds.forty.clip(geom).updateMask(gm)
+    forty = ds.forty.clip(geom)
 
     scores = ee.Image.cat(
         [
@@ -47,16 +32,37 @@ def build_pseudo_labels(
             .rename("score_plantation"),
             forty.select("PlantedForest")
             .multiply(_FORTY_SCALE)
-            .rename("score_restoration"),
+            .rename("score_planted"),
         ]
     )
+
+    # Pixels where ForTy has no information
+    valid_forty = scores.reduce(ee.Reducer.sum()).gt(0)
+
+    scores = scores.updateMask(valid_forty)
 
     dominant = (
         scores.toArray().arrayArgmax().arrayGet(0).rename("dominant_class").toFloat()
     )
-    total = scores.reduce(ee.Reducer.sum()).max(1e-6)
+
+    total = scores.reduce(ee.Reducer.sum())
+
     confidence = (
         scores.reduce(ee.Reducer.max()).divide(total).rename("label_confidence")
     )
 
-    return ee.Image.cat([scores, dominant, confidence]).toFloat()
+    # Only gain pixels AND ForTy-covered pixels get pseudo labels.
+    # But do not force ForTy coverage to match gain coverage.
+    output_mask = gain_confidence.selfMask().And(valid_forty)
+
+    return (
+        ee.Image.cat(
+            [
+                scores,
+                dominant,
+                confidence,
+            ]
+        )
+        .updateMask(output_mask)
+        .toFloat()
+    )

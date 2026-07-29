@@ -13,14 +13,6 @@ PERIOD_YEARS = {
     "p2": (2020, 2024),
 }
 
-# Canopy-height (Meta) is a single fixed 2020 snapshot with no per-period
-# release — only meaningful/available for periods whose gain window ends
-# in 2020. Tracked/exported as information when available, but never used
-# to reject tiles (see filtering/tile_filter.py) — gating on it only for
-# the period where it happens to align would make p1/p2 cheap-filter
-# selection criteria inconsistent with each other.
-_CANOPY_HEIGHT_AVAILABLE_PERIODS = {"p1"}
-
 # ForTy (forest typology) is likewise a fixed 2020 snapshot. For p2, using
 # it would mean labeling a gain event that happens after the snapshot was
 # taken — not just less precise, but describing the wrong point in time.
@@ -161,10 +153,6 @@ class Settings:
         if self.hpc_remote:
             return f"{self.hpc_remote}/{self.drive_folder}"
         return None
-
-    @property
-    def canopy_height_available(self) -> bool:
-        return self.period in _CANOPY_HEIGHT_AVAILABLE_PERIODS
 
     @property
     def pseudo_labels_available(self) -> bool:

@@ -23,4 +23,4 @@ class PseudoLabel(int, Enum):
     AGROCROP = 0
     NAT_REGEN = 1
     PLANTATION = 2
-    RESTORATION = 3
+    PLANTED = 3

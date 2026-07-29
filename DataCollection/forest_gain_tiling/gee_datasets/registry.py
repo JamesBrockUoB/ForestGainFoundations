@@ -12,15 +12,6 @@ class Datasets:
             "projects/nature-trace/assets/forest_typology/forest_typology_2020_v1_0_collection"
         ).mosaic()
 
-        self.meta_ch = (
-            ee.ImageCollection(
-                "projects/meta-forest-monitoring-okw37/assets/CanopyHeight"
-            )
-            .mosaic()
-            .select("cover_code")
-            .unmask(0)
-        )
-
         # p1 (2017->2020): yearly tree-cover mosaics, all uploaded.
         self.dt_cover: dict[int, ee.Image | None] = {
             year: (

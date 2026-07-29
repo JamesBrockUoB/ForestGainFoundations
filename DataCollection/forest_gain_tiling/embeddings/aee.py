@@ -56,32 +56,34 @@ def _align_to_tile_grid(src_path: str, dest_path: Path, tile: dict) -> None:
 
 
 def download_aee(tile: dict, embeddings_dir: Path, logger: logging.Logger) -> None:
-    """
-    "geoai" source: direct HTTPS windowed COG reads from Source
-    Cooperative, no Earth Engine involved. See export/aee.py's
-    submit_aee_exports for the "gee" (Drive export task) alternative.
-    """
     bbox = tile_bbox(tile)
+    years = settings.period_years
 
-    for year in settings.period_years:
-        dest = embeddings_dir / f"aee_{year}.tif"
-        if dest.exists():
-            continue
+    if all((embeddings_dir / f"aee_{y}.tif").exists() for y in years):
+        return
 
-        with tempfile.TemporaryDirectory() as tmp:
-            logger.info(f"{tile['tile_id']} | AEE {year} (geoai)")
-            files = geoai.download_google_satellite_embedding(
-                bbox=bbox,
-                output_dir=tmp,
-                years=[year],
-                crs=None,
-                dequantize=True,
-            )
-            if len(files) != 1:
+    with tempfile.TemporaryDirectory() as tmp:
+        logger.info(
+            f"{tile['tile_id']} | AEE {years[0]}-{years[-1]} (geoai, single batched call)"
+        )
+        geoai.download_google_satellite_embedding(
+            bbox=bbox,
+            output_dir=tmp,
+            years=years,
+            crs=None,
+            dequantize=True,
+        )
+        for year in years:
+            dest = embeddings_dir / f"aee_{year}.tif"
+            if dest.exists():
+                continue
+            src = Path(tmp) / f"aef_{year}.tif"
+            if not src.exists():
                 raise RuntimeError(
-                    f"AEE {year}: expected 1 file, got {len(files)}: {files}"
+                    f"AEE {year}: expected output {src} not produced "
+                    f"(no intersecting tiles for this bbox/year?)"
                 )
-            _align_to_tile_grid(files[0], dest, tile)
+            _align_to_tile_grid(src, dest, tile)
 
 
 def download_embeddings(tile: dict, output_dir: Path, logger: logging.Logger) -> None:

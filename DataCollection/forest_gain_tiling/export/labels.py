@@ -9,27 +9,21 @@ from labels.pseudo import build_pseudo_labels
 def build_label_layers(
     geom: ee.Geometry,
     ds: Datasets,
-    gain_validated: ee.Image,
+    gain_confidence: ee.Image,
 ) -> dict[str, ee.Image]:
     """
-    - gain_mask: always present.
-    - gain_height: only when settings.canopy_height_available (Meta
-      canopy height is a fixed 2020 snapshot).
+    - gain_confidence: always present.
     - pseudo_labels: only when settings.pseudo_labels_available (ForTy
-      is likewise a fixed 2020 snapshot).
-    p2 tiles therefore only export gain_mask under labels/ — intentional.
+      is a fixed 2020 snapshot). p2 tiles therefore only export gain_mask under labels/
     """
     layers: dict[str, ee.Image] = {
-        "gain_mask": gain_validated.unmask(0).rename("gain_mask"),
+        "gain_confidence": gain_confidence.updateMask(gain_confidence).rename(
+            "gain_confidence"
+        ),
     }
 
-    if settings.canopy_height_available:
-        layers["gain_height"] = ds.meta_ch.updateMask(gain_validated.selfMask()).rename(
-            "canopy_gain_height"
-        )
-
     if settings.pseudo_labels_available:
-        layers["pseudo_labels"] = build_pseudo_labels(geom, gain_validated, ds)
+        layers["pseudo_labels"] = build_pseudo_labels(geom, gain_confidence, ds)
 
     return layers
 
@@ -39,11 +33,11 @@ def submit_label_exports(
     crs_transform: list[float],
     full_valid: ee.Image,
     ds: Datasets,
-    gain_validated: ee.Image,
+    gain_confidence: ee.Image,
     tile_id: str,
 ) -> dict[str, ee.batch.Task]:
     tasks: dict[str, ee.batch.Task] = {}
-    layers = build_label_layers(geom, ds, gain_validated)
+    layers = build_label_layers(geom, ds, gain_confidence)
 
     for name, image in layers.items():
         key = f"labels/{name}"

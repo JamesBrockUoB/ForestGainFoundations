@@ -3,6 +3,18 @@ from __future__ import annotations
 import ee
 from config import settings
 
+# Snapshot matched to each period's start
+WDPA_SNAPSHOT_BY_PERIOD = {
+    "p1": "201707",  # nearest available snapshot at/before p1's 2017 start
+    "p2": "202001",  # nearest available snapshot at/before p2's 2020 start
+}
+
+
+def _protected_area_mask(geom: ee.Geometry) -> ee.Image:
+    snapshot = WDPA_SNAPSHOT_BY_PERIOD[settings.period]
+    fc = ee.FeatureCollection(f"WCMC/WDPA/{snapshot}/polygons")
+    return ee.Image().byte().paint(fc, 1).unmask(0).rename("protected_area")
+
 
 def build_static_layers(geom: ee.Geometry) -> dict[str, ee.Image]:
     fabdem = (
@@ -21,6 +33,7 @@ def build_static_layers(geom: ee.Geometry) -> dict[str, ee.Image]:
     return {
         "fabdem": fabdem.rename("DEM"),
         "slope": slope.rename("slope"),
+        "protected_area": _protected_area_mask(geom).clip(geom),
     }
 
 

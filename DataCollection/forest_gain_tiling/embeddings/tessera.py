@@ -90,8 +90,6 @@ def download_tessera(tile: dict, embeddings_dir: Path, logger: logging.Logger) -
             continue
 
         with tempfile.TemporaryDirectory() as tmp:
-            logger.info(f"{tile['tile_id']} | TESSERA {year}")
-
             tiles_to_fetch = gt.registry.load_blocks_for_region(bounds=bbox, year=year)
             files = gt.export_embedding_geotiffs(
                 tiles_to_fetch=tiles_to_fetch,
@@ -101,11 +99,7 @@ def download_tessera(tile: dict, embeddings_dir: Path, logger: logging.Logger) -
             )
             if not files:
                 raise RuntimeError(f"TESSERA {year}: no files returned for bbox={bbox}")
-            if len(files) > 1:
-                logger.warning(
-                    f"{tile['tile_id']} | TESSERA {year} spans {len(files)} "
-                    f"grid tiles — reprojecting and combining onto tile grid"
-                )
+
             _align_to_tile_grid(files, dest, tile)
 
         # reclaim raw npy/landmask data immediately, no accumulation
@@ -114,8 +108,6 @@ def download_tessera(tile: dict, embeddings_dir: Path, logger: logging.Logger) -
 
 
 def download_embeddings(tile: dict, output_dir: Path, logger: logging.Logger) -> None:
-    """TESSERA only — AEE goes through GEE (export/aee.py), since geoai's
-    download_google_satellite_embedding refuses to serve 2017."""
     embeddings_dir = output_dir / "embeddings"
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     download_tessera(tile, embeddings_dir, logger)
