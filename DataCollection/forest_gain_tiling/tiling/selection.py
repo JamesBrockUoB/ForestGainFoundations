@@ -13,6 +13,7 @@ from registry.store import iter_tiles
 
 def filter_candidates(
     status: str,
+    tile_id: str | None = None,
     aoi_id: str | None = None,
     biome: str | None = None,
     region: str | None = None,
@@ -32,6 +33,10 @@ def filter_candidates(
     candidates = []
 
     for tile in iter_tiles(status=status, period=period):
+        # Filter by tile_id (exact match)
+        if tile_id and tile.get("tile_id") != tile_id:
+            continue
+
         # Filter by aoi_id
         if aoi_id and aoi_id not in tile.get("aoi_ids", []):
             continue

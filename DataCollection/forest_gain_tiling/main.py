@@ -17,7 +17,8 @@ Commands
   python main.py run --limit 500                     # next N valid tiles
   python main.py run --biome "Boreal Forests"        # filter by biome (substring match)
   python main.py run --region Neotropic              # filter by region
-  python main.py run --aoi-id aoi_-73.25_-52.75       # single AOI (debug)
+  python main.py run --aoi-id aoi_-73.25_-52.75       # single AOI
+  python main.py run --tile-id tile_-363_2324_p1      # single tile, any status (debug/rerun)
   python main.py run --status failed                 # retry failed tiles
   python main.py status                              # print registry summary (active period)
   python main.py reset --status failed                # retry only failed tiles, keep error text
@@ -34,11 +35,14 @@ Filter flags
 
 Run flags
 ---------
-  --aoi-id     AOI_ID       filter to a single AOI
+  --aoi-id     AOI_ID       filter to a single AOI (may still match multiple tiles,
+                             since one AOI is subdivided into a grid of tiles)
+  --tile-id    TILE_ID      filter to a single tile (exact match).
   --biome      SUBSTRING    filter by biome (case-insensitive substring)
   --region     SUBSTRING    filter by region (case-insensitive substring)
   --limit      N            max tiles to process
-  --status     STATUS       valid (default) | failed | rejected
+  --status     STATUS       valid (default) | failed | rejected — ignored when
+                             --tile-id is given
   --stratify   KEY          biome | region
   --stratify-mode  MODE     prop (default) | equal
 
@@ -216,6 +220,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     logger = setup_logging("run")
 
     target_status = args.status or str(TileStatus.VALID)
+
     if target_status == str(TileStatus.REJECTED):
         logger.warning(
             "Targeting rejected tiles — these failed the filter checks "
@@ -225,6 +230,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     logger.info("Loading candidates from registry for export preparation")
     candidates = filter_candidates(
         status=target_status,
+        tile_id=args.tile_id,
         aoi_id=args.aoi_id,
         biome=args.biome,
         region=args.region,
@@ -334,6 +340,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser("run", help="Submit and monitor export tasks")
     run_p.add_argument("--aoi-id", default=None)
+    run_p.add_argument(
+        "--tile-id",
+        default=None,
+        help="Filter to a single tile (exact match). Bypasses --status filtering "
+        "unless --status is also explicitly given.",
+    )
     run_p.add_argument("--biome", default=None)
     run_p.add_argument("--region", default=None)
     run_p.add_argument("--limit", default=None, type=int)
