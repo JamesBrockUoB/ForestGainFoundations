@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import tempfile
 from pathlib import Path
 
-import geoai
 import numpy as np
 import rasterio
 from config import settings
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tiling.grid import crs_transform as tile_crs_transform
+
+_BATCH_TIMEOUT_S = 300  # covers the whole multi-year batched fetch
 
 
 def tile_bbox(tile: dict) -> tuple[float, float, float, float]:
@@ -55,17 +57,17 @@ def _align_to_tile_grid(src_path: str, dest_path: Path, tile: dict) -> None:
         dst.write(piece)
 
 
-def download_aee(tile: dict, embeddings_dir: Path, logger: logging.Logger) -> None:
-    bbox = tile_bbox(tile)
-    years = settings.period_years
+def _fetch_and_align_batch(
+    bbox: tuple, years: list[int], embeddings_dir_str: str, tile: dict
+) -> None:
+    """Runs in a separate PROCESS -- same reasoning as TESSERA's
+    _fetch_and_align_year: only a process, never a thread, can actually
+    be forcibly abandoned if geoai's fetch hangs."""
+    import geoai
 
-    if all((embeddings_dir / f"aee_{y}.tif").exists() for y in years):
-        return
+    embeddings_dir = Path(embeddings_dir_str)
 
     with tempfile.TemporaryDirectory() as tmp:
-        logger.info(
-            f"{tile['tile_id']} | AEE {years[0]}-{years[-1]} (geoai, single batched call)"
-        )
         geoai.download_google_satellite_embedding(
             bbox=bbox,
             output_dir=tmp,
@@ -83,7 +85,49 @@ def download_aee(tile: dict, embeddings_dir: Path, logger: logging.Logger) -> No
                     f"AEE {year}: expected output {src} not produced "
                     f"(no intersecting tiles for this bbox/year?)"
                 )
-            _align_to_tile_grid(src, dest, tile)
+            _align_to_tile_grid(str(src), dest, tile)
+
+
+def download_aee(tile: dict, embeddings_dir: Path, logger: logging.Logger) -> None:
+    bbox = tile_bbox(tile)
+    years = settings.period_years
+
+    if all((embeddings_dir / f"aee_{y}.tif").exists() for y in years):
+        return
+
+    logger.info(
+        f"{tile['tile_id']} | AEE {years[0]}-{years[-1]} (geoai, single batched call)"
+    )
+
+    proc = mp.Process(
+        target=_fetch_and_align_batch,
+        args=(bbox, years, str(embeddings_dir), tile),
+    )
+    proc.start()
+    proc.join(timeout=_BATCH_TIMEOUT_S)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        raise RuntimeError(
+            f"AEE {years[0]}-{years[-1]}: fetch exceeded {_BATCH_TIMEOUT_S}s "
+            f"timeout for bbox={bbox} -- subprocess terminated"
+        )
+
+    if proc.exitcode != 0:
+        raise RuntimeError(
+            f"AEE {years[0]}-{years[-1]}: subprocess failed "
+            f"(exitcode={proc.exitcode})"
+        )
+
+    missing = [y for y in years if not (embeddings_dir / f"aee_{y}.tif").exists()]
+    if missing:
+        raise RuntimeError(
+            f"AEE: subprocess exited cleanly but years {missing} were not written"
+        )
 
 
 def download_embeddings(tile: dict, output_dir: Path, logger: logging.Logger) -> None:

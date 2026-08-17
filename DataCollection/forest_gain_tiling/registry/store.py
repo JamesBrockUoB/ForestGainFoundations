@@ -1,10 +1,3 @@
-"""High-level registry operations with SQLite backend."""
-
-from __future__ import annotations
-
-from typing import Any
-
-from config import settings
 from enums import TileStatus
 from registry.database import RegistryDB
 
@@ -101,6 +94,7 @@ def get_registry_stats(period: str | None = None) -> dict[str, Any]:
         "by_status": db.status_counts(period=period),
         "by_biome": db.biome_counts(period=period),
         "by_region": db.region_counts(period=period),
+        "by_country": db.country_counts(period=period),
         "rejections": db.rejection_counts(period=period),
     }
 
@@ -110,40 +104,44 @@ def registry_summary(period: str | None = None) -> str:
     db = _get_db()
 
     status_counts = db.status_counts(period=period)
-    biome_counts = db.biome_counts(
-        status_filter=str(TileStatus.COMPLETE), period=period
-    )
-    region_counts = db.region_counts(
-        status_filter=str(TileStatus.COMPLETE), period=period
-    )
-    rejection_counts = db.rejection_counts(period=period)
-
-    scope_label = period if period is not None else "ALL PERIODS"
+    total = db.count_tiles(period=period)
+    biome_counts = db.biome_counts(period=period)
+    region_counts = db.region_counts(period=period)
+    country_counts = db.country_counts(period=period)
+    rejections = db.rejection_counts(period=period)
 
     lines = [
         "",
         "═" * 60,
-        f"  TILE REGISTRY SUMMARY  ({scope_label})",
+        f"  REGISTRY SUMMARY  (period={period})",
         "═" * 60,
-        f"  Total tiles    : {db.count_tiles(period=period):>10,}",
+        f"  Total tiles : {total:>10,}",
+        "",
+        "  By status:",
     ]
-    for s in TileStatus:
-        lines.append(f"  {s.value:<14} : {status_counts.get(s.value, 0):>10,}")
 
-    if rejection_counts:
-        lines += ["", "  Rejected by reason:"]
-        for r, n in sorted(rejection_counts.items(), key=lambda x: -x[1])[:10]:
-            lines.append(f"    {r:<35} {n:>8,}")
+    for status, cnt in sorted(status_counts.items(), key=lambda x: x[0]):
+        lines.append(f"    {status:<20} {cnt:>8,}")
 
-    if biome_counts:
-        lines += ["", "  Complete by biome:"]
-        for b, n in sorted(biome_counts.items(), key=lambda x: -x[1])[:10]:
-            lines.append(f"    {b:<45} {n:>7,}")
+    lines += ["", "  By biome:"]
 
-    if region_counts:
-        lines += ["", "  Complete by region:"]
-        for r, n in sorted(region_counts.items(), key=lambda x: -x[1])[:10]:
-            lines.append(f"    {r:<30} {n:>7,}")
+    for b, n in sorted(biome_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"    {b:<45} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+
+    lines += ["", "  By region:"]
+
+    for r, n in sorted(region_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"    {r:<30} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+
+    lines += ["", "  By country:"]
+
+    for c, n in sorted(country_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"    {c:<30} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+
+    if rejections:
+        lines += ["", "  Rejections:"]
+        for reason, n in sorted(rejections.items(), key=lambda x: -x[1]):
+            lines.append(f"    {reason:<30} {n:>8,}")
 
     lines += ["═" * 60, ""]
     return "\n".join(lines)

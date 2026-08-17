@@ -16,7 +16,7 @@ Usage:
 PERIOD=p1 python generate_aois.py
 
 # HPC
-PERIOD=p2 USE_HPC=1 NUM_WORKERS=32 sbatch submit_aoi_generation.sh
+PERIOD=p2 USE_HPC=1 NUM_WORKERS=4 sbatch submit_aoi_generation.sh
 
 Validity checks
 ────────────────────────────────────────────────────────────────────────────────
@@ -50,6 +50,7 @@ import os
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import ee
@@ -75,13 +76,9 @@ if PERIOD not in PERIOD_YEARS:
 
 YEAR_START, YEAR_END = PERIOD_YEARS[PERIOD]
 
-OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois_clearer_{PERIOD}.json"
-REJECTED_OUTPUT_FILE = (
-    PROJECT_ROOT / OUTPUT_DIR / f"aois/rejected_aois_clearer_{PERIOD}.json"
-)
-CHECKPOINT = (
-    PROJECT_ROOT / OUTPUT_DIR / f"aois/aoi_filter_checkpoint_clearer_{PERIOD}.json"
-)
+OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois_{PERIOD}.json"
+REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/rejected_aois_{PERIOD}.json"
+CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / f"aois/aoi_filter_checkpoint_{PERIOD}.json"
 
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -113,7 +110,7 @@ DW_VEGETATED_LABELS = [1, 2, 3, 4, 5]  # trees, grass, flooded_veg, crops, shrub
 
 # AOI_LIST_CACHE is intentionally NOT period-namespaced: the raw 0.25° grid
 # of candidate land cells is identical regardless of which period is active.
-AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "aois/all_aois_clearer.json"
+AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "aois/all_aois.json"
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -122,7 +119,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "aoi_generation_clearer.log"),
+        logging.FileHandler(LOG_DIR / "aoi_generation.log"),
         logging.StreamHandler(),
     ],
 )
@@ -165,6 +162,8 @@ def _build_gee_datasets():
 
     _dw_veg = _dw_vegetation_mask(YEAR_START).rename("dw_veg")
 
+    _land_veg = _land_raster.addBands(_dw_veg)
+
     def load_dt_mosaic(year):
         return (
             ee.Image(
@@ -184,8 +183,59 @@ def _build_gee_datasets():
     _gain_mask = _forest_start.Not().And(_forest_end).rename("gain").unmask(0)
 
     _ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
+    _countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
 
-    return _land_raster, _dw_veg, _gain_mask, _ecoregions
+    _realm_names = _ecoregions.aggregate_array("REALM").distinct().getInfo()
+    _realm_name_to_id = {name: i for i, name in enumerate(_realm_names)}
+    _id_to_realm_name = {i: name for name, i in _realm_name_to_id.items()}
+
+    _ecoregions_indexed = _ecoregions.map(
+        lambda f: f.set(
+            "realm_id", ee.Dictionary(_realm_name_to_id).get(f.get("REALM"))
+        )
+    )
+
+    _eco_raster = _ecoregions_indexed.reduceToImage(
+        ["BIOME_NUM"], ee.Reducer.first()
+    ).rename("biome_num")
+    _realm_raster = _ecoregions_indexed.reduceToImage(
+        ["realm_id"], ee.Reducer.first()
+    ).rename("realm_id")
+
+    _biome_name_by_num = {}
+    for f in (
+        _ecoregions.distinct(["BIOME_NUM"])
+        .select(["BIOME_NUM", "BIOME_NAME"])
+        .getInfo()["features"]
+    ):
+        p = f["properties"]
+        bn = p.get("BIOME_NUM")
+        if bn is not None:
+            _biome_name_by_num[int(bn)] = p.get("BIOME_NAME") or "Unknown"
+
+    _country_names = _countries.aggregate_array("country_na").distinct().getInfo()
+    _country_name_to_id = {name: i for i, name in enumerate(_country_names)}
+    _id_to_country_name = {i: name for name, i in _country_name_to_id.items()}
+
+    _countries_indexed = _countries.map(
+        lambda f: f.set(
+            "country_id",
+            ee.Dictionary(_country_name_to_id).get(f.get("country_na")),
+        )
+    )
+    _country_raster = _countries_indexed.reduceToImage(
+        ["country_id"], ee.Reducer.first()
+    ).rename("country_id")
+
+    _eco_country_img = _eco_raster.addBands(_realm_raster).addBands(_country_raster)
+
+    _lookups = {
+        "biome_name": _biome_name_by_num,
+        "realm": _id_to_realm_name,
+        "country": _id_to_country_name,
+    }
+
+    return _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups
 
 
 def get_asset_bounds(year_start=2017, year_end=2020, padding=0.5):
@@ -245,28 +295,19 @@ def atomic_json_write(path, obj, indent=None):
     tmp.replace(path)
 
 
-def land_fraction(_land_raster, geom, scale=1000):
-    val = _land_raster.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=geom,
-        scale=scale,
-        maxPixels=1e9,
-    ).get("land")
-
-    return safe_num(val, 0)
-
-
 def mask_s2_scl(img):
     scl = img.select("SCL")
     mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10)).And(scl.neq(0))
     return img.updateMask(mask)
 
 
-def _year_valid_fraction(collection_id, geom, start, end, bands, mask_fn=None):
+def _year_valid_mask(collection_id, geom, start, end, bands, mask_fn=None):
     """
-    Fraction of geom covered by at least one fully-unmasked pixel, across all
-    images in collection_id intersecting geom within [start, end), for the
-    given bands.
+    Per-pixel indicator of whether geom is covered by at least one fully
+    unmasked image in collection_id within [start, end), for the given
+    bands. Returns the image UNREDUCED so it can be built once (over a
+    shared batch-wide geometry) and reduceRegion'd separately per feature,
+    instead of being rebuilt from scratch for every single feature.
     """
     col = ee.ImageCollection(collection_id).filterDate(start, end).filterBounds(geom)
 
@@ -288,45 +329,92 @@ def _year_valid_fraction(collection_id, geom, start, end, bands, mask_fn=None):
 
     valid = col.map(valid_mask).max()
 
-    valid = ee.Image(
+    return ee.Image(
         ee.Algorithms.If(
             valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
         )
     )
 
-    return valid.reduceRegion(
-        reducer=ee.Reducer.mean(), geometry=geom, scale=500, maxPixels=1e9
-    ).get("valid")
 
-
-def has_usable_imagery(geom, min_frac=MIN_IMAGERY_FRACTION):
+def build_year_sensor_masks(batch_geom, year_start=YEAR_START, year_end=YEAR_END):
     """
-    Requires, for every calendar year in [YEAR_START, YEAR_END] inclusive,
-    both S2 and S1 valid-pixel coverage >= min_frac over geom.
+    Build every year/sensor's valid-pixel mask ONCE, filtered against the
+    combined footprint of an entire batch, rather than once per AOI
+    feature.
     """
-    conditions = []
+    masks = {}
 
-    for year in range(YEAR_START, YEAR_END + 1):
+    for year in range(year_start, year_end + 1):
         start, end = f"{year}-01-01", f"{year + 1}-01-01"
 
-        s2_frac = safe_num(
-            _year_valid_fraction(
-                "COPERNICUS/S2_SR_HARMONIZED", geom, start, end, S2_BANDS, mask_s2_scl
-            ),
-            0,
+        masks[("s2", year)] = _year_valid_mask(
+            "COPERNICUS/S2_SR_HARMONIZED", batch_geom, start, end, S2_BANDS, mask_s2_scl
         )
-        s1_frac = safe_num(
-            _year_valid_fraction("COPERNICUS/S1_GRD", geom, start, end, S1_BANDS),
-            0,
+        masks[("s1", year)] = _year_valid_mask(
+            "COPERNICUS/S1_GRD", batch_geom, start, end, S1_BANDS
         )
 
-        conditions.append(s2_frac.gte(min_frac).And(s1_frac.gte(min_frac)))
+    return masks
 
-    result = conditions[0]
-    for c in conditions[1:]:
-        result = result.And(c)
 
-    return result
+def _reduce_regions_getinfo_with_retry(fc_obj, attempts=6, backoff_base=2.0):
+    """
+    Call getInfo() on an EE object (FeatureCollection from reduceRegions, etc.)
+    with exponential backoff retries. Compatible with EE clients that don't accept
+    a timeout kwarg.
+    Returns the getInfo() result (dict).
+    """
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            info = fc_obj.getInfo()
+            return info
+        except Exception as e:
+            last_err = e
+            wait = (backoff_base**attempt) + random.uniform(0, 2)
+            logger.warning(
+                f"getInfo attempt {attempt + 1}/{attempts} failed: {e}; sleeping {wait:.1f}s"
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"Exceeded retries for getInfo(): last error: {last_err}")
+
+
+def has_usable_imagery(geom, masks, min_frac=MIN_IMAGERY_FRACTION, scale=500):
+    """
+    Returns a server-side boolean (ComputedObject) that is true iff every
+    image in `masks` has mean(valid) >= min_frac over `geom`.
+    `masks` is the dict returned by build_year_sensor_masks(batch_geom).
+    """
+    # Empty masks -> false (constructed as an ee expression)
+    if not masks:
+        return ee.Number(0).gt(1)  # always false, returns a server-side boolean
+
+    # Convert masks.values() to a Python list of ee.Image objects
+    imgs = list(masks.values())
+
+    # Compute first fraction
+    first_img = imgs[0]
+    first_frac = safe_num(
+        first_img.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
+        ).get("valid"),
+        0,
+    )
+
+    # Compute minimum across the rest using server-side Ifs to keep everything lazy
+    min_frac_num = ee.Number(first_frac)
+    for img in imgs[1:]:
+        f = safe_num(
+            img.reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
+            ).get("valid"),
+            0,
+        )
+        # min_frac_num = min(min_frac_num, f)
+        min_frac_num = ee.Number(ee.Algorithms.If(f.lt(min_frac_num), f, min_frac_num))
+
+    # Return a server-side boolean: is min_frac_num >= min_frac?
+    return min_frac_num.gte(min_frac)
 
 
 def forest_gain_fraction_dt(_gain_mask, geom, scale=100):
@@ -452,8 +540,34 @@ def generate_aois(
     return valid
 
 
-def process_batch(_land_raster, _dw_veg, _gain_mask, _ecoregions, batch):
+def _smallest_intersecting(source_fc, geom):
+    intersecting = source_fc.filterBounds(geom)
+    with_area = intersecting.map(lambda e: e.set("__area", e.geometry().area(1000)))
+    ranked = with_area.sort("__area", True)
+    return ee.Feature(
+        ee.Algorithms.If(ranked.size().gt(0), ranked.first(), ee.Feature(None))
+    )
+
+
+def _clean_str(raw):
+    return ee.String(
+        ee.Algorithms.If(
+            ee.Algorithms.IsEqual(raw, None),
+            "Unknown",
+            ee.Algorithms.If(
+                ee.Algorithms.IsEqual(raw, "N/A"),
+                "Unknown",
+                ee.Algorithms.If(ee.Algorithms.IsEqual(raw, ""), "Unknown", raw),
+            ),
+        )
+    )
+
+
+def process_batch(
+    _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups, batch
+):
     batch = [a.get("properties", a) if isinstance(a, dict) else a for a in batch]
+
     features = [
         ee.Feature(
             ee.Geometry.Rectangle([a["minLon"], a["minLat"], a["maxLon"], a["maxLat"]]),
@@ -461,161 +575,269 @@ def process_batch(_land_raster, _dw_veg, _gain_mask, _ecoregions, batch):
         )
         for a in batch
     ]
-
     fc = ee.FeatureCollection(features)
+    batch_geom = fc.geometry().bounds(maxError=1)
 
-    def add_all_properties(f):
-        geom = f.geometry()
+    t0 = time.time()
+    masks = build_year_sensor_masks(batch_geom)
 
-        area_km2 = geom.area().divide(1e6)
-        centroid = geom.centroid(1)
-        coords = ee.List(centroid.coordinates())
+    def _fetch_mask(key_img):
+        (sensor, year), img = key_img
+        rr = img.reduceRegions(collection=fc, reducer=ee.Reducer.mean(), scale=500)
+        info = _reduce_regions_getinfo_with_retry(rr)
+        per_feat = {}
+        for f in info.get("features", []):
+            props = f.get("properties", {})
+            key = props.get("id") or f.get("id")
+            val = props.get("valid")
+            if val is None:
+                val = props.get("mean")
+            per_feat[key] = float(val or 0.0)
+        return (sensor, year), per_feat
 
-        lf = land_fraction(_land_raster, geom)
-        has_land = lf.gte(MIN_LAND_FRACTION)
+    mask_results = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_fetch_mask, item): item[0] for item in masks.items()}
+        for fut in as_completed(futures):
+            key, per_feat = fut.result()
+            mask_results[key] = per_feat
+    logger.info(f"  [timing] imagery masks: {time.time() - t0:.1f}s")
 
-        vf = safe_num(
-            _dw_veg.reduceRegion(
-                ee.Reducer.mean(),
-                geometry=geom,
-                scale=1000,
-                maxPixels=1e9,
-            ).get("dw_veg"),
-            0,
+    t0 = time.time()
+    lv_rr = _land_veg.reduceRegions(
+        collection=fc, reducer=ee.Reducer.mean(), scale=1000
+    )
+    lv_info = _reduce_regions_getinfo_with_retry(lv_rr)
+    landveg_map = {}
+    for f in lv_info.get("features", []):
+        props = f.get("properties", {})
+        key = props.get("id") or f.get("id")
+        land = props.get("land")
+        if land is None:
+            land = props.get("discrete_classification") or props.get("mean") or 0.0
+        dw = props.get("dw_veg")
+        if dw is None:
+            dw = props.get("mean_dw_veg") or 0.0
+        landveg_map[key] = {"land": float(land or 0.0), "dw_veg": float(dw or 0.0)}
+    logger.info(f"  [timing] land/veg: {time.time() - t0:.1f}s")
+
+    t0 = time.time()
+    gain_rr = _gain_mask.reduceRegions(
+        collection=fc, reducer=ee.Reducer.mean(), scale=100
+    )
+    gain_info = _reduce_regions_getinfo_with_retry(gain_rr)
+    gain_map = {}
+    for f in gain_info.get("features", []):
+        props = f.get("properties", {})
+        key = props.get("id") or f.get("id")
+        gain_val = props.get("gain")
+        if gain_val is None:
+            gain_val = props.get("mean") or 0.0
+        gain_map[key] = float(gain_val or 0.0)
+    logger.info(f"  [timing] gain: {time.time() - t0:.1f}s")
+
+    t0 = time.time()
+
+    def add_centroid_lookup(f):
+        centroid = f.geometry().centroid(1)
+
+        eco_hit = _ecoregions.filterBounds(centroid)
+        country_hit = _countries.filterBounds(centroid)
+        has_eco = eco_hit.size().gt(0)
+        has_country = country_hit.size().gt(0)
+
+        eco = eco_hit.first()
+        country = country_hit.first()
+
+        biome_name = ee.Algorithms.If(has_eco, _clean_str(eco.get("BIOME_NAME")), None)
+        biome_num = ee.Algorithms.If(has_eco, eco.get("BIOME_NUM"), None)
+        realm = ee.Algorithms.If(has_eco, _clean_str(eco.get("REALM")), None)
+        country_name = ee.Algorithms.If(
+            has_country, _clean_str(country.get("country_na")), None
         )
-
-        has_veg = vf.gte(MIN_VEG_FRACTION)
-
-        fg = forest_gain_fraction_dt(_gain_mask, geom)
-        has_gain = fg.gte(MIN_GAIN_FRACTION)
-
-        has_img = has_usable_imagery(geom)
-
-        intersecting = _ecoregions.filterBounds(geom)
-        eco_with_area = intersecting.map(
-            lambda e: e.set("eco_area", e.geometry().area(1))
-        )
-        ranked = eco_with_area.sort("eco_area", True)
-        eco = ee.Feature(
-            ee.Algorithms.If(ranked.size().gt(0), ranked.first(), ee.Feature(None))
-        )
-
-        biome_name_raw = eco.get("BIOME_NAME")
-        biome_num_raw = eco.get("BIOME_NUM")
-        realm_raw = eco.get("REALM")
-
-        biome_name = ee.String(
-            ee.Algorithms.If(
-                ee.Algorithms.IsEqual(biome_name_raw, None),
-                "Unknown",
-                ee.Algorithms.If(
-                    ee.Algorithms.IsEqual(biome_name_raw, "N/A"),
-                    "Unknown",
-                    ee.Algorithms.If(
-                        ee.Algorithms.IsEqual(biome_name_raw, ""),
-                        "Unknown",
-                        biome_name_raw,
-                    ),
-                ),
-            )
-        )
-
-        biome_num = ee.Number(
-            ee.Algorithms.If(
-                ee.Algorithms.IsEqual(biome_num_raw, None), -1, biome_num_raw
-            )
-        )
-        realm = ee.String(
-            ee.Algorithms.If(
-                ee.Algorithms.IsEqual(realm_raw, None),
-                "Unknown",
-                ee.Algorithms.If(
-                    ee.Algorithms.IsEqual(realm_raw, "N/A"),
-                    "Unknown",
-                    ee.Algorithms.If(
-                        ee.Algorithms.IsEqual(realm_raw, ""), "Unknown", realm_raw
-                    ),
-                ),
-            )
-        )
-
-        is_rock_ice = biome_num.eq(11)
-        biome_name = ee.String(
-            ee.Algorithms.If(is_rock_ice, "Rock and Ice", biome_name)
-        )
-        realm = ee.String(ee.Algorithms.If(is_rock_ice, "Global", realm))
 
         return f.set(
-            "aoi_area_km2",
-            area_km2,
-            "centroid_lon",
-            ee.Number(coords.get(0)),
-            "centroid_lat",
-            ee.Number(coords.get(1)),
-            "land_frac",
-            lf,
-            "has_land",
-            has_land,
-            "veg_fraction",
-            vf,
-            "has_veg",
-            has_veg,
-            "forest_gain_frac",
-            fg,
-            "has_gain",
-            has_gain,
-            "has_imagery",
-            has_img,
-            "biome_name",
-            biome_name,
-            "biome_num",
-            biome_num,
-            "region",
-            realm,
+            {
+                "has_eco": has_eco,
+                "has_country": has_country,
+                "biome_name": biome_name,
+                "biome_num": biome_num,
+                "realm": realm,
+                "country_name": country_name,
+            }
         )
 
-    fc = fc.map(add_all_properties)
+    fc_centroid = fc.map(add_centroid_lookup)
+    centroid_info = _reduce_regions_getinfo_with_retry(fc_centroid)
 
-    def add_validity(f):
-        has_land = ee.Number(f.get("has_land"))
-        has_veg = ee.Number(f.get("has_veg"))
-        has_gain = ee.Number(f.get("has_gain"))
-        has_img = ee.Number(f.get("has_imagery"))
+    eco_map = {}
+    country_map = {}
+    fallback_ids = set()
 
-        valid = has_land.And(has_veg).And(has_gain).And(has_img)
+    for f in centroid_info.get("features", []):
+        props = f.get("properties", {})
+        aid = props.get("id")
 
-        reason = ee.String(
-            ee.Algorithms.If(
-                valid.eq(0),
-                ee.Algorithms.If(
-                    has_land.eq(0),
-                    "no_land",
-                    ee.Algorithms.If(
-                        has_veg.eq(0),
-                        "insufficient_veg",
-                        ee.Algorithms.If(
-                            has_gain.eq(0), "no_forest_gain", "missing_imagery"
-                        ),
-                    ),
-                ),
-                "valid",
-            )
+        if props.get("has_eco"):
+            biome_num_raw = props.get("biome_num")
+            try:
+                biome_num = int(biome_num_raw) if biome_num_raw is not None else -1
+            except (TypeError, ValueError):
+                biome_num = -1
+            if biome_num == 11:
+                eco_map[aid] = {
+                    "biome_name": "Rock and Ice",
+                    "biome_num": biome_num,
+                    "realm": "Global",
+                }
+            else:
+                eco_map[aid] = {
+                    "biome_name": props.get("biome_name") or "Unknown",
+                    "biome_num": biome_num,
+                    "realm": props.get("realm") or "Unknown",
+                }
+        else:
+            fallback_ids.add(aid)
+
+        if props.get("has_country"):
+            country_map[aid] = props.get("country_name") or "Unknown"
+        else:
+            fallback_ids.add(aid)
+
+    # --- 4b) slow path, only for AOIs whose centroid missed. Majority-pixel
+    # vote via the pre-rasterized image, targeted at just this subset
+    # instead of running for every AOI in the batch.
+    if fallback_ids:
+        fc_fallback = fc.filter(ee.Filter.inList("id", list(fallback_ids)))
+        fb_rr = _eco_country_img.reduceRegions(
+            collection=fc_fallback, reducer=ee.Reducer.mode(), scale=1000
         )
+        fb_info = _reduce_regions_getinfo_with_retry(fb_rr)
 
-        return f.set("valid", valid, "rejection_reason", reason)
+        for f in fb_info.get("features", []):
+            props = f.get("properties", {})
+            aid = props.get("id") or f.get("id")
 
-    fc = fc.map(add_validity)
+            if aid not in eco_map:
+                try:
+                    biome_num = (
+                        int(props.get("biome_num"))
+                        if props.get("biome_num") is not None
+                        else -1
+                    )
+                except (TypeError, ValueError):
+                    biome_num = -1
 
-    all_results = fc.getInfo()["features"]
+                if biome_num == 11:
+                    eco_map[aid] = {
+                        "biome_name": "Rock and Ice",
+                        "biome_num": biome_num,
+                        "realm": "Global",
+                    }
+                else:
+                    biome_name = _lookups["biome_name"].get(biome_num, "Unknown")
+                    try:
+                        realm_id = int(props.get("realm_id"))
+                        realm = _lookups["realm"].get(realm_id, "Unknown")
+                    except (TypeError, ValueError):
+                        realm = "Unknown"
+                    eco_map[aid] = {
+                        "biome_name": biome_name,
+                        "biome_num": biome_num,
+                        "realm": realm,
+                    }
 
-    valid_out = [f for f in all_results if f["properties"].get("valid") == 1]
-    rejected_out = [f for f in all_results if f["properties"].get("valid") == 0]
+            if aid not in country_map:
+                try:
+                    country_id = int(props.get("country_id"))
+                    country_map[aid] = _lookups["country"].get(country_id, "Unknown")
+                except (TypeError, ValueError):
+                    country_map[aid] = "Unknown"
+
+    # --- 5) assemble outputs ---
+    valid_out = []
+    rejected_out = []
+
+    for a in batch:
+        aid = a["id"]
+        lv = landveg_map.get(aid, {"land": 0.0, "dw_veg": 0.0})
+        land_frac = float(lv["land"])
+        veg_frac = float(lv["dw_veg"])
+        has_land = land_frac >= MIN_LAND_FRACTION
+        has_veg = veg_frac >= MIN_VEG_FRACTION
+
+        fg = gain_map.get(aid, 0.0)
+        has_gain = fg >= MIN_GAIN_FRACTION
+
+        worst = 1.0
+        for (sensor, year), per in mask_results.items():
+            v = per.get(aid, 0.0)
+            if v < worst:
+                worst = v
+        has_img = worst >= MIN_IMAGERY_FRACTION
+
+        biome = eco_map.get(
+            aid, {"biome_name": "Unknown", "biome_num": -1, "realm": "Unknown"}
+        )
+        country = country_map.get(aid, "Unknown")
+
+        centroid_lon = (a["minLon"] + a["maxLon"]) / 2.0
+        centroid_lat = (a["minLat"] + a["maxLat"]) / 2.0
+        R = 6371.0088
+        import math as _math
+
+        lon1 = _math.radians(a["minLon"])
+        lon2 = _math.radians(a["maxLon"])
+        lat1 = _math.radians(a["minLat"])
+        lat2 = _math.radians(a["maxLat"])
+        area_km2 = abs(R * R * (lon2 - lon1) * (_math.sin(lat2) - _math.sin(lat1)))
+
+        props = {
+            "id": aid,
+            "minLon": a["minLon"],
+            "minLat": a["minLat"],
+            "maxLon": a["maxLon"],
+            "maxLat": a["maxLat"],
+            "aoi_area_km2": float(area_km2),
+            "centroid_lon": float(centroid_lon),
+            "centroid_lat": float(centroid_lat),
+            "land_frac": float(land_frac),
+            "has_land": int(has_land),
+            "veg_fraction": float(veg_frac),
+            "has_veg": int(has_veg),
+            "forest_gain_frac": float(fg),
+            "has_gain": int(has_gain),
+            "has_imagery": int(has_img),
+            "biome_name": biome["biome_name"],
+            "biome_num": int(biome["biome_num"]),
+            "region": biome["realm"],
+            "country": country,
+        }
+
+        valid_flag = bool(has_land and has_veg and has_gain and has_img)
+        if valid_flag:
+            props["valid"] = 1
+            props["rejection_reason"] = "valid"
+            valid_out.append({"type": "Feature", "properties": props})
+        else:
+            props["valid"] = 0
+            if not has_land:
+                props["rejection_reason"] = "no_land"
+            elif not has_veg:
+                props["rejection_reason"] = "insufficient_veg"
+            elif not has_gain:
+                props["rejection_reason"] = "no_forest_gain"
+            else:
+                props["rejection_reason"] = "missing_imagery"
+            rejected_out.append({"type": "Feature", "properties": props})
 
     return valid_out, rejected_out
 
 
 def run_local(remaining, loaded_valid, loaded_rejected):
-    _land_raster, _dw_veg, _gain_mask, _ecoregions = _build_gee_datasets()
+    _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups = (
+        _build_gee_datasets()
+    )
 
     valid_aois = []
     rejected_aois = []
@@ -625,7 +847,13 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
         try:
             valid_batch, rejected_batch = process_batch(
-                _land_raster, _dw_veg, _gain_mask, _ecoregions, batch
+                _land_veg,
+                _gain_mask,
+                _ecoregions,
+                _countries,
+                _eco_country_img,
+                _lookups,
+                batch,
             )
             valid_aois.extend([f["properties"] for f in valid_batch])
             rejected_aois.extend([f["properties"] for f in rejected_batch])
@@ -643,7 +871,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
 
         logger.info(
             f"  {i + len(batch)}/{len(remaining)} processed — "
-            f"{len(valid_aois)} valid"
+            f"{len(loaded_valid) + len(valid_aois)} valid"
         )
 
         time.sleep(0.2)
@@ -658,7 +886,9 @@ def _worker(batch_queue, result_queue, worker_id):
     # process needs its own ee.Initialize call since GEE state isn't
     # inherited across the multiprocessing fork/spawn boundary.
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
-    _land_raster, _dw_veg, _gain_mask, _ecoregions = _build_gee_datasets()
+    _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups = (
+        _build_gee_datasets()
+    )
 
     while True:
         item = batch_queue.get()
@@ -670,10 +900,18 @@ def _worker(batch_queue, result_queue, worker_id):
 
         for attempt in range(8):
             try:
-                valid, rejected = process_batch(
-                    _land_raster, _dw_veg, _gain_mask, _ecoregions, batch
+                valid_batch, rejected_batch = process_batch(
+                    _land_veg,
+                    _gain_mask,
+                    _ecoregions,
+                    _countries,
+                    _eco_country_img,
+                    _lookups,
+                    batch,
                 )
-                result_queue.put(("batch_result", batch_idx, valid, rejected))
+                result_queue.put(
+                    ("batch_result", batch_idx, valid_batch, rejected_batch)
+                )
                 time.sleep(random.uniform(1, 3))
                 break
             except Exception as e:
@@ -751,7 +989,7 @@ def _writer(
 
             logger.info(
                 f"Checkpoint {done}/{total_batches} | "
-                f"{len(valid_aois)} valid | "
+                f"{len(loaded_valid) + len(valid_aois)} valid | "
                 f"{rate:.1f} batches/min | "
                 f"{elapsed:.1f}min elapsed"
             )

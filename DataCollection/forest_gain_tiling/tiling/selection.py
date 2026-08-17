@@ -17,6 +17,7 @@ def filter_candidates(
     aoi_id: str | None = None,
     biome: str | None = None,
     region: str | None = None,
+    country: str | None = None,
     period: str | None = None,
     logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
@@ -47,6 +48,10 @@ def filter_candidates(
 
         # Filter by region (case-insensitive substring)
         if region and region.lower() not in tile.get("region", "").lower():
+            continue
+
+        # Filter by country (case-insensitive substring)
+        if country and country.lower() not in tile.get("country", "").lower():
             continue
 
         candidates.append(tile)

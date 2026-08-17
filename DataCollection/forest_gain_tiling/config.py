@@ -133,7 +133,7 @@ class Settings:
         object.__setattr__(
             self,
             "valid_aois_path",
-            self.data_dir / "aois" / f"valid_aois_clearer_{self.period}.json",
+            self.data_dir / "aois" / f"valid_aois_{self.period}.json",
         )
 
     @property

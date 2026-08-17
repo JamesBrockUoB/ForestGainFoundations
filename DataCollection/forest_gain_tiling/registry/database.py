@@ -13,15 +13,7 @@ from enums import TileStatus
 
 
 class RegistryDB:
-    """SQLite database wrapper for tile registry with streaming/pagination support.
-
-    A single database holds tiles for every period; the `period` column
-    (e.g. "p1", "p2") distinguishes them. Most read/write methods accept an
-    optional `period` filter — pass it explicitly (or rely on the caller
-    already having filtered) whenever an operation should not mix periods,
-    since gain/imagery validity is period-specific even for a tile at the
-    same grid location.
-    """
+    """SQLite database wrapper for tile registry with streaming/pagination support."""
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or settings.registry_db_path
@@ -29,7 +21,6 @@ class RegistryDB:
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        """Context manager for database connections."""
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         # Enable WAL mode for better concurrency
@@ -42,9 +33,9 @@ class RegistryDB:
             conn.close()
 
     def _init_schema(self) -> None:
-        """Initialise database schema if not exists."""
+        """Initialise database schema if not exists and run lightweight migrations."""
         with self._conn() as conn:
-            # Main tiles table
+            # Main tiles table with country column
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tiles (
                     tile_id TEXT PRIMARY KEY,
@@ -61,6 +52,7 @@ class RegistryDB:
                     max_lat REAL NOT NULL,
                     biome TEXT NOT NULL,
                     region TEXT NOT NULL,
+                    country TEXT NOT NULL DEFAULT 'Unknown',
                     status TEXT NOT NULL DEFAULT 'pending',
                     gee_task_id TEXT,
                     submitted_at TEXT,
@@ -82,33 +74,34 @@ class RegistryDB:
                 )
                 """)
 
+            # If the table existed without `country`, add it (safe migration)
+            cur = conn.execute("PRAGMA table_info(tiles)").fetchall()
+            existing_cols = [r[1] for r in cur]
+            if "country" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE tiles ADD COLUMN country TEXT NOT NULL DEFAULT 'Unknown'"
+                )
+
             # Indexes on tiles table
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_status ON tiles(status)
-                """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_period ON tiles(period)
-                """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_period_status ON tiles(period, status)
-                """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_biome ON tiles(biome)
-                """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_region ON tiles(region)
-                """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_updated ON tiles(updated_at DESC)
-                """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON tiles(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_period ON tiles(period)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_period_status ON tiles(period, status)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_biome ON tiles(biome)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_region ON tiles(region)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_country ON tiles(country)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_updated ON tiles(updated_at DESC)"
+            )
 
             # Indexes on tile_aois table
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tile_aois_aoi ON tile_aois(aoi_id)
-                """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tile_aois_tile ON tile_aois(tile_id)
-                """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tile_aois_aoi ON tile_aois(aoi_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tile_aois_tile ON tile_aois(tile_id)"
+            )
 
             conn.commit()
 
@@ -123,7 +116,7 @@ class RegistryDB:
                 """
                 INSERT OR IGNORE INTO tiles (
                     tile_id, period, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
-                    min_lon, min_lat, max_lon, max_lat, biome, region,
+                    min_lon, min_lat, max_lon, max_lat, biome, region, country,
                     status, gee_task_id, submitted_at, completed_at,
                     rejection_reason, error, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -143,6 +136,7 @@ class RegistryDB:
                     tile["max_lat"],
                     tile["biome"],
                     tile["region"],
+                    tile.get("country", "Unknown"),
                     str(tile.get("status", TileStatus.PENDING)),
                     tile.get("gee_task_id"),
                     tile.get("submitted_at"),
@@ -193,6 +187,7 @@ class RegistryDB:
                         tile["max_lat"],
                         tile["biome"],
                         tile["region"],
+                        tile.get("country", "Unknown"),
                         str(tile.get("status", TileStatus.PENDING)),
                         tile.get("gee_task_id"),
                         tile.get("submitted_at"),
@@ -209,7 +204,7 @@ class RegistryDB:
                     """
                     INSERT OR IGNORE INTO tiles (
                         tile_id, period, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
-                        min_lon, min_lat, max_lon, max_lat, biome, region,
+                        min_lon, min_lat, max_lon, max_lat, biome, region, country,
                         status, gee_task_id, submitted_at, completed_at,
                         rejection_reason, error, created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -383,12 +378,31 @@ class RegistryDB:
             rows = conn.execute(query, params).fetchall()
             return {row["region"]: row["cnt"] for row in rows}
 
+    def country_counts(
+        self, status_filter: str | None = None, period: str | None = None
+    ) -> dict[str, int]:
+        """Get counts by country, optionally filtered by status and/or period."""
+        query = "SELECT country, COUNT(*) as cnt FROM tiles"
+        clauses = []
+        params: list[Any] = []
+
+        if status_filter is not None:
+            clauses.append("status = ?")
+            params.append(status_filter)
+        if period is not None:
+            clauses.append("period = ?")
+            params.append(period)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " GROUP BY country ORDER BY cnt DESC"
+
+        with self._conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return {row["country"]: row["cnt"] for row in rows}
+
     def rejection_counts(self, period: str | None = None) -> dict[str, int]:
         """Get rejection reason counts, optionally scoped to one period."""
-        query = (
-            "SELECT rejection_reason, COUNT(*) as cnt FROM tiles "
-            "WHERE status = ? AND rejection_reason IS NOT NULL"
-        )
+        query = "SELECT rejection_reason, COUNT(*) as cnt FROM tiles WHERE status = ? AND rejection_reason IS NOT NULL"
         params: list[Any] = [str(TileStatus.REJECTED)]
         if period is not None:
             query += " AND period = ?"
@@ -406,40 +420,11 @@ class RegistryDB:
         clear_history: bool = False,
         to_status: str = str(TileStatus.PENDING),
     ) -> int:
-        """
-        Reset tile statuses back to `to_status` in a single bulk UPDATE.
-
-        status: if given, only reset tiles currently in this status.
-            If None, reset every tile not already in `to_status` (within
-            `period`, if given).
-        period: if given, only reset tiles in this period. Strongly
-            recommended — resetting across periods indiscriminately will
-            queue tiles from a period you didn't mean to touch back
-            through the filter pipeline.
-        to_status: the status to reset tiles into (default 'pending').
-            Use this to resume a specific pipeline stage — e.g. resetting
-            FAILED tiles that died during the imagery stage back to
-            'cheap_valid' instead of all the way to 'pending', so stage 1
-            isn't redone.
-        clear_history: if True, also null out gee_task_id, submitted_at,
-            completed_at, rejection_reason, and error — a full wipe back
-            to a blank row. If False (default), only the status flag is
-            flipped and the old error/rejection_reason remain visible for
-            debugging.
-
-        Returns the number of rows affected.
-        """
         now = datetime.now(timezone.utc).isoformat()
-
         set_clause = "status = ?, updated_at = ?"
         params: list[Any] = [to_status, now]
-
         if clear_history:
-            set_clause += (
-                ", gee_task_id = NULL, submitted_at = NULL, "
-                "completed_at = NULL, rejection_reason = NULL, error = NULL"
-            )
-
+            set_clause += ", gee_task_id = NULL, submitted_at = NULL, completed_at = NULL, rejection_reason = NULL, error = NULL"
         query = f"UPDATE tiles SET {set_clause}"
         clauses = []
         if status is not None:
@@ -452,7 +437,6 @@ class RegistryDB:
             clauses.append("period = ?")
             params.append(period)
         query += " WHERE " + " AND ".join(clauses)
-
         with self._conn() as conn:
             cursor = conn.execute(query, params)
             conn.commit()
@@ -487,6 +471,7 @@ class RegistryDB:
             "max_lat": row["max_lat"],
             "biome": row["biome"],
             "region": row["region"],
+            "country": row["country"] if "country" in row.keys() else "Unknown",
             "aoi_ids": aoi_ids,
             "status": row["status"],
             "gee_task_id": row["gee_task_id"],

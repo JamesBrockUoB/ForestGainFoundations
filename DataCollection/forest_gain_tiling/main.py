@@ -43,7 +43,7 @@ Run flags
   --limit      N            max tiles to process
   --status     STATUS       valid (default) | failed | rejected — ignored when
                              --tile-id is given
-  --stratify   KEY          biome | region
+  --stratify   KEY          biome | region | country
   --stratify-mode  MODE     prop (default) | equal
 
 All commands are implicitly scoped to the active PERIOD; reset in
@@ -108,11 +108,10 @@ def cmd_plan(args: argparse.Namespace) -> None:
         valid_aois = json.load(f)
     logger.info(f"  {len(valid_aois):,} valid AOIs (period={settings.period})")
 
+    # AOIs are expected to already include biome/region/country (set by generate_aois).
+    # Do not attempt to assign countries here — that belongs in generate_aois.
     from registry.store import _get_db
 
-    # Scoped to the active period: running `plan` for p2 after p1 has
-    # already been planned must not skip generation just because the
-    # (shared) database already has p1 rows in it.
     db_tile_count = _get_db().count_tiles(period=settings.period)
 
     if db_tile_count > 0:
@@ -356,7 +355,9 @@ def build_parser() -> argparse.ArgumentParser:
             str(s) for s in (TileStatus.VALID, TileStatus.FAILED, TileStatus.REJECTED)
         ],
     )
-    run_p.add_argument("--stratify", default=None, choices=["biome", "region"])
+    run_p.add_argument(
+        "--stratify", default=None, choices=["biome", "region", "country"]
+    )
     run_p.add_argument(
         "--stratify-mode",
         default="prop",

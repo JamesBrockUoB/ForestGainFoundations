@@ -153,6 +153,7 @@ def build_grid(
             "max_lat": max_lat,
             "biome": primary.get("biome_name", "Unknown"),
             "region": primary.get("region", "Unknown"),
+            "country": primary.get("country", "Unknown"),
             "period": period,
             "aoi_ids": [primary["id"]],
             "status": str(TileStatus.PENDING),
@@ -162,3 +163,100 @@ def build_grid(
             "rejection_reason": None,
             "error": None,
         }
+
+
+def assign_countries_to_aois(
+    aois: list[dict], logger: logging.Logger | None = None, batch_size: int = 2000
+) -> None:
+    if not aois:
+        return
+    if logger is None:
+        logger = logging.getLogger("gee.assign_country")
+
+    countries_fc = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+
+    for i in range(0, len(aois), batch_size):
+        batch = aois[i : i + batch_size]
+        features = []
+        for a in batch:
+            geom = ee.Geometry.Rectangle(
+                [a["minLon"], a["minLat"], a["maxLon"], a["maxLat"]]
+            )
+            props = {"aoi_id": a["id"]}
+            if "centroid_lon" in a and "centroid_lat" in a:
+                props["centroid_lon"] = a["centroid_lon"]
+                props["centroid_lat"] = a["centroid_lat"]
+            features.append(ee.Feature(geom, props))
+
+        fc = ee.FeatureCollection(features)
+
+        def annotate(f):
+            geom = f.geometry()
+            centroid_lon = ee.Algorithms.If(
+                f.get("centroid_lon"), f.get("centroid_lon"), None
+            )
+            centroid_lat = ee.Algorithms.If(
+                f.get("centroid_lat"), f.get("centroid_lat"), None
+            )
+
+            def _centroid_country():
+                pt = ee.Geometry.Point([centroid_lon, centroid_lat])
+                c = countries_fc.filterBounds(pt).first()
+                return ee.Algorithms.If(c, c.get("COUNTRY_NA"), None)
+
+            centroid_country = ee.Algorithms.If(
+                ee.Algorithms.IsEqual(centroid_lon, None), None, _centroid_country()
+            )
+
+            intersecting = countries_fc.filterBounds(geom)
+            with_area = intersecting.map(
+                lambda c: c.set("_area", c.geometry().intersection(geom, 1).area())
+            )
+            best = ee.Algorithms.If(
+                with_area.size().gt(0), with_area.sort("_area", False).first(), None
+            )
+            majority_country = ee.Algorithms.If(
+                best, ee.Feature(best).get("COUNTRY_NA"), None
+            )
+
+            country_raw = ee.Algorithms.If(
+                ee.Algorithms.IsEqual(centroid_country, None),
+                majority_country,
+                centroid_country,
+            )
+
+            country_final = ee.String(
+                ee.Algorithms.If(
+                    ee.Algorithms.IsEqual(country_raw, None),
+                    "Unknown",
+                    ee.Algorithms.If(
+                        ee.Algorithms.IsEqual(country_raw, "N/A"),
+                        "Unknown",
+                        ee.Algorithms.If(
+                            ee.Algorithms.IsEqual(country_raw, ""),
+                            "Unknown",
+                            country_raw,
+                        ),
+                    ),
+                )
+            )
+
+            return f.set("country", country_final)
+
+        annotated = fc.map(annotate)
+        info = annotated.getInfo()
+        features_info = info.get("features", [])
+        id_to_country = {}
+        for feat in features_info:
+            props = feat.get("properties", {})
+            aoi_id = props.get("aoi_id")
+            country = props.get("country")
+            id_to_country[aoi_id] = country if country is not None else "Unknown"
+
+        for a in batch:
+            a_id = a["id"]
+            a["country"] = id_to_country.get(a_id, "Unknown")
+
+        logger.info(
+            f"Annotated AOIs {i}..{i+len(batch)-1} with country (batch size={len(batch)})"
+        )
