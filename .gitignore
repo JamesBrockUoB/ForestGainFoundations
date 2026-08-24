@@ -12,3 +12,7 @@ settings.json
 *.db*
 
 *.vscode/
+
+*.egg-info/
+
+*.py[cod]

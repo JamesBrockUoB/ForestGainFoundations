@@ -1,46 +1,39 @@
 """
 generate_aois.py
 
-AOI generation with basic sanity checks.
+Generate and validate 0.25° AOIs for the active forest-gain period.
 
-Runs in two modes controlled by the USE_HPC environment variable:
-USE_HPC=0 (default) — single-process, sequential batches, suitable for local dev
-USE_HPC=1           — multiprocess workers + dedicated writer thread for HPC/SLURM
+Environment
+-----------
+  PERIOD=p1 (default) — 2017 → 2020
+  PERIOD=p2           — 2020 → 2024
+  USE_HPC=0 (default) — local sequential processing
+  USE_HPC=1           — multiprocessing for HPC/SLURM
+  NUM_WORKERS=4       — HPC worker count
+  BATCH_SIZE=50       — AOIs per processing batch
+  AOI_STEP=0.25       — AOI grid size in degrees
+  SEARCH_MODE=asset    — derive search bounds from DT assets
 
-Period is controlled by the PERIOD environment variable:
-PERIOD=p1 (default) — 2017 → 2020
-PERIOD=p2           — 2020 → 2024
+Usage
+-----
+  PERIOD=p1 python generate_aois.py
+  PERIOD=p2 USE_HPC=1 NUM_WORKERS=4 sbatch submit_aoi_generation.sh
 
-Usage:
-# Local
-PERIOD=p1 python generate_aois.py
-
-# HPC
-PERIOD=p2 USE_HPC=1 NUM_WORKERS=4 sbatch submit_aoi_generation.sh
+The script resumes from its period-specific checkpoint and writes:
+  data/aois/valid_aois_<period>.json
+  data/aois/rejected_aois_<period>.json
 
 Validity checks
-────────────────────────────────────────────────────────────────────────────────
-1. Has land          USDOS/LSIB_SIMPLE/2017 — excludes open ocean
-2. Has vegetation    Dynamic World (GOOGLE/DYNAMICWORLD/V1), median composite
-                     for the active period's year_start — top class is trees,
-                     grass, flooded_vegetation, crops, or shrub_and_scrub ≥ 1%.
-3. Has imagery       S2 (COPERNICUS/S2_SR_HARMONIZED) and S1 (COPERNICUS/S1_GRD)
-                    — every calendar year in the active period must clear 5%
-                    valid-pixel coverage for both sensors
-                    PERIOD=p1 → 2017,2018,2019,2020
-                    PERIOD=p2 → 2020,2021,2022,2023,2024
-4. Has forest gain   DT year_start→year_end for the active period — at least 0.1%
-                    of cell must show tree cover gain with over 50% confidence
-                    counting as tree cover
+---------------
+  • Land coverage
+  • ≥1% Dynamic World vegetation
+  • ≥5% usable S1 and S2 coverage for every year in the period
+  • ≥0.1% forest gain between the period's start and end year
 
-Output fields per AOI
-────────────────────────────────────────────────────────────────────────────────
-id, minLon, minLat, maxLon, maxLat
-valid
-rejection_reason
-veg_fraction
-forest_gain_frac
-has_imagery
+Output fields include
+---------------------
+  id, bounds, area/centroid, land/vegetation/gain fractions,
+  imagery status, biome, region, country, validity and rejection reason.
 """
 
 import json
@@ -108,9 +101,7 @@ S1_BANDS = ["VV", "VH"]
 DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
 DW_VEGETATED_LABELS = [1, 2, 3, 4, 5]  # trees, grass, flooded_veg, crops, shrub/scrub
 
-# AOI_LIST_CACHE is intentionally NOT period-namespaced: the raw 0.25° grid
-# of candidate land cells is identical regardless of which period is active.
-AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / "aois/all_aois.json"
+AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / f"aois/all_aois_{PERIOD}.json"
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -538,15 +529,6 @@ def generate_aois(
         logger.info(f"[AOI] batch {i+1}/{batches} → valid so far: {len(valid)}")
 
     return valid
-
-
-def _smallest_intersecting(source_fc, geom):
-    intersecting = source_fc.filterBounds(geom)
-    with_area = intersecting.map(lambda e: e.set("__area", e.geometry().area(1000)))
-    ranked = with_area.sort("__area", True)
-    return ee.Feature(
-        ee.Algorithms.If(ranked.size().gt(0), ranked.first(), ee.Feature(None))
-    )
 
 
 def _clean_str(raw):

@@ -9,3 +9,10 @@ seaborn
 scipy
 geoai-py
 geotessera
+numpy
+pyproj
+ee
+peft
+terratorch
+streamlit
+streamlit-folium

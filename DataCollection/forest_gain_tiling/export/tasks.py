@@ -15,7 +15,10 @@ from embeddings.tasks import process_all_embeddings_with_retry
 from enums import TileStatus
 from export.aee import submit_aee_exports
 from export.composites import submit_composite_exports
-from export.drive import rclone_all_products
+from export.drive import (
+    check_hpc_available,
+    rclone_all_products,
+)
 from export.labels import submit_label_exports
 from export.metadata import write_tile_metadata
 from export.static import submit_static_exports
@@ -225,6 +228,13 @@ def run_local(
     local_output: bool = False,
 ) -> None:
     """Process tiles sequentially."""
+    if not local_output:
+        if not settings.hpc_path:
+            raise RuntimeError("HPC_PATH is not configured")
+        if not check_hpc_available(settings.hpc_path, logger):
+            logger.error(f"HPC destination unreachable: {settings.hpc_path}")
+            return
+
     total = len(candidates)
     for i, tile in enumerate(candidates, 1):
         logger.info(f"Tile {i}/{total}: {tile['tile_id']}")
@@ -300,7 +310,6 @@ def _mp_writer(result_queue: mp.Queue, total: int, logger: logging.Logger) -> No
 def run_hpc(
     candidates: list[dict],
     logger: logging.Logger,
-    local_output: bool = False,
 ) -> None:
     """
     Process tiles with HPC workers. `ds` is accepted only to match
@@ -309,13 +318,18 @@ def run_hpc(
     objects can't cross a process boundary, so the ds passed in here is
     unused.
     """
+    if not settings.hpc_path:
+        raise RuntimeError("HPC_PATH is not configured")
+    if not check_hpc_available(settings.hpc_path, logger):
+        logger.error(f"HPC destination unreachable: {settings.hpc_path}")
+        return
     tile_queue: mp.Queue = mp.Queue()
     result_queue: mp.Queue = mp.Queue()
 
     workers = [
         mp.Process(
             target=_mp_worker,
-            args=(tile_queue, result_queue, i, local_output),
+            args=(tile_queue, result_queue, i, False),
         )
         for i in range(settings.num_workers)
     ]

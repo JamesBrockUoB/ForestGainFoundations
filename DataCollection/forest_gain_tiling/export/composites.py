@@ -3,6 +3,9 @@ from __future__ import annotations
 import ee
 from config import settings
 
+NATIVE_10M_BANDS = ["B2", "B3", "B4", "B8"]
+NATIVE_20M_BANDS = ["B5", "B6", "B7", "B8A", "B11", "B12"]
+
 
 def _mask_s2_scl(img: ee.Image) -> ee.Image:
     scl = img.select("SCL")
@@ -11,13 +14,8 @@ def _mask_s2_scl(img: ee.Image) -> ee.Image:
     )
 
 
-def _add_indices(img: ee.Image) -> ee.Image:
-    ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    evi = img.expression(
-        "2.5*((NIR-RED)/(NIR+6.0*RED-7.5*BLUE+1.0))",
-        {"NIR": img.select("B8"), "RED": img.select("B4"), "BLUE": img.select("B2")},
-    ).rename("EVI")
-    return img.select(["B2", "B3", "B4", "B5", "B6", "B7", "B8"]).addBands([ndvi, evi])
+def _add_ndvi(img: ee.Image) -> ee.Image:
+    return img.addBands(img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
 
 
 def _date_range(year: int) -> tuple[str, str]:
@@ -79,21 +77,22 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
         .map(_mask_s2_scl)
-        .select(
-            [
-                "B2",
-                "B3",
-                "B4",
-                "B5",
-                "B6",
-                "B7",
-                "B8",
-            ]
-        )
-        .map(_add_indices)
+        .select(NATIVE_10M_BANDS + NATIVE_20M_BANDS)
+        .map(_upsample_20m_bands_to_10m)
     )
 
     return s2.median()
+
+
+def _upsample_20m_bands_to_10m(img: ee.Image) -> ee.Image:
+    """B2/B3/B4/B8 are native 10m. B5/B6/B7/B8A/B11/B12 are native 20m --
+    bilinear-resample those before compositing so every band shares the
+    same pixel grid going into the median reducer, rather than mixing
+    resolutions and letting GEE nearest-neighbor it implicitly at export."""
+    native_10m = img.select(NATIVE_10M_BANDS)
+    native_20m = img.select(NATIVE_20M_BANDS).resample("bilinear")
+
+    return native_10m.addBands(native_20m).copyProperties(img, img.propertyNames())
 
 
 def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
@@ -122,10 +121,23 @@ def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
         .map(_mask_s2_scl)
-        .map(_add_indices)
+        .map(_add_ndvi)
         .select(["NDVI"])
         .median()
     )
+
+
+def s2_ndvi_trend(geom: ee.Geometry, years: list[int]) -> ee.Image:
+    """Per-pixel NDVI slope across `years` using each year's peak-NDVI
+    composite. One linearFit reduction over a small collection — cheap,
+    same cost family as the old two-year delta."""
+    imgs = []
+    for year in years:
+        ndvi = s2_peak_ndvi(geom, year).rename("ndvi")
+        yr = ee.Image.constant(year).toFloat().rename("year")
+        imgs.append(ee.Image.cat([yr, ndvi]))
+    fit = ee.ImageCollection(imgs).reduce(ee.Reducer.linearFit())
+    return fit.select("scale").rename("ndvi_trend")
 
 
 def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
@@ -147,30 +159,10 @@ def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
     return med.addBands(med.select("VV").divide(med.select("VH")).rename("VVVH"))
 
 
-_BAND_SUFFIXES = [
-    "B2",
-    "B3",
-    "B4",
-    "B5",
-    "B6",
-    "B7",
-    "B8",
-    "NDVI",
-    "EVI",
-    "VV",
-    "VH",
-    "VVVH",
-]
-
-
 def build_year_composite(geom: ee.Geometry, year: int) -> ee.Image:
     """Combined S1+S2 composite for a single year — exported as its own
     per-year file (composites/s1s2_<year>.tif)."""
-    return (
-        s2_composite(geom, year)
-        .addBands(s1_composite(geom, year))
-        .rename(list(_BAND_SUFFIXES))
-    )
+    return s2_composite(geom, year).addBands(s1_composite(geom, year))
 
 
 def submit_composite_exports(

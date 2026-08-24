@@ -119,7 +119,7 @@ class RegistryDB:
                     min_lon, min_lat, max_lon, max_lat, biome, region, country,
                     status, gee_task_id, submitted_at, completed_at,
                     rejection_reason, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tile["tile_id"],
@@ -207,7 +207,7 @@ class RegistryDB:
                         min_lon, min_lat, max_lon, max_lat, biome, region, country,
                         status, gee_task_id, submitted_at, completed_at,
                         rejection_reason, error, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     params_list,
                 )

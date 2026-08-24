@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ee
 from config import settings
-from export.composites import s1_availability, s2_availability, s2_peak_ndvi
+from export.composites import s1_availability, s2_availability, s2_ndvi_trend
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 
@@ -10,7 +10,7 @@ NO_GAIN_SENTINEL = -9999.0
 
 CHEAP_BAND_NAMES = [
     "gain_frac",
-    "ndvi_delta",
+    "ndvi_trend",
 ]
 
 if settings.period == "p1":
@@ -34,11 +34,10 @@ def build_cheap_stats_image(
 
     gain_mask = gain_validated.selfMask()
 
-    ndvi_delta = (
-        s2_peak_ndvi(geom, settings.year_end)
-        .subtract(s2_peak_ndvi(geom, settings.year_start))
+    ndvi_trend = (
+        s2_ndvi_trend(geom, settings.period_years)
         .updateMask(gain_mask)
-        .rename("ndvi_delta")
+        .rename("ndvi_trend")
     )
 
     forty = ds.forty.clip(geom)
@@ -60,7 +59,7 @@ def build_cheap_stats_image(
 
     bands = [
         gain_binary.rename("gain_frac"),
-        ndvi_delta,
+        ndvi_trend,
     ]
 
     # Only needed for P1

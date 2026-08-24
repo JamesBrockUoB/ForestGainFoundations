@@ -1,54 +1,57 @@
 """
 Forest-gain tile export pipeline.
 
-Period is controlled by the PERIOD environment variable (same convention as
-generate_aois.py):
+Period is controlled by the PERIOD environment variable:
   PERIOD=p1 (default) — 2017 → 2020
   PERIOD=p2           — 2020 → 2024
-Every command below operates on tiles tagged with the active period only.
 
-Commands
+Examples
 --------
-  PERIOD=p1 python main.py plan                     # build tile registry, print summary
-  PERIOD=p1 python main.py filter --stage cheap      # cheap gain/NDVI filter
-  PERIOD=p1 python main.py filter --stage imagery    # per-year S1+S2 availability filter
-  python main.py filter --stage cheap --limit 5      # filter only the first N batches (testing)
-  python main.py run                                # process all valid tiles
-  python main.py run --limit 500                     # next N valid tiles
-  python main.py run --biome "Boreal Forests"        # filter by biome (substring match)
-  python main.py run --region Neotropic              # filter by region
-  python main.py run --aoi-id aoi_-73.25_-52.75       # single AOI
-  python main.py run --tile-id tile_-363_2324_p1      # single tile, any status (debug/rerun)
-  python main.py run --status failed                 # retry failed tiles
-  python main.py status                              # print registry summary (active period)
-  python main.py reset --status failed                # retry only failed tiles, keep error text
-  python main.py reset --status rejected --yes        # re-filter previously rejected tiles, no prompt
-  python main.py reset --clear-history                # nuke everything back to blank pending
+  PERIOD=p1 python main.py plan
+  PERIOD=p1 python main.py status
+  PERIOD=p1 python main.py filter --stage cheap
+  PERIOD=p1 python main.py filter --stage imagery
+  PERIOD=p1 python main.py filter --stage cheap --limit 5
+  PERIOD=p1 python main.py run
+  PERIOD=p1 python main.py run --limit 500
+  PERIOD=p1 python main.py run --biome "Boreal Forests"
+  PERIOD=p1 python main.py run --region "Neotropic"
+  PERIOD=p1 python main.py run --aoi-id aoi_-73.25_-52.75
+  PERIOD=p1 python main.py run --tile-id tile_-363_2324_p1
+  PERIOD=p1 python main.py run --status failed
+  PERIOD=p1 python main.py run --local-output --limit 10
+  PERIOD=p1 python main.py reset --status failed
+  PERIOD=p1 python main.py reset --status failed --to-status valid
+  PERIOD=p1 python main.py reset --status rejected --yes
+  PERIOD=p1 python main.py reset --clear-history
 
-Filter flags
-------------
-  --stage      cheap | imagery   which filter stage to run
-                 cheap:   PENDING -> CHEAP_VALID | REJECTED (gain/NDVI thresholds)
-                 imagery: CHEAP_VALID -> VALID | REJECTED (per-year S1+S2 availability
-                          over every year in the active period)
-  --limit      N            max number of AOIs to process (for testing)
+Run
+---
+  --aoi-id AOI_ID
+  --tile-id TILE_ID
+  --biome SUBSTRING
+  --region SUBSTRING
+  --limit N
+  --status valid | failed | rejected
+  --stratify biome | region | country
+  --stratify-mode prop | equal
+  --local-output
 
-Run flags
----------
-  --aoi-id     AOI_ID       filter to a single AOI (may still match multiple tiles,
-                             since one AOI is subdivided into a grid of tiles)
-  --tile-id    TILE_ID      filter to a single tile (exact match).
-  --biome      SUBSTRING    filter by biome (case-insensitive substring)
-  --region     SUBSTRING    filter by region (case-insensitive substring)
-  --limit      N            max tiles to process
-  --status     STATUS       valid (default) | failed | rejected — ignored when
-                             --tile-id is given
-  --stratify   KEY          biome | region | country
-  --stratify-mode  MODE     prop (default) | equal
+Filter
+------
+  --stage cheap | imagery
+  --batch-size N
+  --limit N
 
-All commands are implicitly scoped to the active PERIOD; reset in
-particular always filters on period, so `reset --status failed` for
-PERIOD=p1 will never touch p2 tiles.
+Reset
+-----
+  --status STATUS
+  --to-status STATUS
+  --clear-history
+  --yes
+
+All commands are scoped to the active PERIOD. PERIOD can be overridden at
+runtime, e.g. PERIOD=p2 python main.py run.
 """
 
 from __future__ import annotations
@@ -132,6 +135,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
         new_count = 0
         biome_counts = Counter()
         region_counts = Counter()
+        country_counts = Counter()
         total = 0
 
         for t in build_grid(valid_aois, logger):
@@ -139,6 +143,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
 
             biome_counts[t["biome"]] += 1
             region_counts[t["region"]] += 1
+            country_counts[t["country"]] += 1
             total += 1
 
             if len(batch) >= batch_size:
@@ -161,24 +166,44 @@ def cmd_plan(args: argparse.Namespace) -> None:
             f"  TILE PLAN SUMMARY  (period={settings.period})",
             "═" * 60,
             f"  Total tiles : {total:>10,}",
-            f"  Grid size   : {sz:.0f} m x {sz:.0f} m  ({settings.tile_pixels}x{settings.tile_pixels} px @ {settings.scale} m/px)",
+            f"  Grid size   : {sz:.0f} m x {sz:.0f} m  "
+            f"({settings.tile_pixels}x{settings.tile_pixels} px @ {settings.scale} m/px)",
             f"  CRS         : {settings.crs}",
-            f"  Min overlap : {settings.min_aoi_overlap_frac*100:.0f}% of tile inside a single AOI",
-            "",
-            "  By biome:",
+            f"  Min overlap : "
+            f"{settings.min_aoi_overlap_frac * 100:.0f}% of tile inside a single AOI",
         ]
-        for b, n in biome_counts.most_common():
-            lines.append(f"    {b:<45} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
-        lines += ["", "  By region:"]
-        for r, n in region_counts.most_common():
-            lines.append(f"    {r:<30} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+
+        if args.verbose:
+            lines += ["", "  By biome:"]
+            for b, n in biome_counts.most_common():
+                lines.append(
+                    f"    {b:<45} {n:>8,}  " f"({100 * n / max(total, 1):5.1f}%)"
+                )
+
+            lines += ["", "  By region:"]
+            for r, n in region_counts.most_common():
+                lines.append(
+                    f"    {r:<30} {n:>8,}  " f"({100 * n / max(total, 1):5.1f}%)"
+                )
+
+            lines += ["", "  By country:"]
+            for c, n in country_counts.most_common():
+                lines.append(
+                    f"    {c:<30} {n:>8,}  " f"({100 * n / max(total, 1):5.1f}%)"
+                )
+
         lines += ["═" * 60, ""]
         print("\n".join(lines))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
     """Print registry status summary for the active period."""
-    print(registry_summary(period=settings.period))
+    print(
+        registry_summary(
+            period=settings.period,
+            verbose=args.verbose,
+        )
+    )
 
 
 def cmd_filter(args: argparse.Namespace) -> None:
@@ -208,7 +233,12 @@ def cmd_filter(args: argparse.Namespace) -> None:
             limit_batches=args.limit,
         )
 
-    print(registry_summary(period=settings.period))
+    print(
+        registry_summary(
+            period=settings.period,
+            verbose=args.verbose,
+        )
+    )
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -257,12 +287,17 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     if settings.use_hpc:
         logger.info(f"Mode: HPC | workers={settings.num_workers}")
-        run_hpc(candidates, logger, local_output=args.local_output)
+        run_hpc(candidates, logger)
     else:
         logger.info("Mode: local")
         run_local(candidates, ds, logger, local_output=args.local_output)
 
-    print(registry_summary(period=settings.period))
+    print(
+        registry_summary(
+            period=settings.period,
+            verbose=args.verbose,
+        )
+    )
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
@@ -297,7 +332,12 @@ def cmd_reset(args: argparse.Namespace) -> None:
         to_status=args.to_status,
     )
     logger.info(f"Reset {n:,} tiles (period={settings.period}) to '{args.to_status}'.")
-    print(registry_summary(period=settings.period))
+    print(
+        registry_summary(
+            period=settings.period,
+            verbose=args.verbose,
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -306,6 +346,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show summary breakdowns by biome, region, and country.",
+    )
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("plan", help="Build tile registry from valid AOIs (no GEE calls)")

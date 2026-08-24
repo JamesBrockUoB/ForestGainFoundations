@@ -6,10 +6,11 @@ from typing import Any, Generator
 
 import ee
 import numpy as np
-from config import settings
-from enums import TileStatus
 from pyproj import Transformer
 from tqdm import tqdm
+
+from config import settings
+from enums import TileStatus
 
 # Equal-area CRS for grid math — ensures every tile covers the same ground
 # area regardless of latitude. EPSG:3857 (Web Mercator) does not preserve

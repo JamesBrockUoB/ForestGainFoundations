@@ -86,7 +86,7 @@ class Settings:
 
     min_aoi_overlap_frac: float = 0.1
     gain_pct_min: float = 1.0
-    ndvi_delta_min: float = 0.0
+    ndvi_trend_min: float = 0.0
     gain_sustain_dropout_tolerance: int = 1
     min_pseudo_gain_frac: float = 0.5
 

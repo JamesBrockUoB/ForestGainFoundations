@@ -18,7 +18,7 @@ def evaluate_cheap_stats(
 ) -> tuple[str, str | None]:
 
     gain_pct = stats["gain_frac"] * 100.0
-    ndvi_delta = stats["ndvi_delta"]
+    ndvi_trend = stats["ndvi_trend"]
 
     if gain_pct == 0.0:
         return str(TileStatus.REJECTED), "no_gain"
@@ -26,7 +26,7 @@ def evaluate_cheap_stats(
     if gain_pct < settings.gain_pct_min:
         return str(TileStatus.REJECTED), "low_gain_pct"
 
-    if ndvi_delta <= settings.ndvi_delta_min:
+    if ndvi_trend <= settings.ndvi_trend_min:
         return str(TileStatus.REJECTED), "low_viability"
 
     if settings.period == "p1":

@@ -1,3 +1,6 @@
+from typing import Any
+
+from config import settings
 from enums import TileStatus
 from registry.database import RegistryDB
 
@@ -99,16 +102,15 @@ def get_registry_stats(period: str | None = None) -> dict[str, Any]:
     }
 
 
-def registry_summary(period: str | None = None) -> str:
-    """Generate summary statistics of registry state, optionally scoped to a period."""
+def registry_summary(
+    period: str | None = None,
+    verbose: int = 0,
+) -> str:
+    """Generate registry summary, optionally including biome/region/country breakdowns."""
     db = _get_db()
 
     status_counts = db.status_counts(period=period)
     total = db.count_tiles(period=period)
-    biome_counts = db.biome_counts(period=period)
-    region_counts = db.region_counts(period=period)
-    country_counts = db.country_counts(period=period)
-    rejections = db.rejection_counts(period=period)
 
     lines = [
         "",
@@ -123,25 +125,32 @@ def registry_summary(period: str | None = None) -> str:
     for status, cnt in sorted(status_counts.items(), key=lambda x: x[0]):
         lines.append(f"    {status:<20} {cnt:>8,}")
 
-    lines += ["", "  By biome:"]
+    if verbose:
+        biome_counts = db.biome_counts(period=period)
+        region_counts = db.region_counts(period=period)
+        country_counts = db.country_counts(period=period)
 
-    for b, n in sorted(biome_counts.items(), key=lambda x: -x[1]):
-        lines.append(f"    {b:<45} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
+        lines += ["", "  By biome:"]
+        for biome, count in sorted(biome_counts.items(), key=lambda x: -x[1]):
+            lines.append(
+                f"    {biome:<45} {count:>8,}  "
+                f"({100 * count / max(total, 1):5.1f}%)"
+            )
 
-    lines += ["", "  By region:"]
+        lines += ["", "  By region:"]
+        for region, count in sorted(region_counts.items(), key=lambda x: -x[1]):
+            lines.append(
+                f"    {region:<30} {count:>8,}  "
+                f"({100 * count / max(total, 1):5.1f}%)"
+            )
 
-    for r, n in sorted(region_counts.items(), key=lambda x: -x[1]):
-        lines.append(f"    {r:<30} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
-
-    lines += ["", "  By country:"]
-
-    for c, n in sorted(country_counts.items(), key=lambda x: -x[1]):
-        lines.append(f"    {c:<30} {n:>8,}  ({100*n/max(total,1):5.1f}%)")
-
-    if rejections:
-        lines += ["", "  Rejections:"]
-        for reason, n in sorted(rejections.items(), key=lambda x: -x[1]):
-            lines.append(f"    {reason:<30} {n:>8,}")
+        lines += ["", "  By country:"]
+        for country, count in sorted(country_counts.items(), key=lambda x: -x[1]):
+            lines.append(
+                f"    {country:<30} {count:>8,}  "
+                f"({100 * count / max(total, 1):5.1f}%)"
+            )
 
     lines += ["═" * 60, ""]
+
     return "\n".join(lines)

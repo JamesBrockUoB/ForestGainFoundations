@@ -41,7 +41,6 @@
     3. Install dependencies:
 
     ```bash
-      cd DataCollection/
       pip install -r requirements.txt
     ```
 
