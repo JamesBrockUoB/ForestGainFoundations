@@ -112,6 +112,28 @@ def run_worker(action: str, period: str, payload: dict) -> dict:
     return json.loads(result.stdout)
 
 
+def find_aoi_at(period: str, lon: float, lat: float) -> dict | None:
+    """Find the AOI cell (valid or rejected) containing a lon/lat point.
+
+    biome_name/region/country are grid-level attributes assigned when the
+    AOI grid was built, independent of whether the cell passed validity
+    checks -- so both lists are searched, not just the valid ones.
+    """
+    valid_aois, rejected_aois = load_aoi_checkpoint(period)
+
+    for aoi in valid_aois + rejected_aois:
+        min_lon, max_lon = aoi.get("minLon"), aoi.get("maxLon")
+        min_lat, max_lat = aoi.get("minLat"), aoi.get("maxLat")
+
+        if None in (min_lon, max_lon, min_lat, max_lat):
+            continue
+
+        if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
+            return aoi
+
+    return None
+
+
 @st.cache_data
 def list_exported_tiles(period: str) -> list[str]:
     root = settings.data_dir / "inspector_tiles" / period
@@ -195,6 +217,14 @@ corners = tile_corners_lonlat(tile)
 
 tile_box_6933 = box(tile["x_min_m"], tile["y_min_m"], tile["x_max_m"], tile["y_max_m"])
 tile_is_in_extent = extent_6933.covers(tile_box_6933)
+
+tile_centre_lon = (tile["min_lon"] + tile["max_lon"]) / 2
+tile_centre_lat = (tile["min_lat"] + tile["max_lat"]) / 2
+aoi_at_tile = find_aoi_at(period, tile_centre_lon, tile_centre_lat)
+
+tile["biome"] = aoi_at_tile.get("biome_name") if aoi_at_tile else None
+tile["region"] = aoi_at_tile.get("region") if aoi_at_tile else None
+tile["country"] = aoi_at_tile.get("country") if aoi_at_tile else None
 
 tab_select, tab_viewer = st.tabs(["Tile selection & validity", "Exported tile viewer"])
 
@@ -297,6 +327,12 @@ with tab_select:
         language="text",
     )
 
+    st.caption(
+        f"Biome: {tile['biome'] or '—'} · "
+        f"Region: {tile['region'] or '—'} · "
+        f"Country: {tile['country'] or '—'}"
+    )
+
     if not tile_is_in_extent:
         st.error("The complete 2.56 km tile must lie inside the Forest Gain footprint.")
 
@@ -333,8 +369,9 @@ with tab_select:
     st.subheader("Export for investigation")
 
     output_root = settings.data_dir / "inspector_tiles" / period
+    output_dir_target = output_root / tile["tile_id"]
 
-    st.caption(f"Writes to `{output_root}` without updating registry data")
+    st.caption(f"Writes to `{output_dir_target}` without updating registry data")
 
     confirmed = st.checkbox("I understand this submits Earth Engine export tasks.")
 
@@ -342,10 +379,11 @@ with tab_select:
         try:
             with st.spinner("Submitting exports and downloading products…"):
                 output_dir = run_worker(
-                    "export", period, {"tile": tile, "output_root": str(output_root)}
+                    "export", period, {"tile": tile, "output_dir": str(output_dir_target)}
                 )["output_dir"]
 
             st.success(f"Export complete: {output_dir}")
+            list_exported_tiles.clear()
 
         except Exception as exc:
             st.exception(exc)

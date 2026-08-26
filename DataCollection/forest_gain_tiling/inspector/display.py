@@ -26,6 +26,39 @@ PSEUDO_CLASS_NAMES = ["AGROCROP", "NAT_REGEN", "PLANTATION", "PLANTED"]
 PSEUDO_CLASS_COLORS = ["#e6ab02", "#1b9e77", "#7570b3", "#d95f02"]
 PSEUDO_LABEL_NODATA = -9999
 
+# Units shown on static-layer colorbars, keyed by the layer names used in
+# tile_inspector.py's static_paths dict. A missing/blank entry just means
+# no unit suffix.
+STATIC_LAYER_UNITS = {
+    "Slope": "°",
+    "Protected area": "",
+    "FABDEM": "m",
+}
+
+
+def _fmt(value, decimals: int = 2, suffix: str = "") -> str:
+    """Format a number to a fixed number of decimal places, or '—' if missing.
+
+    Centralises the 2dp convention used throughout the metadata summary so
+    it isn't repeated (and isn't inconsistent) across every st.write call.
+    """
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{decimals}f}{suffix}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _round2(value):
+    """Round a number to 2dp for tabular display, passing through None."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return value
+
 
 def valid_aoi_style(opacity: float) -> dict:
     return {
@@ -124,10 +157,13 @@ def read_embedding(path: str) -> np.ndarray:
     return data.transpose(1, 2, 0)
 
 
-def static_colour_preview(path: str, cmap_name: str) -> np.ndarray:
-    import matplotlib.pyplot as plt
-    from matplotlib import colormaps
+def static_colour_data(path: str) -> tuple[np.ndarray, float, float]:
+    """Read a static raster and return it alongside its display bounds.
 
+    Unlike a pre-baked RGB preview, the raw (nodata-masked) array is kept
+    scalar so callers can render with imshow(..., cmap=..., vmin=, vmax=)
+    and attach a matching colorbar as a legend.
+    """
     with rasterio.open(path) as src:
         arr = src.read(1).astype(np.float32)
         nodata = src.nodata
@@ -136,22 +172,16 @@ def static_colour_preview(path: str, cmap_name: str) -> np.ndarray:
     if nodata is not None:
         valid &= arr != nodata
 
+    arr = np.where(valid, arr, np.nan)
+
     if not valid.any():
-        return np.zeros((*arr.shape, 3), dtype=np.float32)
+        return arr, 0.0, 1.0
 
-    lo, hi = np.nanpercentile(arr[valid], [2, 98])
-    if hi <= lo:
-        hi = lo + 1.0
+    vmin, vmax = np.nanpercentile(arr[valid], [2, 98])
+    if vmax <= vmin:
+        vmax = vmin + 1.0
 
-    normalised = np.clip((arr - lo) / (hi - lo), 0, 1)
-
-    cmap = colormaps[cmap_name]
-    rgb = cmap(normalised)[..., :3].astype(np.float32)
-    rgb[~valid] = 0
-
-    plt.close("all")
-
-    return rgb
+    return arr, float(vmin), float(vmax)
 
 
 def load_tile_metadata(tile_dir: Path) -> dict | None:
@@ -161,25 +191,6 @@ def load_tile_metadata(tile_dir: Path) -> dict | None:
 
     with open(metadata_path) as f:
         return json.load(f)
-
-
-def _render_overlay(
-    base_image: np.ndarray,
-    overlay_image: np.ndarray,
-    opacity: float,
-    title: str,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.imshow(base_image)
-    ax.imshow(overlay_image, alpha=opacity)
-    ax.axis("off")
-    ax.set_title(title)
-    fig.tight_layout(pad=0)
-
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
 
 
 def render_yearly_products(
@@ -229,34 +240,115 @@ def render_static_layers(
     display_mode: str,
     opacity: float,
 ) -> None:
-    cols = st.columns(len(static_paths))
+    """Render the three static layers side-by-side."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
 
-    for col, (layer_name, static_path) in zip(cols, static_paths.items()):
-        with col:
-            st.markdown(f"### {layer_name}")
+    if not static_paths:
+        return
 
-            if not static_path.exists():
-                st.info(f"No {layer_name} raster found.")
-                continue
+    fig, axes = plt.subplots(
+        1,
+        len(static_paths),
+        figsize=(5 * len(static_paths), 5),
+    )
 
-            try:
-                static_image = static_colour_preview(
-                    str(static_path), static_colours[layer_name]
+    if len(static_paths) == 1:
+        axes = [axes]
+
+    for ax, (layer_name, static_path) in zip(axes, static_paths.items()):
+        if not static_path.exists():
+            ax.set_title(layer_name)
+            ax.axis("off")
+            continue
+
+        try:
+            arr, vmin, vmax = static_colour_data(str(static_path))
+
+            if display_mode == "Overlay on S2" and s2_images:
+                first_year = sorted(s2_images, key=int)[0]
+                ax.imshow(s2_images[first_year])
+
+            if layer_name == "Protected area":
+                cmap = ListedColormap([
+                    "#d9d9d9",
+                    "#1b9e77",
+                ])
+
+                norm = BoundaryNorm(
+                    [-0.5, 0.5, 1.5],
+                    cmap.N,
                 )
 
-                if display_mode == "Overlay on S2" and s2_images:
-                    first_year = sorted(s2_images, key=int)[0]
-                    _render_overlay(
-                        s2_images[first_year],
-                        static_image,
-                        opacity,
-                        f"{layer_name} / S2 {first_year}",
-                    )
-                else:
-                    st.image(static_image, use_container_width=True)
+                masked = np.ma.masked_invalid(arr)
 
-            except Exception as exc:
-                st.error(f"Could not display {layer_name}: {exc}")
+                im = ax.imshow(
+                    masked,
+                    cmap=cmap,
+                    norm=norm,
+                    interpolation="nearest",
+                    alpha=(
+                        opacity
+                        if display_mode == "Overlay on S2"
+                        else 1.0
+                    ),
+                )
+
+                ax.set_title("Protected area")
+
+                cbar = fig.colorbar(
+                    im,
+                    ax=ax,
+                    ticks=[0, 1],
+                    fraction=0.046,
+                    pad=0.04,
+                )
+                cbar.ax.set_yticklabels([
+                    "Not protected",
+                    "Protected",
+                ])
+
+            else:
+                # Continuous layer.
+                cmap_name = static_colours[layer_name]
+                unit = STATIC_LAYER_UNITS.get(layer_name, "")
+
+                im = ax.imshow(
+                    arr,
+                    cmap=cmap_name,
+                    vmin=vmin,
+                    vmax=vmax,
+                    interpolation="nearest",
+                    alpha=(
+                        opacity
+                        if display_mode == "Overlay on S2"
+                        else 1.0
+                    ),
+                )
+
+                ax.set_title(layer_name)
+
+                cbar = fig.colorbar(
+                    im,
+                    ax=ax,
+                    fraction=0.046,
+                    pad=0.04,
+                )
+
+                cbar.set_label(
+                    f"{layer_name}{f' ({unit})' if unit else ''}"
+                )
+
+            ax.axis("off")
+
+        except Exception as exc:
+            ax.set_title(layer_name)
+            ax.axis("off")
+            st.error(f"Could not display {layer_name}: {exc}")
+
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
 
 
 def read_gain_confidence(path: str) -> np.ndarray:
@@ -386,7 +478,7 @@ def display_climate(metadata: dict) -> None:
     fig, ax1 = plt.subplots(figsize=(9, 3.5))
     ax1.plot(years, precip, marker="o", linewidth=2)
     ax1.set_xlabel("Year")
-    ax1.set_ylabel("Annual precipitation (mm)")
+    ax1.set_ylabel("Annual precipitation")
     ax1.grid(alpha=0.2)
 
     ax2 = ax1.twinx()
@@ -401,12 +493,12 @@ def display_climate(metadata: dict) -> None:
     climate_rows = [
         {
             "Year": int(year),
-            "Precipitation (mm)": climate[year].get("precip_sum"),
-            "Precip min (mm)": climate[year].get("precip_min"),
-            "Precip max (mm)": climate[year].get("precip_max"),
-            "Mean temperature (°C)": climate[year].get("temp_mean"),
-            "Temp min (°C)": climate[year].get("temp_min"),
-            "Temp max (°C)": climate[year].get("temp_max"),
+            "Precipitation": _round2(climate[year].get("precip_sum")),
+            "Precip min": _round2(climate[year].get("precip_min")),
+            "Precip max": _round2(climate[year].get("precip_max")),
+            "Mean temperature": _round2(climate[year].get("temp_mean")),
+            "Temp min": _round2(climate[year].get("temp_min")),
+            "Temp max": _round2(climate[year].get("temp_max")),
             "Source": climate[year].get("climate_source"),
         }
         for year in years
@@ -425,43 +517,30 @@ def render_tile_metadata(metadata: dict) -> None:
 
     with overview_cols[0]:
         gain_pct = metadata.get("gain_pct")
-        st.metric("Forest gain", f"{gain_pct:.2f}%" if gain_pct is not None else "—")
+        st.metric("Forest gain", _fmt(gain_pct, suffix="%"))
         st.write(f"**Biome:** {metadata.get('biome', '—')}")
         st.write(f"**Region:** {metadata.get('region', '—')}")
         st.write(f"**Country:** {metadata.get('country', '—')}")
 
     with overview_cols[1]:
         st.write("**Soil**")
-        st.write(f"SOC: {soil.get('soc', '—')}")
-        st.write(f"Clay: {soil.get('clay_pct', '—')}%")
-        st.write(f"pH: {soil.get('ph', '—')}")
+        st.write(f"SOC: {_fmt(soil.get('soc'))}")
+        st.write(f"Clay: {_fmt(soil.get('clay_pct'), suffix='%')}")
+        st.write(f"pH: {_fmt(soil.get('ph'))}")
 
     with overview_cols[2]:
         st.write("**Pseudo labels**")
         st.write(f"Dominant class: {pseudo.get('dominant_class', '—')}")
-
-        confidence = pseudo.get("mean_confidence")
-        st.write(
-            f"Mean confidence: {confidence:.3f}"
-            if confidence is not None
-            else "Mean confidence: —"
-        )
+        st.write(f"Mean confidence: {_fmt(pseudo.get('mean_confidence'))}")
 
         labelled_fraction = pseudo.get("labelled_gain_pixel_fraction")
-        st.write(
-            f"Labelled gain: {labelled_fraction * 100:.1f}%"
-            if labelled_fraction is not None
-            else "Labelled gain: —"
-        )
+        labelled_pct = labelled_fraction * 100 if labelled_fraction is not None else None
+        st.write(f"Labelled gain: {_fmt(labelled_pct, suffix='%')}")
 
     with overview_cols[3]:
         st.write("**Slope**")
-
-        mean_slope = slope_metadata.get("mean")
-        p90_slope = slope_metadata.get("p90")
-
-        st.write(f"Mean: {mean_slope:.2f}°" if mean_slope is not None else "Mean: —")
-        st.write(f"P90: {p90_slope:.2f}°" if p90_slope is not None else "P90: —")
+        st.write(f"Mean: {_fmt(slope_metadata.get('mean'), suffix='°')}")
+        st.write(f"P90: {_fmt(slope_metadata.get('p90'), suffix='°')}")
         st.write(f"Exported: {metadata.get('exported_at', '—')}")
 
     st.write("**Bounds**")
@@ -471,14 +550,14 @@ def render_tile_metadata(metadata: dict) -> None:
         st.write(f"CRS: {bounds.get('crs', '—')}")
 
     with bounds_cols[1]:
-        st.write(f"X: {bounds.get('x_min_m', '—')} → {bounds.get('x_max_m', '—')}")
+        st.write(f"X: {_fmt(bounds.get('x_min_m'))} → {_fmt(bounds.get('x_max_m'))}")
 
     with bounds_cols[2]:
-        st.write(f"Y: {bounds.get('y_min_m', '—')} → {bounds.get('y_max_m', '—')}")
+        st.write(f"Y: {_fmt(bounds.get('y_min_m'))} → {_fmt(bounds.get('y_max_m'))}")
 
     with bounds_cols[3]:
-        st.write(f"Lon: {bounds.get('min_lon', '—')} → {bounds.get('max_lon', '—')}")
-        st.write(f"Lat: {bounds.get('min_lat', '—')} → {bounds.get('max_lat', '—')}")
+        st.write(f"Lon: {_fmt(bounds.get('min_lon'))} → {_fmt(bounds.get('max_lon'))}")
+        st.write(f"Lat: {_fmt(bounds.get('min_lat'))} → {_fmt(bounds.get('max_lat'))}")
 
     if metadata.get("climate_yearly"):
         st.subheader("Climate by year")
@@ -492,3 +571,6 @@ def render_tile_metadata(metadata: dict) -> None:
                 hide_index=True,
                 use_container_width=True,
             )
+
+    with st.expander("Full metadata JSON"):
+        st.json(metadata)
