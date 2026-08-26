@@ -4,31 +4,42 @@ from __future__ import annotations
 
 from typing import Any
 
-from pyproj import Transformer
-
 from config import settings
 from filtering.raster_stats import fetch_cheap_stats, fetch_imagery_stats
 from gee_datasets.registry import Datasets
+from pyproj import Transformer
 
 _TO_GRID = Transformer.from_crs("EPSG:4326", settings.crs, always_xy=True)
 _FROM_GRID = Transformer.from_crs(settings.crs, "EPSG:4326", always_xy=True)
 
 
 def point_centred_tile(lon: float, lat: float, period: str) -> dict[str, Any]:
-    """Create a 2.56 km EPSG:6933 square centred exactly on a clicked point.
-
-    The point is not snapped to the production grid. Bounds remain in metres
-    and produce the usual 256 x 256, 10 m affine export grid.
-    """
+    """Create a 2560 m point-centred tile aligned to the 10 m pixel grid."""
     x_center, y_center = _TO_GRID.transform(lon, lat)
+
+    # Snap centre to the 10 m pixel grid.
+    x_center = round(x_center / settings.scale) * settings.scale
+    y_center = round(y_center / settings.scale) * settings.scale
+
     half_size = settings.tile_size_m / 2
-    x_min, x_max = x_center - half_size, x_center + half_size
-    y_min, y_max = y_center - half_size, y_center + half_size
+
+    x_min = x_center - half_size
+    x_max = x_center + half_size
+    y_min = y_center - half_size
+    y_max = y_center + half_size
+
     corners = [
         _FROM_GRID.transform(x, y)
-        for x, y in ((x_min, y_min), (x_min, y_max), (x_max, y_min), (x_max, y_max))
+        for x, y in (
+            (x_min, y_min),
+            (x_min, y_max),
+            (x_max, y_max),
+            (x_max, y_min),
+        )
     ]
+
     lons, lats = zip(*corners)
+
     tile_id = f"inspect_{period}_{x_center:.3f}_{y_center:.3f}".replace(
         ".", "d"
     )
@@ -44,9 +55,6 @@ def point_centred_tile(lon: float, lat: float, period: str) -> dict[str, Any]:
         "min_lat": min(lats),
         "max_lon": max(lons),
         "max_lat": max(lats),
-        "biome": "Inspector tile",
-        "region": "Inspector tile",
-        "country": "Inspector tile",
     }
 
 

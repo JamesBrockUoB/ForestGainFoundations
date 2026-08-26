@@ -182,6 +182,7 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
         "period": tile.get("period"),
         "biome": tile.get("biome"),
         "region": tile.get("region"),
+        "country": tile.get("country"),
         "bounds": {
             "crs": "EPSG:6933",
             "x_min_m": tile["x_min_m"],

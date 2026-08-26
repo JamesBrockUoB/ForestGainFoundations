@@ -12,7 +12,7 @@ WDPA_SNAPSHOT_BY_PERIOD = {
 
 def _protected_area_mask(geom: ee.Geometry) -> ee.Image:
     snapshot = WDPA_SNAPSHOT_BY_PERIOD[settings.period]
-    fc = ee.FeatureCollection(f"WCMC/WDPA/{snapshot}/polygons")
+    fc = ee.FeatureCollection(f"WCMC/WDPA/{snapshot}/polygons").filterBounds(geom)
     return ee.Image().byte().paint(fc, 1).unmask(0).rename("protected_area")
 
 

@@ -85,9 +85,7 @@ class RegistryDB:
             # Indexes on tiles table
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON tiles(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_period ON tiles(period)")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_period_status ON tiles(period, status)"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_period_status_xi_yi ON tiles(period, status, xi, yi)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_biome ON tiles(biome)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_region ON tiles(region)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_country ON tiles(country)")
