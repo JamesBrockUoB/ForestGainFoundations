@@ -96,15 +96,19 @@ class Settings:
     # Allowed post-crossing reversions to non-forest in intermediate years
     # (never applies to year_end). See labels/gain.py.
 
-    # Coverage-check band subsets — a deliberately small, high-resolution
-    # proxy for "is there usable imagery here at all". NOT the full band
+    # Coverage-check band proxy for "is there usable imagery here at all". NOT the full band
     # set used for actual export
-    s2_check_bands: tuple[str, ...] = ("B2", "B4", "B8")
-    s1_check_bands: tuple[str, ...] = ("VV", "VH")
+    s2_check_band: str = "B2"
+    min_s1_observations: int = 5
 
     # Per-year, per-sensor minimum valid-pixel fraction, checked for every
     # calendar year in the active period
-    imagery_min_valid_frac: float = 0.7
+    imagery_min_valid_frac: float = 1
+
+    # Cloud Score+ cs_cdf threshold for S2 availability/export masking.
+    cloud_score_thresh: float = field(
+        default_factory=lambda: float(os.getenv("CLOUD_SCORE_THRESH", "0.6"))
+    )
 
     poll_interval: int = 30
     use_hpc: bool = field(default_factory=lambda: os.getenv("USE_HPC", "0") == "1")
@@ -112,7 +116,7 @@ class Settings:
 
     aee_source: str = field(default_factory=lambda: os.getenv("AEE_SOURCE", "gee"))
 
-    filter_batch_size: int = 25
+    filter_batch_size: int = 100
 
     def __post_init__(self) -> None:
         if self.period not in PERIOD_YEARS:

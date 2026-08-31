@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import ee
-
 from config import settings
 from embeddings.tasks import process_all_embeddings_with_retry
 from export.aee import submit_aee_exports

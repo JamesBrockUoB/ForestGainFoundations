@@ -6,12 +6,39 @@ from config import settings
 NATIVE_10M_BANDS = ["B2", "B3", "B4", "B8"]
 NATIVE_20M_BANDS = ["B5", "B6", "B7", "B8A", "B11", "B12"]
 
+CLOUD_SCORE_PLUS_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
+CLOUD_SCORE_PLUS_BAND = "cs_cdf"
 
-def _mask_s2_scl(img: ee.Image) -> ee.Image:
-    scl = img.select("SCL")
-    return img.updateMask(
-        scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10)).And(scl.neq(0))
+
+def hemisphere_from_tile(min_lat: float, max_lat: float) -> bool:
+    """True if the tile's centroid is in the northern hemisphere.
+
+    Only used for the leaf-on NDVI trend signal
+    """
+    return (min_lat + max_lat) / 2.0 >= 0
+
+
+def _join_cloud_score_plus(ic: ee.ImageCollection, geom, start: str, end: str) -> ee.ImageCollection:
+    """Join Cloud Score+ per-pixel quality onto an S2 SR collection by
+    system:index."""
+    cs_col = (
+        ee.ImageCollection(CLOUD_SCORE_PLUS_COLLECTION)
+        .filterDate(start, end)
+        .filterBounds(geom)
     )
+    return ee.ImageCollection(
+        ee.Join.saveFirst("cloud_score_plus").apply(
+            primary=ic,
+            secondary=cs_col,
+            condition=ee.Filter.equals(leftField="system:index", rightField="system:index"),
+        )
+    )
+
+
+def _mask_cloud_score_plus(img: ee.Image, threshold: float = settings.cloud_score_thresh) -> ee.Image:
+    """Mask using the joined Cloud Score+ cs_cdf band"""
+    cs = ee.Image(img.get("cloud_score_plus")).select(CLOUD_SCORE_PLUS_BAND)
+    return img.updateMask(cs.gte(threshold))
 
 
 def _add_ndvi(img: ee.Image) -> ee.Image:
@@ -22,61 +49,68 @@ def _date_range(year: int) -> tuple[str, str]:
     return f"{year}-01-01", f"{year+1}-01-01"
 
 
-def s2_availability(geom: ee.Geometry, year: int) -> ee.Image:
+def leaf_on_window(year: int, *, north: bool) -> tuple[str, str]:
+    """Leaf-on / peak-growing-season window — used only by
+    s2_peak_ndvi / s2_ndvi_trend."""
+    if north:
+        return f"{year}-05-01", f"{year}-09-30"
+    return f"{year}-11-01", f"{year + 1}-03-31"
+
+
+def s2_availability(geom, year: int) -> ee.Image:
     """
-    Coverage check only — uses settings.s2_check_bands (a small proxy
-    subset), NOT the full band list used for spectral analysis. See
-    s2_composite for the full-band version used in actual exports.
+    Full-year, Cloud Score+ masked coverage check
     """
     start, end = _date_range(year)
     ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
-        .map(_mask_s2_scl)
-        .select(list(settings.s2_check_bands))
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
     )
-    return ic.map(lambda i: i.mask().reduce(ee.Reducer.min())).reduce(ee.Reducer.max())
+    ic = _join_cloud_score_plus(ic, geom, start, end)
+    ic = ic.map(_mask_cloud_score_plus).select(settings.s2_check_band)
+    return ic.count().gt(0).unmask(0)
 
 
-def s1_availability(geom: ee.Geometry, year: int) -> ee.Image:
+def s1_observation_count(tile: ee.Feature, year: int) -> ee.Number:
     """
-    S1 counterpart to s2_availability — fraction-style valid-pixel presence
-    check using settings.s1_check_bands (VV, VH by default), IW mode only.
+    Acquisition-level S1 observation count for one tile.
     """
     start, end = _date_range(year)
     ic = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
         .filterDate(start, end)
-        .filterBounds(geom)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .select(list(settings.s1_check_bands))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+        .select(settings.s1_check_band)
     )
-    return ic.map(lambda i: i.mask().reduce(ee.Reducer.min())).reduce(ee.Reducer.max())
+    return ic.filterBounds(tile.geometry()).size()
 
 
-def s2_coverage_frac(geom: ee.Geometry, year: int) -> ee.Number:
-    """Fraction of pixels in geom with at least one valid S2 observation in `year`."""
-    valid = s2_availability(geom, year)
-    stats = valid.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=geom,
-        scale=settings.scale,
-        crs=settings.crs_wkt,
-        maxPixels=1_000_000_000,
-    )
-    return ee.Number(ee.Algorithms.If(stats.get("valid"), stats.get("valid"), 0))
+def s1_availability(tile: ee.Feature, year: int) -> ee.Number:
+    """
+    Acquisition-level S1 availability for one tile. 1 if the tile meets
+    settings.min_s1_observations, else 0.
+    """
+    return s1_observation_count(tile, year).gte(settings.min_s1_observations).int()
 
 
 def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
+    """Full-year median composite, Cloud Score+ masked."""
     start, end = _date_range(year)
 
-    s2 = (
+    ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
-        .map(_mask_s2_scl)
+    )
+    ic = _join_cloud_score_plus(ic, geom, start, end)
+
+    s2 = (
+        ic.map(_mask_cloud_score_plus)
         .select(NATIVE_10M_BANDS + NATIVE_20M_BANDS)
         .map(_upsample_20m_bands_to_10m)
     )
@@ -85,62 +119,43 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
 
 
 def _upsample_20m_bands_to_10m(img: ee.Image) -> ee.Image:
-    """B2/B3/B4/B8 are native 10m. B5/B6/B7/B8A/B11/B12 are native 20m --
-    bilinear-resample those before compositing so every band shares the
-    same pixel grid going into the median reducer, rather than mixing
-    resolutions and letting GEE nearest-neighbor it implicitly at export."""
     native_10m = img.select(NATIVE_10M_BANDS)
     native_20m = img.select(NATIVE_20M_BANDS).resample("bilinear")
-
     return native_10m.addBands(native_20m).copyProperties(img, img.propertyNames())
 
 
-def s2_peak_ndvi(geom: ee.Geometry, year: int) -> ee.Image:
-    centroid = ee.Geometry(geom).centroid(maxError=1)
-    north = ee.Number(centroid.coordinates().get(1)).gt(0)
+def s2_peak_ndvi(geom: ee.Geometry, year: int, *, north: bool) -> ee.Image:
+    """Leaf-on NDVI, Cloud Score+ masked — same masking as everything
+    else in this module, just on the tighter leaf-on window."""
+    start, end = leaf_on_window(year, north=north)
 
-    start = ee.String(
-        ee.Algorithms.If(
-            north,
-            f"{year}-05-01",
-            f"{year}-11-01",
-        )
-    )
-
-    end = ee.String(
-        ee.Algorithms.If(
-            north,
-            f"{year}-09-30",
-            f"{year + 1}-03-31",
-        )
-    )
-
-    return (
+    ic = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
-        .map(_mask_s2_scl)
+    )
+    ic = _join_cloud_score_plus(ic, geom, start, end)
+
+    return (
+        ic.map(_mask_cloud_score_plus)
         .map(_add_ndvi)
         .select(["NDVI"])
         .median()
     )
 
 
-def s2_ndvi_trend(geom: ee.Geometry, years: list[int]) -> ee.Image:
-    """Per-pixel NDVI slope across `years` using each year's peak-NDVI
-    composite. One linearFit reduction over a small collection — cheap,
-    same cost family as the old two-year delta."""
+def s2_ndvi_trend(geom: ee.Geometry, years: list[int], *, north: bool) -> ee.Image:
     imgs = []
     for year in years:
-        ndvi = s2_peak_ndvi(geom, year).rename("ndvi")
+        ndvi = s2_peak_ndvi(geom, year, north=north).rename("ndvi")
         yr = ee.Image.constant(year).toFloat().rename("year")
         imgs.append(ee.Image.cat([yr, ndvi]))
     fit = ee.ImageCollection(imgs).reduce(ee.Reducer.linearFit())
     return fit.select("scale").rename("ndvi_trend")
 
 
-def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
+def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:
     def _mask_edge(img):
         edge = img.lt(-30.0)
         return img.updateMask(img.mask().And(edge.Not()))
@@ -156,12 +171,11 @@ def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:  # noqa: ARG001
         .map(_mask_edge)
         .median()
     )
-    return med.addBands(med.select("VV").divide(med.select("VH")).rename("VVVH"))
+    return med.addBands(med.select("VV").subtract(med.select("VH")).rename("VVVH"))
 
 
 def build_year_composite(geom: ee.Geometry, year: int) -> ee.Image:
-    """Combined S1+S2 composite for a single year — exported as its own
-    per-year file (composites/s1s2_<year>.tif)."""
+    """Combined S1+S2 composite for a single year."""
     return s2_composite(geom, year).addBands(s1_composite(geom, year))
 
 
@@ -171,10 +185,7 @@ def submit_composite_exports(
     full_valid: ee.Image,
     tile_id: str,
 ) -> dict[str, ee.batch.Task]:
-    """
-    Submit one export task per year in settings.period_years. Returns a
-    dict keyed "composites/s1s2_<year>" -> started ee.batch.Task.
-    """
+    """Submit one export task per year in settings.period_years."""
     tasks: dict[str, ee.batch.Task] = {}
 
     for year in settings.period_years:

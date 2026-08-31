@@ -27,7 +27,9 @@ def iter_pending_tile_batches(
                         x_min_m,
                         y_min_m,
                         x_max_m,
-                        y_max_m
+                        y_max_m,
+                        min_lat,
+                        max_lat
                     FROM tiles
                     WHERE status = ? AND period = ?
                     ORDER BY xi, yi
@@ -45,7 +47,9 @@ def iter_pending_tile_batches(
                         x_min_m,
                         y_min_m,
                         x_max_m,
-                        y_max_m
+                        y_max_m,
+                        min_lat,
+                        max_lat
                     FROM tiles
                     WHERE status = ? AND period = ?
                       AND (xi > ? OR (xi = ? AND yi > ?))
@@ -74,6 +78,8 @@ def iter_pending_tile_batches(
                     "y_min_m": r["y_min_m"],
                     "x_max_m": r["x_max_m"],
                     "y_max_m": r["y_max_m"],
+                    "min_lat": r["min_lat"],
+                    "max_lat": r["max_lat"],
                 }
                 for r in rows
             ]

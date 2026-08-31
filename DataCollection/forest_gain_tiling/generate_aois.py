@@ -13,6 +13,7 @@ Environment
   BATCH_SIZE=50       — AOIs per processing batch
   AOI_STEP=0.25       — AOI grid size in degrees
   SEARCH_MODE=asset    — derive search bounds from DT assets
+  CLOUD_SCORE_THRESH=0.6 — Cloud Score+ cs_cdf threshold for S2 masking
 
 Usage
 -----
@@ -27,7 +28,8 @@ Validity checks
 ---------------
   • Land coverage
   • ≥1% Dynamic World vegetation
-  • ≥5% usable S1 and S2 coverage for every year in the period
+  • S2: pixel coverage (Cloud Score+ masked, full year) ≥ MIN_IMAGERY_FRACTION
+  • S1: ≥ settings.min_s1_observations qualifying acquisitions, every year
   • ≥0.1% forest gain between the period's start and end year
 
 Output fields include
@@ -86,20 +88,19 @@ SEARCH_MODE = os.getenv("SEARCH_MODE", "asset")
 MIN_VEG_FRACTION = 0.01
 MIN_LAND_FRACTION = 0.01
 MIN_GAIN_FRACTION = 0.001
+
 MIN_IMAGERY_FRACTION = 0.05
 
-# Coverage-check band subsets. NOT for spectral analysis — these are a
-# deliberately small, high-resolution proxy for "is there usable imagery
-# here at all", not the full band set consumed by any downstream analysis.
-S2_BANDS = [
-    "B2",
-    "B4",
-    "B8",
-]  # blue + red + NIR, 10m — strong proxy for full-scene coverage
-S1_BANDS = ["VV", "VH"]
+S2_BANDS = [settings.s2_check_band]
 
 DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
 DW_VEGETATED_LABELS = [1, 2, 3, 4, 5]  # trees, grass, flooded_veg, crops, shrub/scrub
+
+# Cloud Score+ — cs_cdf is the calibrated variant Google recommends thresholding against;
+# 0.6 is a starting default
+CLOUD_SCORE_PLUS_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
+CLOUD_SCORE_PLUS_BAND = "cs_cdf"
+CLOUD_SCORE_THRESH = float(os.getenv("CLOUD_SCORE_THRESH", "0.6"))
 
 AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / f"aois/all_aois_{PERIOD}.json"
 
@@ -286,34 +287,46 @@ def atomic_json_write(path, obj, indent=None):
     tmp.replace(path)
 
 
-def mask_s2_scl(img):
-    scl = img.select("SCL")
-    mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10)).And(scl.neq(0))
-    return img.updateMask(mask)
+def _join_cloud_score_plus(ic, geom, start, end):
+    """Join Cloud Score+ per-pixel quality onto an S2 SR collection by
+    system:index."""
+    cs_col = (
+        ee.ImageCollection(CLOUD_SCORE_PLUS_COLLECTION)
+        .filterDate(start, end)
+        .filterBounds(geom)
+    )
+    return ee.ImageCollection(
+        ee.Join.saveFirst("cloud_score_plus").apply(
+            primary=ic,
+            secondary=cs_col,
+            condition=ee.Filter.equals(
+                leftField="system:index", rightField="system:index"
+            ),
+        )
+    )
 
 
-def _year_valid_mask(collection_id, geom, start, end, bands, mask_fn=None):
+def mask_s2_cloud_score_plus(img):
+    """Requires img to have been through _join_cloud_score_plus first."""
+    cs = ee.Image(img.get("cloud_score_plus")).select(CLOUD_SCORE_PLUS_BAND)
+    return img.updateMask(cs.gte(CLOUD_SCORE_THRESH))
+
+
+def _s2_year_valid_mask(geom, start, end, bands):
     """
-    Per-pixel indicator of whether geom is covered by at least one fully
-    unmasked image in collection_id within [start, end), for the given
+    Per-pixel indicator of whether geom is covered by at least one
+    Cloud Score+ unmasked S2 image within [start, end), for the given
     bands. Returns the image UNREDUCED so it can be built once (over a
-    shared batch-wide geometry) and reduceRegion'd separately per feature,
-    instead of being rebuilt from scratch for every single feature.
+    shared batch-wide geometry) and reduceRegion'd separately per
+    feature, instead of being rebuilt from scratch for every feature.
     """
-    col = ee.ImageCollection(collection_id).filterDate(start, end).filterBounds(geom)
-
-    if "S1_GRD" in collection_id:
-        col = col.filter(
-            ee.Filter.listContains("transmitterReceiverPolarisation", "VV")
-        )
-        col = col.filter(
-            ee.Filter.listContains("transmitterReceiverPolarisation", "VH")
-        )
-
-    if mask_fn is not None:
-        col = col.map(mask_fn)
-
-    col = col.select(bands)
+    col = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterDate(start, end)
+        .filterBounds(geom)
+    )
+    col = _join_cloud_score_plus(col, geom, start, end)
+    col = col.map(mask_s2_cloud_score_plus).select(bands)
 
     def valid_mask(img):
         return img.mask().reduce(ee.Reducer.min()).rename("valid")
@@ -329,23 +342,50 @@ def _year_valid_mask(collection_id, geom, start, end, bands, mask_fn=None):
 
 def build_year_sensor_masks(batch_geom, year_start=YEAR_START, year_end=YEAR_END):
     """
-    Build every year/sensor's valid-pixel mask ONCE, filtered against the
+    Build every year's S2 valid-pixel mask ONCE, filtered against the
     combined footprint of an entire batch, rather than once per AOI
-    feature.
+    feature. S1 is checked separately via acquisition count, not a
+    pixel-level mask — see s1_scene_counts_for_batch.
     """
     masks = {}
 
     for year in range(year_start, year_end + 1):
         start, end = f"{year}-01-01", f"{year + 1}-01-01"
-
-        masks[("s2", year)] = _year_valid_mask(
-            "COPERNICUS/S2_SR_HARMONIZED", batch_geom, start, end, S2_BANDS, mask_s2_scl
-        )
-        masks[("s1", year)] = _year_valid_mask(
-            "COPERNICUS/S1_GRD", batch_geom, start, end, S1_BANDS
-        )
+        masks[("s2", year)] = _s2_year_valid_mask(batch_geom, start, end, S2_BANDS)
 
     return masks
+
+
+def s1_scene_counts_for_batch(fc: ee.FeatureCollection, year: int) -> dict[str, int]:
+    """
+    Acquisition-level S1 scene count per AOI feature, for one year. Same
+    qualifying filters as composites.s1_observation_count (IW mode, dual
+    VV/VH polarisation), batched across the whole FeatureCollection in a
+    single getInfo() call rather than one call per AOI.
+    """
+    start, end = f"{year}-01-01", f"{year + 1}-01-01"
+
+    col = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterDate(start, end)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+    )
+
+    def _count_for_feature(f):
+        n = col.filterBounds(f.geometry()).size()
+        return f.set("s1_count", n)
+
+    fc_counted = fc.map(_count_for_feature)
+    info = _reduce_regions_getinfo_with_retry(fc_counted)
+
+    out = {}
+    for f in info.get("features", []):
+        props = f.get("properties", {})
+        aid = props.get("id") or f.get("id")
+        out[aid] = int(props.get("s1_count", 0) or 0)
+    return out
 
 
 def _reduce_regions_getinfo_with_retry(fc_obj, attempts=6, backoff_base=2.0):
@@ -368,44 +408,6 @@ def _reduce_regions_getinfo_with_retry(fc_obj, attempts=6, backoff_base=2.0):
             )
             time.sleep(wait)
     raise RuntimeError(f"Exceeded retries for getInfo(): last error: {last_err}")
-
-
-def has_usable_imagery(geom, masks, min_frac=MIN_IMAGERY_FRACTION, scale=500):
-    """
-    Returns a server-side boolean (ComputedObject) that is true iff every
-    image in `masks` has mean(valid) >= min_frac over `geom`.
-    `masks` is the dict returned by build_year_sensor_masks(batch_geom).
-    """
-    # Empty masks -> false (constructed as an ee expression)
-    if not masks:
-        return ee.Number(0).gt(1)  # always false, returns a server-side boolean
-
-    # Convert masks.values() to a Python list of ee.Image objects
-    imgs = list(masks.values())
-
-    # Compute first fraction
-    first_img = imgs[0]
-    first_frac = safe_num(
-        first_img.reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
-        ).get("valid"),
-        0,
-    )
-
-    # Compute minimum across the rest using server-side Ifs to keep everything lazy
-    min_frac_num = ee.Number(first_frac)
-    for img in imgs[1:]:
-        f = safe_num(
-            img.reduceRegion(
-                reducer=ee.Reducer.mean(), geometry=geom, scale=scale, maxPixels=1e9
-            ).get("valid"),
-            0,
-        )
-        # min_frac_num = min(min_frac_num, f)
-        min_frac_num = ee.Number(ee.Algorithms.If(f.lt(min_frac_num), f, min_frac_num))
-
-    # Return a server-side boolean: is min_frac_num >= min_frac?
-    return min_frac_num.gte(min_frac)
 
 
 def forest_gain_fraction_dt(_gain_mask, geom, scale=100):
@@ -583,7 +585,14 @@ def process_batch(
         for fut in as_completed(futures):
             key, per_feat = fut.result()
             mask_results[key] = per_feat
-    logger.info(f"  [timing] imagery masks: {time.time() - t0:.1f}s")
+    logger.info(f"  [timing] s2 imagery masks: {time.time() - t0:.1f}s")
+
+    t0 = time.time()
+    s1_counts_by_year = {
+        year: s1_scene_counts_for_batch(fc, year)
+        for year in range(YEAR_START, YEAR_END + 1)
+    }
+    logger.info(f"  [timing] s1 scene counts: {time.time() - t0:.1f}s")
 
     t0 = time.time()
     lv_rr = _land_veg.reduceRegions(
@@ -751,12 +760,19 @@ def process_batch(
         fg = gain_map.get(aid, 0.0)
         has_gain = fg >= MIN_GAIN_FRACTION
 
-        worst = 1.0
+        worst_s2 = 1.0
         for (sensor, year), per in mask_results.items():
             v = per.get(aid, 0.0)
-            if v < worst:
-                worst = v
-        has_img = worst >= MIN_IMAGERY_FRACTION
+            if v < worst_s2:
+                worst_s2 = v
+        has_s2_img = worst_s2 >= MIN_IMAGERY_FRACTION
+
+        has_s1_img = all(
+            s1_counts_by_year[year].get(aid, 0) >= settings.min_s1_observations
+            for year in range(YEAR_START, YEAR_END + 1)
+        )
+
+        has_img = has_s2_img and has_s1_img
 
         biome = eco_map.get(
             aid, {"biome_name": "Unknown", "biome_num": -1, "realm": "Unknown"}
