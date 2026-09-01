@@ -155,9 +155,8 @@ def process_tile(
         # no dependency on GEE task state -- start it now so it overlaps
         # the entire _wait_for_all polling window below, not just the
         # rclone step after. process_all_embeddings_with_retry already
-        # skips the geoai-AEE download when aee_source=="gee" (that AEE
-        # went into `tasks` above instead), so this is always safe to
-        # start unconditionally here regardless of aee_source.
+        # skips the geoai-AEE download when aee_source=="gee", so this is always safe to
+        # start unconditionally regardless of aee_source.
         embeddings_result: dict[str, bool] = {}
 
         def _run_embeddings() -> None:

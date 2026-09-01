@@ -288,27 +288,23 @@ def atomic_json_write(path, obj, indent=None):
 
 
 def _join_cloud_score_plus(ic, geom, start, end):
-    """Join Cloud Score+ per-pixel quality onto an S2 SR collection by
-    system:index."""
+    """Link Cloud Score+ QA band onto each S2 image via
+    ImageCollection.linkCollection — Google's recommended pattern for
+    this dataset. The linked band is attached directly as a band on
+    each image, matched by system:index, rather than nested behind a
+    property lookup (the older Join.saveFirst pattern this replaces)."""
     cs_col = (
         ee.ImageCollection(CLOUD_SCORE_PLUS_COLLECTION)
         .filterDate(start, end)
         .filterBounds(geom)
     )
-    return ee.ImageCollection(
-        ee.Join.saveFirst("cloud_score_plus").apply(
-            primary=ic,
-            secondary=cs_col,
-            condition=ee.Filter.equals(
-                leftField="system:index", rightField="system:index"
-            ),
-        )
-    )
+    return ic.linkCollection(cs_col, [CLOUD_SCORE_PLUS_BAND])
 
 
 def mask_s2_cloud_score_plus(img):
-    """Requires img to have been through _join_cloud_score_plus first."""
-    cs = ee.Image(img.get("cloud_score_plus")).select(CLOUD_SCORE_PLUS_BAND)
+    """Mask using the linked Cloud Score+ cs_cdf band — a plain band on
+    img after linkCollection, no unwrapping needed."""
+    cs = img.select(CLOUD_SCORE_PLUS_BAND)
     return img.updateMask(cs.gte(CLOUD_SCORE_THRESH))
 
 
@@ -316,44 +312,44 @@ def _s2_year_valid_mask(geom, start, end, bands):
     """
     Per-pixel indicator of whether geom is covered by at least one
     Cloud Score+ unmasked S2 image within [start, end), for the given
-    bands. Returns the image UNREDUCED so it can be built once (over a
-    shared batch-wide geometry) and reduceRegion'd separately per
-    feature, instead of being rebuilt from scratch for every feature.
+    bands. Uses ImageCollection.count() (a native collection-level
+    reducer) rather than a per-image map+max reduction, and applies the
+    CLOUDY_PIXEL_PERCENTAGE scene-level prefilter before the Cloud
+    Score+ link so near-fully-cloudy scenes are dropped before the
+    per-pixel work runs at all.
     """
     col = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(start, end)
         .filterBounds(geom)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
     )
     col = _join_cloud_score_plus(col, geom, start, end)
     col = col.map(mask_s2_cloud_score_plus).select(bands)
 
-    def valid_mask(img):
-        return img.mask().reduce(ee.Reducer.min()).rename("valid")
-
-    valid = col.map(valid_mask).max()
-
-    return ee.Image(
-        ee.Algorithms.If(
-            valid.bandNames().size().gt(0), valid, ee.Image(0).rename("valid")
-        )
-    )
+    counts = col.select(bands[0]).count()
+    return counts.gt(0).unmask(0).rename("valid")
 
 
-def build_year_sensor_masks(batch_geom, year_start=YEAR_START, year_end=YEAR_END):
+def build_year_sensor_masks_combined(batch_geom, year_start=YEAR_START, year_end=YEAR_END):
     """
-    Build every year's S2 valid-pixel mask ONCE, filtered against the
-    combined footprint of an entire batch, rather than once per AOI
-    feature. S1 is checked separately via acquisition count, not a
-    pixel-level mask — see s1_scene_counts_for_batch.
+    Combined multi-band S2 coverage image: one band per year
+    (s2_<year>), each built once against the batch-wide geometry. Bands
+    are reduced together in a single reduceRegions call downstream
+    instead of one call per year — trades N separate EE round-trips
+    (each paying its own queueing/compute overhead) for one larger call,
+    which wins when per-call overhead dominates rather than per-call
+    pixel volume (AOI-scale geometries at scale=500 are light enough
+    that this is the right tradeoff; see raster_stats.py's tile-export
+    pipeline for the opposite case, where pixel volume dominates and
+    splitting by year is the correct call instead).
     """
-    masks = {}
-
+    bands = []
     for year in range(year_start, year_end + 1):
         start, end = f"{year}-01-01", f"{year + 1}-01-01"
-        masks[("s2", year)] = _s2_year_valid_mask(batch_geom, start, end, S2_BANDS)
-
-    return masks
+        mask = _s2_year_valid_mask(batch_geom, start, end, S2_BANDS)
+        bands.append(mask.rename(f"s2_{year}"))
+    return ee.Image.cat(bands)
 
 
 def s1_scene_counts_for_batch(fc: ee.FeatureCollection, year: int) -> dict[str, int]:
@@ -563,28 +559,23 @@ def process_batch(
     batch_geom = fc.geometry().bounds(maxError=1)
 
     t0 = time.time()
-    masks = build_year_sensor_masks(batch_geom)
 
-    def _fetch_mask(key_img):
-        (sensor, year), img = key_img
-        rr = img.reduceRegions(collection=fc, reducer=ee.Reducer.mean(), scale=500)
-        info = _reduce_regions_getinfo_with_retry(rr)
-        per_feat = {}
-        for f in info.get("features", []):
-            props = f.get("properties", {})
-            key = props.get("id") or f.get("id")
-            val = props.get("valid")
-            if val is None:
-                val = props.get("mean")
-            per_feat[key] = float(val or 0.0)
-        return (sensor, year), per_feat
+    year_names = [f"s2_{y}" for y in range(YEAR_START, YEAR_END + 1)]
 
-    mask_results = {}
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_fetch_mask, item): item[0] for item in masks.items()}
-        for fut in as_completed(futures):
-            key, per_feat = fut.result()
-            mask_results[key] = per_feat
+    combined_s2 = build_year_sensor_masks_combined(batch_geom)
+    s2_rr = combined_s2.reduceRegions(
+        collection=fc, reducer=ee.Reducer.mean(), scale=500, tileScale=4
+    )
+    s2_info = _reduce_regions_getinfo_with_retry(s2_rr)
+
+    mask_results = {("s2", y): {} for y in range(YEAR_START, YEAR_END + 1)}
+    for f in s2_info.get("features", []):
+        props = f.get("properties", {})
+        aid = props.get("id") or f.get("id")
+        for y, band in zip(range(YEAR_START, YEAR_END + 1), year_names):
+            val = props.get(band)
+            mask_results[("s2", y)][aid] = float(val or 0.0)
+
     logger.info(f"  [timing] s2 imagery masks: {time.time() - t0:.1f}s")
 
     t0 = time.time()

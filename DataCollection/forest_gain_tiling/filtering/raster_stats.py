@@ -143,8 +143,12 @@ def fetch_cheap_stats(
 
 def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
     """
-    S2: full-year, Cloud Score+ masked pixel-level availability
-    S1: acquisition-level availability per tile/year
+    S2: full-year, Cloud Score+ masked pixel-level availability — one
+        reduceRegions call for all tiles.
+    S1: acquisition-level availability via composites.s1_availability,
+        mapped server-side over the tile FeatureCollection and fetched
+        with one getInfo() per year — instead of one getInfo() per
+        tile per year.
     """
     fc = tiles_to_feature_collection(tiles)
 
@@ -152,23 +156,34 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
         s2_availability(fc, year).rename(f"s2_{year}")
         for year in settings.period_years
     ]
+
     stats = ee.Image.cat(bands)
 
-    out = _reduce_tiles(stats, tiles, S2_BAND_NAMES, tile_scale=8)
-    for t in tiles:
-        out.setdefault(t["tile_id"], {})
+    out = _reduce_tiles(
+        stats,
+        tiles,
+        S2_BAND_NAMES,
+        tile_scale=8,
+    )
 
-    for tile in tiles:
-        tile_id = tile["tile_id"]
-        tile_geom = ee.Geometry.Rectangle(
-            [tile["x_min_m"], tile["y_min_m"], tile["x_max_m"], tile["y_max_m"]],
-            proj=ee.Projection(settings.crs_wkt),
-            geodesic=False,
-        )
-        tile_feature = ee.Feature(tile_geom, {"tile_id": tile_id})
+    def add_s1_stats(feature):
+        for year in settings.period_years:
+            feature = feature.set(
+                f"s1_{year}",
+                s1_availability(feature, year),
+            )
+        return feature
+
+    s1_info = fc.map(add_s1_stats).getInfo()
+
+    for feature in s1_info["features"]:
+        props = feature["properties"]
+        tile_id = props["tile_id"]
+
+        out.setdefault(tile_id, {})
 
         for year in settings.period_years:
-            available = s1_availability(tile_feature, year)
-            out[tile_id][f"s1_{year}"] = available.getInfo()
+            out[tile_id][f"s1_{year}"] = props.get(f"s1_{year}")
 
     return out
+

@@ -99,6 +99,7 @@ class Settings:
     # Coverage-check band proxy for "is there usable imagery here at all". NOT the full band
     # set used for actual export
     s2_check_band: str = "B2"
+    s1_check_band: str = "VV"
     min_s1_observations: int = 5
 
     # Per-year, per-sensor minimum valid-pixel fraction, checked for every

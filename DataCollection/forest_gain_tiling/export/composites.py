@@ -19,25 +19,23 @@ def hemisphere_from_tile(min_lat: float, max_lat: float) -> bool:
 
 
 def _join_cloud_score_plus(ic: ee.ImageCollection, geom, start: str, end: str) -> ee.ImageCollection:
-    """Join Cloud Score+ per-pixel quality onto an S2 SR collection by
-    system:index."""
+    """Link Cloud Score+ QA band onto each S2 image via
+    ImageCollection.linkCollection — Google's recommended pattern for
+    this dataset. The linked band is attached directly as a band on
+    each image, matched by system:index, rather than nested behind a
+    property lookup (the older Join.saveFirst pattern this replaces)."""
     cs_col = (
         ee.ImageCollection(CLOUD_SCORE_PLUS_COLLECTION)
         .filterDate(start, end)
         .filterBounds(geom)
     )
-    return ee.ImageCollection(
-        ee.Join.saveFirst("cloud_score_plus").apply(
-            primary=ic,
-            secondary=cs_col,
-            condition=ee.Filter.equals(leftField="system:index", rightField="system:index"),
-        )
-    )
+    return ic.linkCollection(cs_col, [CLOUD_SCORE_PLUS_BAND])
 
 
 def _mask_cloud_score_plus(img: ee.Image, threshold: float = settings.cloud_score_thresh) -> ee.Image:
-    """Mask using the joined Cloud Score+ cs_cdf band"""
-    cs = ee.Image(img.get("cloud_score_plus")).select(CLOUD_SCORE_PLUS_BAND)
+    """Mask using the linked Cloud Score+ cs_cdf band — a plain band on
+    img after linkCollection, no unwrapping needed."""
+    cs = img.select(CLOUD_SCORE_PLUS_BAND)
     return img.updateMask(cs.gte(threshold))
 
 
@@ -211,3 +209,4 @@ def submit_composite_exports(
         tasks[key] = task
 
     return tasks
+    
