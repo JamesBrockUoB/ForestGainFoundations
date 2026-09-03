@@ -100,17 +100,24 @@ class GainTileDataset(Dataset):
         with rasterio.open(tile_dir / "labels" / "gain_confidence.tif") as src:
             gain_conf = src.read(1).astype(np.float32)
         gain_valid = ~np.isnan(gain_conf)
+        # Map the 50..100 confidence range to 0..1 for soft targets.
         gain_weight = np.clip(
             (np.nan_to_num(gain_conf, nan=50.0) - 50.0) / 50.0, 0.0, 1.0
         )
+        # gain_mask keeps previous semantic (valid pixel presence) as float32 0/1
         gain_mask = gain_valid.astype(np.float32)
 
         class_dist, cls_weight = self._read_typology(tile_dir, gain_valid)
 
         return {
             "pixels": pixels,
-            "gain_mask": torch.from_numpy(gain_mask),
+            # soft target probability in [0,1]
+            "gain_target": torch.from_numpy(gain_weight),
+            # keep legacy name for backward compatibility
             "gain_weight": torch.from_numpy(gain_weight),
+            # 1.0 for valid pixels, 0.0 for nodata
+            "gain_mask": torch.from_numpy(gain_mask),
+            # value 1.0 where gain was valid, 0.0 otherwise (float32 preserved)
             "gain_valid": torch.from_numpy(gain_valid.astype(np.float32)),
             "class_dist": torch.from_numpy(class_dist),
             "cls_weight": torch.tensor(cls_weight, dtype=torch.float32),

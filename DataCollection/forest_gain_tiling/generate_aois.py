@@ -494,7 +494,7 @@ def generate_aois(
         end = min((i + 1) * batch_size, total)
         batch = cells[start:end]
 
-        logger.info(f"[AOI] processing batch {i+1}/{batches} ({start}-{end})")
+        logger.info(f"[AOI] processing batch {i + 1}/{batches} ({start}-{end})")
 
         features = [
             ee.Feature(

@@ -92,6 +92,6 @@
       - DRIVE_AUTH_CREDENTIALS - Your Earth Engine credentials for GDrive authorisations
       - SEARCH_MODE - `asset` for limiting search area to geographic extent of deadtrees.earth product, or `global` for the whole world
       - PERIOD - The time period for collecting and processing imagery for. `p1` for 2017-2020, or `p2` for 2020-2024. Note that there are no pseudo-labels for forest typology for `p2`
-      - AEE_SOURCE - Data source for downloading AEE embeddings - either `gee` or `geoai`. GEE is faster but uses compute quota, whereas the GeoAI library is quota-free but slower
+      - AEE_SOURCE - Data source for downloading AEE embeddings - either `gee` or `geoai`.
 
     </details>

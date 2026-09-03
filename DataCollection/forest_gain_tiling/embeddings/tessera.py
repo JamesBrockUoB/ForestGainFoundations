@@ -100,48 +100,71 @@ def _fetch_and_align_year(
 
 
 def download_tessera(tile: dict, embeddings_dir: Path, logger: logging.Logger) -> None:
+    """
+    Fetch tessera embeddings for all years required for this period.
+    Launch one subprocess per missing year and wait for them concurrently.
+    Each subprocess is bounded by the unchanged _YEAR_TIMEOUT_S and will
+    be forcibly terminated if it exceeds that timeout.
+    """
     bbox = tile_bbox(tile)
 
+    # Determine missing years
+    years_to_fetch: list[tuple[int, Path]] = []
     for year in settings.period_years:
         dest = embeddings_dir / f"tessera_{year}.tif"
-        if dest.exists():
-            continue
+        if not dest.exists():
+            years_to_fetch.append((year, dest))
 
-        raw_dir = tempfile.mkdtemp(prefix="tessera_raw_")
-        try:
+    if not years_to_fetch:
+        return
+
+    procs: list[tuple[mp.Process, str, int, Path]] = []
+    try:
+        for year, dest in years_to_fetch:
+            raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
             proc = mp.Process(
                 target=_fetch_and_align_year,
                 args=(raw_dir, bbox, year, str(dest), tile),
             )
             proc.start()
+            procs.append((proc, raw_dir, year, dest))
+
+        # Wait for each process with the same per-process timeout semantics
+        for proc, raw_dir, year, dest in procs:
             proc.join(timeout=_YEAR_TIMEOUT_S)
 
             if proc.is_alive():
-                # Actually stops the work, unlike ThreadPoolExecutor --
-                # this reclaims the process's memory immediately at the
-                # OS level, regardless of what it was doing internally.
                 proc.terminate()
                 proc.join(timeout=10)
                 if proc.is_alive():
                     proc.kill()
                     proc.join()
+                # Clean up raw dirs and raise an error to indicate the timeout
+                for _p, rd, _y, _d in procs:
+                    shutil.rmtree(rd, ignore_errors=True)
                 raise RuntimeError(
                     f"TESSERA {year}: fetch exceeded {_YEAR_TIMEOUT_S}s "
                     f"timeout for bbox={bbox} -- subprocess terminated"
                 )
 
             if proc.exitcode != 0:
+                for _p, rd, _y, _d in procs:
+                    shutil.rmtree(rd, ignore_errors=True)
                 raise RuntimeError(
                     f"TESSERA {year}: subprocess failed (exitcode={proc.exitcode})"
                 )
 
             if not dest.exists():
+                for _p, rd, _y, _d in procs:
+                    shutil.rmtree(rd, ignore_errors=True)
                 raise RuntimeError(
                     f"TESSERA {year}: subprocess exited cleanly but {dest} "
                     f"was not written"
                 )
-        finally:
-            shutil.rmtree(raw_dir, ignore_errors=True)
+
+    finally:
+        for _p, rd, _y, _d in procs:
+            shutil.rmtree(rd, ignore_errors=True)
 
 
 def download_embeddings(tile: dict, output_dir: Path, logger: logging.Logger) -> None:

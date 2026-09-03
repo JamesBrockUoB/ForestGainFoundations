@@ -494,8 +494,6 @@ def display_climate(metadata: dict) -> None:
         {
             "Year": int(year),
             "Precipitation": _round2(climate[year].get("precip_sum")),
-            "Precip min": _round2(climate[year].get("precip_min")),
-            "Precip max": _round2(climate[year].get("precip_max")),
             "Mean temperature": _round2(climate[year].get("temp_mean")),
             "Temp min": _round2(climate[year].get("temp_min")),
             "Temp max": _round2(climate[year].get("temp_max")),
@@ -511,9 +509,8 @@ def render_tile_metadata(metadata: dict) -> None:
     bounds = metadata.get("bounds", {})
     soil = metadata.get("soil", {})
     pseudo = metadata.get("pseudo_labels", {})
-    slope_metadata = metadata.get("slope_deg", {})
 
-    overview_cols = st.columns(4)
+    overview_cols = st.columns(3)
 
     with overview_cols[0]:
         gain_pct = metadata.get("gain_pct")
@@ -536,12 +533,6 @@ def render_tile_metadata(metadata: dict) -> None:
         labelled_fraction = pseudo.get("labelled_gain_pixel_fraction")
         labelled_pct = labelled_fraction * 100 if labelled_fraction is not None else None
         st.write(f"Labelled gain: {_fmt(labelled_pct, suffix='%')}")
-
-    with overview_cols[3]:
-        st.write("**Slope**")
-        st.write(f"Mean: {_fmt(slope_metadata.get('mean'), suffix='°')}")
-        st.write(f"P90: {_fmt(slope_metadata.get('p90'), suffix='°')}")
-        st.write(f"Exported: {metadata.get('exported_at', '—')}")
 
     st.write("**Bounds**")
     bounds_cols = st.columns(4)

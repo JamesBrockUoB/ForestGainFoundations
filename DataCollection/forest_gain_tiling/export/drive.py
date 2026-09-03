@@ -1,9 +1,28 @@
-from __future__ import annotations
-
 import logging
+import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import settings
+
+
+def _build_rclone_base_args() -> list[str]:
+    """
+    Build a tuned base rclone argument list, reading defaults from settings
+    if present. Individual rclone products will append source and dest paths.
+    """
+    transfers = getattr(settings, "rclone_transfers", 8)
+    checkers = getattr(settings, "rclone_checkers", 8)
+    fast_list = getattr(settings, "rclone_fast_list", True)
+
+    args = ["rclone", "moveto", "--drive-use-trash=false"]
+    if fast_list:
+        args.append("--fast-list")
+    args += [f"--transfers={transfers}", f"--checkers={checkers}"]
+    drive_chunk = getattr(settings, "rclone_drive_chunk_size", None)
+    if drive_chunk:
+        args.append(f"--drive-chunk-size={drive_chunk}")
+    return args
 
 
 def rclone_product(
@@ -24,17 +43,12 @@ def rclone_product(
     drive_name = f"{tile_id}__{category}__{name}.tif"
     dest_path = f"{dest_root}/{tile_id}/{category}/{name}.tif"
 
-    result = subprocess.run(
-        [
-            "rclone",
-            "moveto",
-            "--drive-use-trash=false",
-            f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}",
-            dest_path,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    cmd = _build_rclone_base_args() + [
+        f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}",
+        dest_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
         logger.warning(
@@ -51,12 +65,43 @@ def rclone_all_products(
     products: list[tuple[str, str]],
     dest_root: str,
     logger: logging.Logger,
+    max_workers: int | None = None,
 ) -> bool:
-    """Stops at the first failure — one missing file already means the
-    tile can't be marked complete."""
-    for category, name in products:
-        if not rclone_product(tile_id, category, name, dest_root, logger):
+    """Run rclone moves in parallel across products for a single tile.
+    Stops at the first failure — one missing file already means the
+    tile can't be marked complete.
+    """
+    if not products:
+        return True
+
+    cpu_count = os.cpu_count() or 4
+    default_workers = min(len(products), max(2, cpu_count * 2))
+    max_workers = max_workers or default_workers
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(rclone_product, tile_id, category, name, dest_root, logger): (category, name)
+            for category, name in products
+        }
+
+        try:
+            for fut in as_completed(futures):
+                ok = fut.result()
+                if not ok:
+                    # cancel outstanding tasks and return False
+                    for pending in futures:
+                        if not pending.done():
+                            pending.cancel()
+                    failed = futures[fut]
+                    logger.warning(f"{tile_id} | rclone failed for {failed}; aborting tile rclone")
+                    return False
+        except Exception as exc:
+            for pending in futures:
+                if not pending.done():
+                    pending.cancel()
+            logger.warning(f"{tile_id} | rclone encountered an exception: {exc}")
             return False
+
     return True
 
 

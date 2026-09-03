@@ -16,8 +16,6 @@ from tiling.grid import tile_geom
 SOIL_BANDS = ["soc", "clay_pct", "ph"]
 ERA5_YEARLY_BANDS = [
     "precip_sum",
-    "precip_min",
-    "precip_max",
     "temp_mean",
     "temp_min",
     "temp_max",
@@ -70,8 +68,7 @@ def _fetch_soil(geom: ee.Geometry) -> dict[str, float | None]:
 def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
     """
     One year of ERA5-Land Monthly Aggregated stats -- precipitation and
-    2m air temperature, each as mean/min/max across the year's 12
-    monthly values.
+    2m air temperature. All values are aggregated to a single tile-level scalar
 
     ERA5-Land masks ocean at its own (~9km) native landmask resolution --
     a coastal tile can be unambiguously on land at Sentinel-2 resolution
@@ -90,8 +87,6 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
         .select(
             [
                 "total_precipitation_sum",
-                "total_precipitation_min",
-                "total_precipitation_max",
                 "temperature_2m",
                 "temperature_2m_min",
                 "temperature_2m_max",
@@ -106,16 +101,6 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
             .max(0)
             .multiply(1000)
             .rename("precip_sum"),
-            ic.select("total_precipitation_min")
-            .min()
-            .max(0)
-            .multiply(1000)
-            .rename("precip_min"),
-            ic.select("total_precipitation_max")
-            .max()
-            .max(0)
-            .multiply(1000)
-            .rename("precip_max"),
             ic.select("temperature_2m").mean().subtract(273.15).rename("temp_mean"),
             ic.select("temperature_2m_min").min().subtract(273.15).rename("temp_min"),
             ic.select("temperature_2m_max").max().subtract(273.15).rename("temp_max"),
@@ -256,16 +241,6 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
                 "mean_confidence": None,
                 "labelled_gain_pixel_fraction": 0.0,
             }
-
-    slope_path = output_dir / "static" / "slope.tif"
-    if slope_path.exists():
-        with rasterio.open(slope_path) as src:
-            s = src.read(1)
-        s_valid = s[~np.isnan(s)]
-        metadata["slope_deg"] = {
-            "mean": float(s_valid.mean()) if s_valid.size else None,
-            "p90": float(np.percentile(s_valid, 90)) if s_valid.size else None,
-        }
 
     return metadata
 

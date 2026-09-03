@@ -39,37 +39,62 @@ def _wait_for_all(
     tasks: dict[str, ee.batch.Task],
     logger: logging.Logger,
     tile_id: str,
+    submitted_times: dict[str, float] | None = None,
+    poll_interval: float | None = None,
 ) -> bool:
-    """
-    Poll every submitted GEE export task until each is COMPLETED, or
-    return False (cancelling any still-running tasks) the moment one
-    FAILS/CANCELLED. This is what makes "mark complete" wait for every
-    product rather than just the first to finish.
-    """
+    if poll_interval is None:
+        poll_interval = settings.poll_interval
+
     pending = dict(tasks)
+    first_running: dict[str, float] = {}
+    completed_at: dict[str, float] = {}
+
+    if submitted_times is None:
+        submitted_times = {k: time.time() for k in tasks.keys()}
 
     while pending:
         for key, task in list(pending.items()):
-            state = task.status()["state"]
+            try:
+                status = task.status()
+            except Exception:
+                status = {}
+            state = status.get("state")
+
+            if state and state not in ("READY", "PENDING") and key not in first_running:
+                first_running[key] = time.time()
+                qtime = first_running[key] - submitted_times.get(key, first_running[key])
+                logger.info(f"{tile_id} | {key} started (queue {qtime:.1f}s)")
 
             if state == "COMPLETED":
+                end = time.time()
+                start = first_running.get(key, submitted_times.get(key, end))
+                runt = end - start
+                qtime = start - submitted_times.get(key, start)
+                total = end - submitted_times.get(key, end)
+                logger.info(
+                    f"{tile_id} | {key} completed (queue {qtime:.1f}s, run {runt:.1f}s, total {total:.1f}s)"
+                )
+                completed_at[key] = end
                 del pending[key]
 
             elif state in ("FAILED", "CANCELLED", "CANCEL_REQUESTED"):
-                err = task.status().get("error_message", "unknown")
+                err = status.get("error_message", "unknown")
                 logger.error(f"{tile_id} | export failed: {key} — {err}")
-
                 for other_key, other_task in pending.items():
                     if other_key != key:
                         try:
                             other_task.cancel()
                         except Exception:
                             pass
-
                 return False
 
         if pending:
-            time.sleep(settings.poll_interval)
+            time.sleep(poll_interval)
+
+    if submitted_times and completed_at:
+        first_submit = min(submitted_times.values())
+        last_complete = max(completed_at.values())
+        logger.info(f"{tile_id} | all exports finished (wall {(last_complete-first_submit):.1f}s)")
 
     return True
 
@@ -134,6 +159,9 @@ def process_tile(
         if settings.aee_source == "gee":
             tasks.update(submit_aee_exports(geom, ct, tile_id))
 
+        # record local submit timestamps for timing diagnostics
+        submitted_times = {k: time.time() for k in tasks.keys()}
+
         update_tile(
             tile_id,
             status=TileStatus.SUBMITTED,
@@ -170,7 +198,7 @@ def process_tile(
         t_embeddings = threading.Thread(target=_run_embeddings)
         t_embeddings.start()
 
-        if not _wait_for_all(tasks, logger, tile_id):
+        if not _wait_for_all(tasks, logger, tile_id, submitted_times=submitted_times):
             raise RuntimeError("one or more GEE export tasks failed")
 
         logger.info(f"{tile_id} | all exports complete")
