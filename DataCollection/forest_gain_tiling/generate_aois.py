@@ -45,7 +45,6 @@ import os
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import ee
@@ -102,6 +101,14 @@ CLOUD_SCORE_PLUS_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
 CLOUD_SCORE_PLUS_BAND = "cs_cdf"
 CLOUD_SCORE_THRESH = float(os.getenv("CLOUD_SCORE_THRESH", "0.6"))
 
+# Real coverage footprint of the dt_tree_cover assets, derived from
+# where the product actually has nonzero values -- not the asset's
+# rectangular EPSG:3035 grid bounds. Recomputed on the fly every run at DT_FOOTPRINT_SCALE
+# -- 5km keeps this under EE's interactive pixel-count ceiling and
+# still traces a fine-grained boundary in a couple of seconds
+DT_FOOTPRINT_SCALE = 5000
+DT_FOOTPRINT_BAND = 0
+
 AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / f"aois/all_aois_{PERIOD}.json"
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -128,6 +135,42 @@ ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 logger.info(
     f"GEE initialised | project={settings.gee_project} | HPC={USE_HPC} | PERIOD={PERIOD}"
 )
+
+
+def get_dt_domain_geometry(
+    band_index: int = DT_FOOTPRINT_BAND,
+    years: tuple[int, ...] = PERIOD_YEARS[PERIOD],
+    working_scale: int = DT_FOOTPRINT_SCALE,
+) -> ee.Geometry:
+    """
+    Real coverage extent of the dt_tree_cover assets, derived from where
+    the product has nonzero values. Unions across all years.
+    Working_scale=5000 stays inside EE's interactive
+    pixel-count ceiling and completes in a couple of seconds.
+    """
+    mask = ee.Image.constant(0)
+    for year in years:
+        img = (
+            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_mosaic")
+            .select(band_index)
+            .reproject(crs="EPSG:3035", scale=working_scale)
+        )
+        mask = mask.max(img.gt(0))
+    mask = mask.selfMask()
+
+    fc = mask.reduceToVectors(
+        geometry=mask.geometry(),
+        crs="EPSG:3035",
+        scale=working_scale,
+        geometryType="polygon",
+        eightConnected=True,
+        maxPixels=1e13,
+        tileScale=16,
+    )
+
+    geojson = fc.geometry(maxError=1000).dissolve(maxError=1000).getInfo()
+    logger.info("Computed dt domain footprint (real nonzero-value extent)")
+    return ee.Geometry(geojson)
 
 
 def _dw_vegetation_mask(year):
@@ -232,26 +275,13 @@ def _build_gee_datasets():
 
 def get_asset_bounds(year_start=2017, year_end=2020, padding=0.5):
     """
-    Derive the geographic bounding box of the deadtrees gain layer
-    by unioning the tile geometries for the start and end years.
-    Returns (min_lon, min_lat, max_lon, max_lat) with optional padding.
+    Derive the geographic bounding box from the REAL dt coverage
+    footprint (nonzero-value extent), not the asset's raw rectangular
+    grid -- avoids over-including regions like Ukraine/Russia that sit
+    inside the EPSG:3035 grid but have no real product coverage.
     """
-
-    def load_mosaic(year):
-        return ee.Image(
-            f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_mosaic"
-        )
-
-    bounds = (
-        load_mosaic(year_start)
-        .geometry()
-        .union(load_mosaic(year_end).geometry(), 1)
-        .bounds(1, "EPSG:4326")
-        .coordinates()
-        .get(0)
-    )
-
-    coords = ee.List(bounds).getInfo()
+    domain = get_dt_domain_geometry()
+    coords = ee.List(domain.bounds(1, "EPSG:4326").coordinates().get(0)).getInfo()
 
     lons = [c[0] for c in coords]
     lats = [c[1] for c in coords]
@@ -262,7 +292,7 @@ def get_asset_bounds(year_start=2017, year_end=2020, padding=0.5):
     max_lat = min(90.0, max(lats) + padding)
 
     logger.info(
-        f"Asset bounds derived: "
+        f"Asset bounds derived from real footprint: "
         f"lon [{min_lon:.2f}, {max_lon:.2f}] "
         f"lat [{min_lat:.2f}, {max_lat:.2f}]"
     )
@@ -485,9 +515,7 @@ def generate_aois(
 
     valid = []
     batches = math.ceil(total / batch_size)
-    asset_geom = ee.Image(
-        "projects/symbolic-base-346316/assets/dt_tree_cover_2020_mosaic"
-    ).geometry()
+    asset_geom = get_dt_domain_geometry()
 
     for i in range(batches):
         start = i * batch_size

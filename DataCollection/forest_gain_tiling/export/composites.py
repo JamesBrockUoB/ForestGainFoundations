@@ -116,6 +116,16 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
     return s2.median()
 
 
+def valid_mask_from_composite(img: ee.Image, *, out_band_name: str = "s2_valid") -> ee.Image:
+    """
+    Derive a 0/1 validity mask from a composite image `img`.
+    Uses img.mask() — returns 1 where any band is valid, 0 otherwise.
+    Returns a single-band byte image named out_band_name.
+    """
+    mask_any = img.mask().reduce(ee.Reducer.max()).rename(out_band_name)
+    return mask_any.toFloat()
+
+
 def _upsample_20m_bands_to_10m(img: ee.Image) -> ee.Image:
     native_10m = img.select(NATIVE_10M_BANDS)
     native_20m = img.select(NATIVE_20M_BANDS).resample("bilinear")
@@ -188,6 +198,11 @@ def submit_composite_exports(
 
     for year in settings.period_years:
         image = build_year_composite(geom, year).updateMask(full_valid).toFloat()
+
+        mask_band_name = f"s2_valid_{year}"
+        mask_img = valid_mask_from_composite(image, out_band_name=mask_band_name).toFloat()
+        image = image.addBands(mask_img)
+
         name = f"s1s2_{year}"
         key = f"composites/{name}"
         prefix = f"{tile_id}__composites__{name}"
