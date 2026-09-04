@@ -104,7 +104,7 @@ class Settings:
 
     # Per-year, per-sensor minimum valid-pixel fraction, checked for every
     # calendar year in the active period
-    imagery_min_valid_frac: float = 0.99
+    imagery_min_valid_frac: float = 1
 
     # Cloud Score+ cs_cdf threshold for S2 availability/export masking.
     cloud_score_thresh: float = field(
