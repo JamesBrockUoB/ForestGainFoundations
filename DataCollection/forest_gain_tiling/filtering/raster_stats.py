@@ -152,12 +152,30 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
     """
     fc = tiles_to_feature_collection(tiles)
 
-    bands = [
-        s2_availability(fc, year).rename(f"s2_{year}")
-        for year in settings.period_years
-    ]
+    tile_images = []
 
-    stats = ee.Image.cat(bands)
+    for tile in tiles:
+        geom = ee.Geometry.Rectangle(
+            [
+                tile["x_min_m"],
+                tile["y_min_m"],
+                tile["x_max_m"],
+                tile["y_max_m"],
+            ],
+            proj=ee.Projection(settings.crs_wkt),
+            geodesic=False,
+        )
+
+        tile_image = ee.Image.cat(
+            [
+                s2_availability(geom, year).rename(f"s2_{year}")
+                for year in settings.period_years
+            ]
+        ).clip(geom)
+
+        tile_images.append(tile_image)
+
+    stats = ee.ImageCollection(tile_images).mosaic()
 
     out = _reduce_tiles(
         stats,
@@ -186,4 +204,3 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
             out[tile_id][f"s1_{year}"] = props.get(f"s1_{year}")
 
     return out
-

@@ -14,6 +14,7 @@ Examples
   PERIOD=p1 python main.py filter --stage cheap --limit 5
   PERIOD=p1 python main.py run
   PERIOD=p1 python main.py run --limit 500
+  PERIOD=p1 python main.py run --tile-batch-size 5
   PERIOD=p1 python main.py run --biome "Boreal Forests"
   PERIOD=p1 python main.py run --region "Neotropic"
   PERIOD=p1 python main.py run --aoi-id aoi_-73.25_-52.75
@@ -36,6 +37,7 @@ Run
   --stratify biome | region | country
   --stratify-mode prop | equal
   --local-output
+  --tile-batch-size N
 
 Filter
 ------
@@ -64,6 +66,7 @@ from datetime import datetime
 import ee
 from config import settings
 from enums import TileStatus
+from export.batch_tasks import run_batched_hpc, run_batched_local
 from export.tasks import run_hpc, run_local
 from filtering.tasks import run_filter_hpc, run_filter_local
 from gee.auth import get_ee_credentials
@@ -245,6 +248,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     """
     Run phase: process valid tiles (pseudo-labels + export) for the active period.
     Resumes from saved state - only processes tiles not yet complete/rejected.
+
+    By default, exports one tile per GEE task (--tile-batch-size 1). Set
+    --tile-batch-size > 1 to pack that many tiles into each export job —
+    trades per-tile export-task-count for GEE concurrency headroom, at
+    the cost of a download/split step after each batch completes.
     """
     logger = setup_logging("run")
 
@@ -285,12 +293,29 @@ def cmd_run(args: argparse.Namespace) -> None:
     init_ee()
     ds = Datasets()
 
-    if settings.use_hpc:
-        logger.info(f"Mode: HPC | workers={settings.num_workers}")
-        run_hpc(candidates, logger)
+    batched = args.tile_batch_size > 1
+
+    if batched:
+        logger.info(f"Batched mode: {args.tile_batch_size} tiles per export job")
+        if settings.use_hpc:
+            logger.info(f"Mode: HPC | workers={settings.num_workers}")
+            run_batched_hpc(candidates, logger, tile_batch_size=args.tile_batch_size)
+        else:
+            logger.info("Mode: local")
+            run_batched_local(
+                candidates,
+                ds,
+                logger,
+                tile_batch_size=args.tile_batch_size,
+                local_output=args.local_output,
+            )
     else:
-        logger.info("Mode: local")
-        run_local(candidates, ds, logger, local_output=args.local_output)
+        if settings.use_hpc:
+            logger.info(f"Mode: HPC | workers={settings.num_workers}")
+            run_hpc(candidates, logger)
+        else:
+            logger.info("Mode: local")
+            run_local(candidates, ds, logger, local_output=args.local_output)
 
     print(
         registry_summary(
@@ -417,6 +442,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-output",
         action="store_true",
         help="Write exports and embeddings to DataCollection/data/test_tiles instead of HPC.",
+    )
+
+    run_p.add_argument(
+        "--tile-batch-size",
+        default=1,
+        type=int,
+        help="Tiles packed into each GEE export job (default: 1, i.e. no "
+        "batching). Values >1 pack that many tiles into one atlas export "
+        "per product, trading task count for a download/split step.",
     )
 
     _RESETTABLE_STATUSES = [

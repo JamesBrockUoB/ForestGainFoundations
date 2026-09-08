@@ -1,7 +1,9 @@
 import logging
 import os
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from config import settings
 
@@ -25,6 +27,20 @@ def _build_rclone_base_args() -> list[str]:
     return args
 
 
+def _run_rclone_moveto(src: str, dest: str, logger: logging.Logger) -> bool:
+    """Shared rclone moveto runner — used for Drive->dest moves (single
+    tile products) and Drive->local staging moves (atlas products)."""
+    cmd = _build_rclone_base_args() + [src, dest]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        logger.warning(f"rclone failed: {src} -> {dest}: {result.stderr[:200]}")
+        return False
+
+    logger.debug(f"rclone complete: {src} -> {dest}")
+    return True
+
+
 def rclone_product(
     tile_id: str,
     category: str,
@@ -42,22 +58,8 @@ def rclone_product(
     """
     drive_name = f"{tile_id}__{category}__{name}.tif"
     dest_path = f"{dest_root}/{tile_id}/{category}/{name}.tif"
-
-    cmd = _build_rclone_base_args() + [
-        f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}",
-        dest_path,
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        logger.warning(
-            f"rclone failed for {tile_id} {category}/{name}: {result.stderr[:200]}"
-        )
-        return False
-
-    logger.debug(f"rclone complete: {tile_id} {category}/{name}")
-    return True
+    src = f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}"
+    return _run_rclone_moveto(src, dest_path, logger)
 
 
 def rclone_all_products(
@@ -80,7 +82,10 @@ def rclone_all_products(
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
-            ex.submit(rclone_product, tile_id, category, name, dest_root, logger): (category, name)
+            ex.submit(rclone_product, tile_id, category, name, dest_root, logger): (
+                category,
+                name,
+            )
             for category, name in products
         }
 
@@ -88,12 +93,13 @@ def rclone_all_products(
             for fut in as_completed(futures):
                 ok = fut.result()
                 if not ok:
-                    # cancel outstanding tasks and return False
                     for pending in futures:
                         if not pending.done():
                             pending.cancel()
                     failed = futures[fut]
-                    logger.warning(f"{tile_id} | rclone failed for {failed}; aborting tile rclone")
+                    logger.warning(
+                        f"{tile_id} | rclone failed for {failed}; aborting tile rclone"
+                    )
                     return False
         except Exception as exc:
             for pending in futures:
@@ -103,6 +109,52 @@ def rclone_all_products(
             return False
 
     return True
+
+
+def rclone_download_atlas(
+    drive_name: str,
+    local_path: Path,
+    logger: logging.Logger,
+) -> bool:
+    """
+    Move one atlas GeoTIFF from Drive into a local staging path, so it
+    can be opened with rasterio and split. Always lands locally
+    regardless of local_output/HPC — splitting needs a local file
+    either way.
+    """
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    src = f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}"
+    return _run_rclone_moveto(src, str(local_path), logger)
+
+
+def place_split_file(
+    local_split_path: Path,
+    tile_id: str,
+    category: str,
+    name: str,
+    dest_root: str,
+    local_output: bool,
+    logger: logging.Logger,
+) -> bool:
+    """
+    Move one already-split, correctly-georeferenced per-tile file from
+    local staging into its final destination — a plain local move for
+    local_output, or an rclone local->remote copy for HPC.
+    """
+    if local_output:
+        dest_path = Path(dest_root) / tile_id / category / f"{name}.tif"
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(local_split_path), str(dest_path))
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"{tile_id} | local move failed for {category}/{name}: {exc}"
+            )
+            return False
+
+    dest_path = f"{dest_root}/{tile_id}/{category}/{name}.tif"
+    return _run_rclone_moveto(str(local_split_path), dest_path, logger)
 
 
 def check_hpc_available(
@@ -124,11 +176,7 @@ def check_hpc_available(
 
     try:
         result = subprocess.run(
-            [
-                "rclone",
-                "lsd",
-                f"{remote}:{path}",
-            ],
+            ["rclone", "lsd", f"{remote}:{path}"],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -138,15 +186,8 @@ def check_hpc_available(
             logger.info(f"HPC rclone destination available: {dest_root}")
             return True
 
-        # The directory may not exist yet. Check the remote itself.
         result = subprocess.run(
-            [
-                "rclone",
-                "lsd",
-                f"{remote}:",
-                "--max-depth",
-                "1",
-            ],
+            ["rclone", "lsd", f"{remote}:", "--max-depth", "1"],
             capture_output=True,
             text=True,
             timeout=timeout,
