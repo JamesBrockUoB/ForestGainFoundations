@@ -117,7 +117,8 @@ class Settings:
 
     aee_source: str = field(default_factory=lambda: os.getenv("AEE_SOURCE", "gee"))
 
-    filter_batch_size: int = 100
+    filter_batch_size_cheap: int = 200
+    filter_batch_size_imagery: int = 40
 
     def __post_init__(self) -> None:
         if self.period not in PERIOD_YEARS:

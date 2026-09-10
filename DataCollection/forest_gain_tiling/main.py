@@ -12,9 +12,10 @@ Examples
   PERIOD=p1 python main.py filter --stage cheap
   PERIOD=p1 python main.py filter --stage imagery
   PERIOD=p1 python main.py filter --stage cheap --limit 5
+  PERIOD=p1 python main.py filter --stage cheap --stratify biome --tile-limit 2000
+  PERIOD=p1 python main.py filter --stage cheap --stratify biome --stratify-mode equal --tile-limit 2000
   PERIOD=p1 python main.py run
   PERIOD=p1 python main.py run --limit 500
-  PERIOD=p1 python main.py run --tile-batch-size 5
   PERIOD=p1 python main.py run --biome "Boreal Forests"
   PERIOD=p1 python main.py run --region "Neotropic"
   PERIOD=p1 python main.py run --aoi-id aoi_-73.25_-52.75
@@ -37,13 +38,16 @@ Run
   --stratify biome | region | country
   --stratify-mode prop | equal
   --local-output
-  --tile-batch-size N
 
 Filter
 ------
   --stage cheap | imagery
-  --batch-size N
+  --batch-size-cheap N
+  --batch-size-imagery N
   --limit N
+  --stratify biome | region | country
+  --stratify-mode prop | equal
+  --tile-limit N   (required if --stratify is set; total tiles to draw)
 
 Reset
 -----
@@ -66,7 +70,6 @@ from datetime import datetime
 import ee
 from config import settings
 from enums import TileStatus
-from export.batch_tasks import run_batched_hpc, run_batched_local
 from export.tasks import run_hpc, run_local
 from filtering.tasks import run_filter_hpc, run_filter_local
 from gee.auth import get_ee_credentials
@@ -75,7 +78,9 @@ from registry.store import registry_summary
 from tiling.grid import build_grid
 from tiling.selection import (
     filter_candidates,
+    load_or_compute_strata_ratios,
     log_strata_counts,
+    save_strata_ratios,
     stratified_sample,
 )
 
@@ -162,6 +167,20 @@ def cmd_plan(args: argparse.Namespace) -> None:
             f"→ {settings.registry_db_path}"
         )
 
+        # Population-level stratification ratios, computed once here from
+        # the full unfiltered tile grid — this is the reference distribution
+        # `run` and `filter --stratify` sample toward, never the distribution
+        # of whatever subset survives cheap/imagery filtering.
+        save_strata_ratios(
+            settings.period,
+            {"biome": biome_counts, "region": region_counts, "country": country_counts},
+            total,
+        )
+        logger.info(
+            f"Cached strata ratios ({total:,} tiles) → "
+            f"data/aois/strata_ratios_{settings.period}.json"
+        )
+
         sz = settings.tile_size_m
         lines = [
             "",
@@ -213,27 +232,60 @@ def cmd_filter(args: argparse.Namespace) -> None:
     logger = setup_logging(f"filter_{args.stage}")
     init_ee()
 
+    if args.stratify and args.tile_limit is None:
+        logger.error("--stratify requires --tile-limit")
+        return
+
+    if args.stratify and args.stratify_mode == "prop":
+        # Fail fast on a missing/stale ratio cache before spending any
+        # GEE calls.
+        load_or_compute_strata_ratios(settings.period, logger)
+
+    batch_size = (
+        args.batch_size_cheap if args.stage == "cheap" else args.batch_size_imagery
+    )
+
     if settings.use_hpc:
         logger.info(
             f"Mode: HPC | workers={settings.num_workers} | stage={args.stage} "
-            f"| period={settings.period} | batch_size={args.batch_size} | Filtering tiles"
+            f"| period={settings.period} | batch_size={batch_size}"
+            + (
+                f" | stratify={args.stratify} mode={args.stratify_mode} "
+                f"tile_limit={args.tile_limit}"
+                if args.stratify
+                else ""
+            )
+            + " | Filtering tiles"
         )
         run_filter_hpc(
             logger,
             stage=args.stage,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             limit_batches=args.limit,
+            stratify_field=args.stratify,
+            stratify_mode=args.stratify_mode,
+            tile_limit=args.tile_limit,
         )
     else:
         logger.info(
             f"Mode: local | stage={args.stage} | period={settings.period} "
-            f"| batch_size={args.batch_size} | Filtering tiles"
+            f"| batch_size={batch_size}"
+            + (
+                f" | stratify={args.stratify} mode={args.stratify_mode} "
+                f"tile_limit={args.tile_limit}"
+                if args.stratify
+                else ""
+            )
+            + " | Filtering tiles"
         )
         run_filter_local(
             logger,
             stage=args.stage,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             limit_batches=args.limit,
+            stratify_field=args.stratify,
+            stratify_mode=args.stratify_mode,
+            tile_limit=args.tile_limit,
         )
 
     print(
@@ -248,11 +300,6 @@ def cmd_run(args: argparse.Namespace) -> None:
     """
     Run phase: process valid tiles (pseudo-labels + export) for the active period.
     Resumes from saved state - only processes tiles not yet complete/rejected.
-
-    By default, exports one tile per GEE task (--tile-batch-size 1). Set
-    --tile-batch-size > 1 to pack that many tiles into each export job —
-    trades per-tile export-task-count for GEE concurrency headroom, at
-    the cost of a download/split step after each batch completes.
     """
     logger = setup_logging("run")
 
@@ -276,8 +323,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     )
 
     if args.stratify and args.limit:
+        ratios = None
+        if args.stratify_mode == "prop":
+            ratios = load_or_compute_strata_ratios(settings.period, logger)[
+                args.stratify
+            ]
+
         candidates = stratified_sample(
-            candidates, args.stratify, args.limit, args.stratify_mode
+            candidates, args.stratify, args.limit, args.stratify_mode, ratios=ratios
         )
         log_strata_counts(candidates, args.stratify, logger, args.stratify_mode)
     elif args.limit:
@@ -293,29 +346,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     init_ee()
     ds = Datasets()
 
-    batched = args.tile_batch_size > 1
-
-    if batched:
-        logger.info(f"Batched mode: {args.tile_batch_size} tiles per export job")
-        if settings.use_hpc:
-            logger.info(f"Mode: HPC | workers={settings.num_workers}")
-            run_batched_hpc(candidates, logger, tile_batch_size=args.tile_batch_size)
-        else:
-            logger.info("Mode: local")
-            run_batched_local(
-                candidates,
-                ds,
-                logger,
-                tile_batch_size=args.tile_batch_size,
-                local_output=args.local_output,
-            )
+    if settings.use_hpc:
+        logger.info(f"Mode: HPC | workers={settings.num_workers}")
+        run_hpc(candidates, logger)
     else:
-        if settings.use_hpc:
-            logger.info(f"Mode: HPC | workers={settings.num_workers}")
-            run_hpc(candidates, logger)
-        else:
-            logger.info("Mode: local")
-            run_local(candidates, ds, logger, local_output=args.local_output)
+        logger.info("Mode: local")
+        run_local(candidates, ds, logger, local_output=args.local_output)
 
     print(
         registry_summary(
@@ -386,7 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     filter_p = sub.add_parser(
         "filter",
-        help="Run one stage of the tile-batch filter (no exports)",
+        help="Run one stage of the tile filter",
     )
     filter_p.add_argument(
         "--stage",
@@ -398,16 +434,48 @@ def build_parser() -> argparse.ArgumentParser:
         "(CHEAP_VALID -> VALID).",
     )
     filter_p.add_argument(
-        "--batch-size",
-        default=settings.filter_batch_size,
+        "--batch-size-cheap",
+        default=settings.filter_batch_size_cheap,
         type=int,
-        help=f"Tiles per raster fetch (default: {settings.filter_batch_size})",
+        help=f"Tiles per raster fetch (default: {settings.filter_batch_size_cheap})",
+    )
+    filter_p.add_argument(
+        "--batch-size-imagery",
+        default=settings.filter_batch_size_imagery,
+        type=int,
+        help=f"Tiles per raster fetch (default: {settings.filter_batch_size_imagery})",
     )
     filter_p.add_argument(
         "--limit",
         default=None,
         type=int,
-        help="Max number of batches to process (for testing on a subset)",
+        help="Max number of batches to process (for testing on a subset). "
+        "Ignored if --stratify is set — use --tile-limit instead.",
+    )
+    filter_p.add_argument(
+        "--stratify",
+        default=None,
+        choices=["biome", "region", "country"],
+        help="Draw tiles across strata instead of plain xi/yi order. "
+        "Requires --tile-limit.",
+    )
+    filter_p.add_argument(
+        "--stratify-mode",
+        default="prop",
+        choices=["prop", "equal"],
+        dest="stratify_mode",
+        help="prop: allocate by cached population ratios from `plan`. "
+        "equal: even split across strata present at this stage — better "
+        "for small proto-dataset runs where prop mode would round thin "
+        "strata down to zero.",
+    )
+    filter_p.add_argument(
+        "--tile-limit",
+        default=None,
+        type=int,
+        dest="tile_limit",
+        help="Total tiles to draw when --stratify is set. Required if "
+        "--stratify is used.",
     )
 
     run_p = sub.add_parser("run", help="Submit and monitor export tasks")
@@ -442,15 +510,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-output",
         action="store_true",
         help="Write exports and embeddings to DataCollection/data/test_tiles instead of HPC.",
-    )
-
-    run_p.add_argument(
-        "--tile-batch-size",
-        default=1,
-        type=int,
-        help="Tiles packed into each GEE export job (default: 1, i.e. no "
-        "batching). Values >1 pack that many tiles into one atlas export "
-        "per product, trading task count for a download/split step.",
     )
 
     _RESETTABLE_STATUSES = [

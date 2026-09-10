@@ -28,8 +28,7 @@ def _build_rclone_base_args() -> list[str]:
 
 
 def _run_rclone_moveto(src: str, dest: str, logger: logging.Logger) -> bool:
-    """Shared rclone moveto runner — used for Drive->dest moves (single
-    tile products) and Drive->local staging moves (atlas products)."""
+    """Shared rclone moveto runner — used for Drive->dest moves"""
     cmd = _build_rclone_base_args() + [src, dest]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -109,52 +108,6 @@ def rclone_all_products(
             return False
 
     return True
-
-
-def rclone_download_atlas(
-    drive_name: str,
-    local_path: Path,
-    logger: logging.Logger,
-) -> bool:
-    """
-    Move one atlas GeoTIFF from Drive into a local staging path, so it
-    can be opened with rasterio and split. Always lands locally
-    regardless of local_output/HPC — splitting needs a local file
-    either way.
-    """
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    src = f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}"
-    return _run_rclone_moveto(src, str(local_path), logger)
-
-
-def place_split_file(
-    local_split_path: Path,
-    tile_id: str,
-    category: str,
-    name: str,
-    dest_root: str,
-    local_output: bool,
-    logger: logging.Logger,
-) -> bool:
-    """
-    Move one already-split, correctly-georeferenced per-tile file from
-    local staging into its final destination — a plain local move for
-    local_output, or an rclone local->remote copy for HPC.
-    """
-    if local_output:
-        dest_path = Path(dest_root) / tile_id / category / f"{name}.tif"
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.move(str(local_split_path), str(dest_path))
-            return True
-        except Exception as exc:
-            logger.warning(
-                f"{tile_id} | local move failed for {category}/{name}: {exc}"
-            )
-            return False
-
-    dest_path = f"{dest_root}/{tile_id}/{category}/{name}.tif"
-    return _run_rclone_moveto(str(local_split_path), dest_path, logger)
 
 
 def check_hpc_available(

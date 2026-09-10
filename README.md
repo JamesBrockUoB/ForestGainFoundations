@@ -80,7 +80,7 @@
 
       - GEE_PROJECT - Your GEE project name
       - OUTPUT_DIR - data/
-      - BATCH_SIZE - 5
+      - BATCH_SIZE - 100 - AOI batch size processing
       - AOI_STEP - 0.25
       - TILE_PIXELS - 256
       - NUM_WORKERS - 4

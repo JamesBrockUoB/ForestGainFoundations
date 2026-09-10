@@ -9,7 +9,11 @@ from itertools import islice
 import ee
 from config import settings
 from enums import TileStatus
-from filtering.tile_batches import count_pending, iter_pending_tile_batches
+from filtering.tile_batches import (
+    count_pending,
+    iter_pending_tile_batches,
+    iter_stratified_pending_tile_batches,
+)
 from filtering.tile_filter import filter_batch_cheap, filter_batch_imagery
 from gee.auth import get_ee_credentials
 from gee_datasets.registry import Datasets
@@ -28,34 +32,89 @@ STAGES = {
 }
 
 
-def run_filter_local(
-    logger: logging.Logger,
-    stage: str,
+def _resolve_batch_iter(
+    cfg: dict,
+    period: str,
     batch_size: int,
-    limit_batches: int | None = None,
-) -> None:
-    cfg = STAGES[stage]
-    period = settings.period
-    ds = Datasets() if stage == "cheap" else None  # <-- build once, reused every batch
+    limit_batches: int | None,
+    stratify_field: str | None,
+    stratify_mode: str,
+    tile_limit: int | None,
+    logger: logging.Logger,
+):
+    """
+    Shared batch-source resolution for both local and HPC runners.
+    Returns (batch_iter, total_batches_estimate).
+
+    Stratified mode ignores limit_batches — tile_limit is the knob there,
+    since "N batches" doesn't map onto "allocated draw across strata" the
+    same way it does for the plain xi/yi-ordered scan.
+    """
+    if stratify_field:
+        if tile_limit is None:
+            raise ValueError("tile_limit is required when stratify_field is set")
+
+        total_batches = -(-tile_limit // batch_size)
+        batch_iter = iter_stratified_pending_tile_batches(
+            cfg["input_status"],
+            batch_size,
+            period,
+            stratify_field,
+            tile_limit,
+            mode=stratify_mode,
+            logger=logger,
+        )
+        logger.info(
+            f"starting | period={period} | batch_size={batch_size} | "
+            f"stratify={stratify_field} mode={stratify_mode} | "
+            f"tile_limit={tile_limit:,} | total_batches(est)={total_batches:,}"
+        )
+        return batch_iter, total_batches
 
     total_pending = count_pending(cfg["input_status"], period)
-    total_batches = -(-total_pending // batch_size)  # ceil division
+    total_batches = -(-total_pending // batch_size)
     if limit_batches is not None:
         total_batches = min(total_batches, limit_batches)
 
-    totals: dict[str, int] = {}
-    n_tiles = 0
-    n_batches = 0
-    t0 = time.time()
+    batch_iter = iter_pending_tile_batches(cfg["input_status"], batch_size, period)
+    if limit_batches is not None:
+        batch_iter = islice(batch_iter, limit_batches)
 
     logger.info(
         f"starting | period={period} | batch_size={batch_size} | "
         f"pending={total_pending:,} | total_batches={total_batches:,}"
     )
+    return batch_iter, total_batches
 
-    batch_iter = iter_pending_tile_batches(cfg["input_status"], batch_size, period)
-    if limit_batches is not None:
-        batch_iter = islice(batch_iter, limit_batches)
+
+def run_filter_local(
+    logger: logging.Logger,
+    stage: str,
+    batch_size: int,
+    limit_batches: int | None = None,
+    stratify_field: str | None = None,
+    stratify_mode: str = "prop",
+    tile_limit: int | None = None,
+) -> None:
+    cfg = STAGES[stage]
+    period = settings.period
+    ds = Datasets() if stage == "cheap" else None  # <-- build once, reused every batch
+
+    batch_iter, total_batches = _resolve_batch_iter(
+        cfg,
+        period,
+        batch_size,
+        limit_batches,
+        stratify_field,
+        stratify_mode,
+        tile_limit,
+        logger,
+    )
+
+    totals: dict[str, int] = {}
+    n_tiles = 0
+    n_batches = 0
+    t0 = time.time()
 
     with tqdm(
         batch_iter, total=total_batches, desc=f"filter[{stage}]", unit="batch"
@@ -151,16 +210,39 @@ def run_filter_hpc(
     stage: str,
     batch_size: int,
     limit_batches: int | None = None,
+    stratify_field: str | None = None,
+    stratify_mode: str = "prop",
+    tile_limit: int | None = None,
 ) -> None:
     cfg = STAGES[stage]
     period = settings.period
     batch_queue: mp.Queue = mp.Queue()
     result_queue: mp.Queue = mp.Queue()
 
+    t0 = time.time()  # covers batch materialisation + worker spin-up/staggering
+
+    batch_iter, _ = _resolve_batch_iter(
+        cfg,
+        period,
+        batch_size,
+        limit_batches,
+        stratify_field,
+        stratify_mode,
+        tile_limit,
+        logger,
+    )
+
+    # HPC path materialises batches up front (same as before this change) —
+    # the stratified iterator already does its own DB work per stratum
+    # before yielding, so this is just draining it into a list.
     batches = []
-    for tiles in iter_pending_tile_batches(cfg["input_status"], batch_size, period):
+    for tiles in batch_iter:
         batches.append(tiles)
-        if limit_batches is not None and len(batches) >= limit_batches:
+        if (
+            stratify_field is None
+            and limit_batches is not None
+            and len(batches) >= limit_batches
+        ):
             break
 
     if not batches:
@@ -191,6 +273,11 @@ def run_filter_hpc(
     logger.info(
         f"started {settings.num_workers} workers for period={period} | "
         f"{len(batches):,} batches ({sum(len(b) for b in batches):,} tiles)"
+        + (
+            f" | stratify={stratify_field} mode={stratify_mode}"
+            if stratify_field
+            else ""
+        )
     )
 
     for idx, tiles in enumerate(batches, start=1):
@@ -201,3 +288,11 @@ def run_filter_hpc(
     for w in workers:
         w.join()
     writer_thread.join()
+
+    elapsed = (time.time() - t0) / 60
+    n_tiles = sum(len(b) for b in batches)
+    rate = n_tiles / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"hpc filter complete: {len(batches):,} batches, {n_tiles:,} tiles | "
+        f"{elapsed:.1f}min elapsed | {rate:.0f} tiles/min"
+    )
