@@ -13,7 +13,7 @@ from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tiling.grid import crs_transform as tile_crs_transform
 
-_YEAR_TIMEOUT_S = 180  # generous but bounded
+_YEAR_TIMEOUT_S = 300
 
 
 def tile_bbox(tile: dict) -> tuple[float, float, float, float]:
