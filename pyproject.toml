@@ -10,7 +10,6 @@ requires-python = ">=3.12"
 dependencies = [
     "earthengine-api",
     "ee",
-    "geoai-py",
     "geotessera",
     "numpy",
     "pyproj",
@@ -45,7 +44,7 @@ include = [
     "stack*",
     "inspector*",
     "tiling*",
-    "prithvi_gain*",
+    "wandb",
 ]
 
 [tool.pytest.ini_options]

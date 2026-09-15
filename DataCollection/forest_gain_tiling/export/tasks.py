@@ -62,7 +62,9 @@ def _wait_for_all(
 
             if state and state not in ("READY", "PENDING") and key not in first_running:
                 first_running[key] = time.time()
-                qtime = first_running[key] - submitted_times.get(key, first_running[key])
+                qtime = first_running[key] - submitted_times.get(
+                    key, first_running[key]
+                )
                 logger.info(f"{tile_id} | {key} started (queue {qtime:.1f}s)")
 
             if state == "COMPLETED":
@@ -94,7 +96,9 @@ def _wait_for_all(
     if submitted_times and completed_at:
         first_submit = min(submitted_times.values())
         last_complete = max(completed_at.values())
-        logger.info(f"{tile_id} | all exports finished (wall {(last_complete-first_submit):.1f}s)")
+        logger.info(
+            f"{tile_id} | all exports finished (wall {(last_complete-first_submit):.1f}s)"
+        )
 
     return True
 
@@ -102,11 +106,10 @@ def _wait_for_all(
 def _verify_tile_outputs(output_dir: Path, gee_product_keys: list[str]) -> list[str]:
     """
     Final gate before COMPLETE: confirm every GEE-derived product and
-    every expected embedding file for the active period actually landed
+    every expected TESSERA embedding file for the active period actually landed
     on disk. Embedding years are scoped to settings.period_years (p1:
-    2017-2020, p2: 2020-2024) — NOT a fixed 2017-2024 range, since each
-    period only ever needs its own years. Returns a list of missing
-    relative product keys (empty = fully verified).
+    2017-2020, p2: 2020-2024). Returns a list of missing relative product
+    keys (empty = fully verified).
     """
     missing: list[str] = []
 
@@ -131,12 +134,10 @@ def process_tile(
     local_output: bool = False,
 ) -> str:
     """
-    Process one tile: submit every GEE export (composites/static/labels/
-    [aee if aee_source=="gee"]), start embeddings downloading IMMEDIATELY
-    in parallel (TESSERA, and AEE if aee_source=="geoai" -- neither
-    depends on GEE task state), wait for all GEE tasks, rclone, then join
-    the embeddings thread and verify everything landed. A tile is only
-    ever marked COMPLETE after every product has been confirmed on disk.
+    Process one tile: submit every GEE export (composites/static/labels),
+    start TESSERA embeddings downloading IMMEDIATELY in parallel, wait for all
+    GEE tasks, rclone, then join the embeddings thread and verify everything landed.
+    A tile is only ever marked COMPLETE after every product has been confirmed on disk.
     """
     tile_id = tile["tile_id"]
     geom = tile_geom(tile)
@@ -156,8 +157,7 @@ def process_tile(
         tasks.update(
             submit_label_exports(geom, ct, full_valid, ds, gain_confidence, tile_id)
         )
-        if settings.aee_source == "gee":
-            tasks.update(submit_aee_exports(geom, ct, tile_id))
+        tasks.update(submit_aee_exports(geom, ct, tile_id))
 
         # record local submit timestamps for timing diagnostics
         submitted_times = {k: time.time() for k in tasks.keys()}
@@ -179,12 +179,6 @@ def process_tile(
             output_dir = Path(settings.hpc_path) / tile_id
             dest_root = settings.hpc_path
 
-        # Embeddings (TESSERA always, + AEE when aee_source=="geoai") has
-        # no dependency on GEE task state -- start it now so it overlaps
-        # the entire _wait_for_all polling window below, not just the
-        # rclone step after. process_all_embeddings_with_retry already
-        # skips the geoai-AEE download when aee_source=="gee", so this is always safe to
-        # start unconditionally regardless of aee_source.
         embeddings_result: dict[str, bool] = {}
 
         def _run_embeddings() -> None:
@@ -207,13 +201,19 @@ def process_tile(
         products = [tuple(key.split("/", 1)) for key in tasks.keys()]
         rclone_ok = rclone_all_products(tile_id, products, dest_root, logger)
 
-        # Embeddings has been running since before _wait_for_all started --
-        # by this point it's very likely already finished (or close to
-        # it), so this join is typically near-instant
+        # Embeddings thread runs concurrently -- join to wait for completion
         t_embeddings.join()
 
         if not rclone_ok:
-            raise RuntimeError("rclone transfer failed")
+            logger.error(
+                f"{tile_id} | rclone transfer failed; preserving local outputs for retry"
+            )
+            update_tile(
+                tile_id,
+                status=TileStatus.FAILED,
+                error="rclone transfer failed; local outputs preserved",
+            )
+            return str(TileStatus.FAILED)
 
         if not embeddings_result.get("ok"):
             raise RuntimeError("embedding acquisition failed")
@@ -338,13 +338,7 @@ def run_hpc(
     candidates: list[dict],
     logger: logging.Logger,
 ) -> None:
-    """
-    Process tiles with HPC workers. `ds` is accepted only to match
-    run_local's call signature from main.py's cmd_run — each worker
-    process builds its own Datasets() in _mp_worker, since ee-bound
-    objects can't cross a process boundary, so the ds passed in here is
-    unused.
-    """
+    """Process tiles with HPC workers."""
     if not settings.hpc_path:
         raise RuntimeError("HPC_PATH is not configured")
     if not check_hpc_available(settings.hpc_path, logger):

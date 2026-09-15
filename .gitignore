@@ -19,3 +19,13 @@ settings.json
 *.py[cod]
 
 **/tests/benchmark_results/*
+
+wandb/
+
+aoi_footprint*
+
+build/*
+
+*Forest-Gain-CD*
+
+*DataCollection/dt_plots*

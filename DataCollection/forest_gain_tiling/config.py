@@ -115,8 +115,6 @@ class Settings:
     use_hpc: bool = field(default_factory=lambda: os.getenv("USE_HPC", "0") == "1")
     num_workers: int = field(default_factory=lambda: int(os.getenv("NUM_WORKERS", "4")))
 
-    aee_source: str = field(default_factory=lambda: os.getenv("AEE_SOURCE", "gee"))
-
     filter_batch_size_cheap: int = 200
     filter_batch_size_imagery: int = 40
 

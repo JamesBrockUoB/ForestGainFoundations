@@ -52,10 +52,11 @@ def export_inspector_tile(
         tasks.update(submit_composite_exports(geom, transform, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, transform, full_valid, tile_id))
         tasks.update(
-            submit_label_exports(geom, transform, full_valid, ds, gain_confidence, tile_id)
+            submit_label_exports(
+                geom, transform, full_valid, ds, gain_confidence, tile_id
+            )
         )
-        if settings.aee_source == "gee":
-            tasks.update(submit_aee_exports(geom, transform, tile_id))
+        tasks.update(submit_aee_exports(geom, transform, tile_id))
 
         def run_embeddings() -> None:
             embeddings_result["ok"] = process_all_embeddings_with_retry(
@@ -88,7 +89,10 @@ def export_inspector_tile(
         for task in tasks.values():
             try:
                 if task.status()["state"] not in {
-                    "COMPLETED", "FAILED", "CANCELLED", "CANCEL_REQUESTED"
+                    "COMPLETED",
+                    "FAILED",
+                    "CANCELLED",
+                    "CANCEL_REQUESTED",
                 }:
                     task.cancel()
             except Exception:

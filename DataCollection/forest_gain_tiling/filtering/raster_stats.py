@@ -36,6 +36,51 @@ def split_by_hemisphere(tiles: list[dict]) -> tuple[list[dict], list[dict]]:
     return north, south
 
 
+def check_tessera_coverage(
+    tiles: list[dict],
+    logger=None,
+) -> tuple[list[dict], dict[str, list[int]]]:
+    from geotessera import GeoTessera
+
+    gt = GeoTessera()
+
+    covered_tiles = []
+    missing_by_tile = {}
+
+    for tile in tiles:
+        bbox = (
+            tile["min_lon"],
+            tile["min_lat"],
+            tile["max_lon"],
+            tile["max_lat"],
+        )
+
+        missing_years = []
+
+        for year in settings.period_years:
+            blocks = gt.registry.load_blocks_for_region(
+                bounds=bbox,
+                year=year,
+            )
+
+            if not blocks:
+                missing_years.append(year)
+
+        if missing_years:
+            missing_by_tile[tile["tile_id"]] = missing_years
+
+            if logger:
+                logger.debug(
+                    f"TESSERA coverage missing | "
+                    f"tile={tile['tile_id']} | "
+                    f"years={missing_years}"
+                )
+        else:
+            covered_tiles.append(tile)
+
+    return covered_tiles, missing_by_tile
+
+
 def build_cheap_stats_image(
     geom: ee.Geometry,
     ds: Datasets,

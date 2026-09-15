@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -8,26 +9,57 @@ def weighted_bce_loss(
     gain_weight: torch.Tensor,
     gain_valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-pixel BCE weighted by pseudo-label confidence, restricted to
-    valid (labelled-or-explicitly-negative) pixels. Assumes gain_valid
-    covers both confidently-positive and confidently-negative pixels; if
-    your masks are positive-only, you'll need a different negative-sampling
-    strategy."""
-    per_px = F.binary_cross_entropy_with_logits(seg_logits, gain_mask, reduction="none")
+    """
+    Per-pixel BCE weighted by pseudo-label confidence, restricted to valid pixels.
+
+    Args:
+        seg_logits: Model output logits of shape (B, H, W)
+        gain_mask: Binary target mask of shape (B, H, W) (0 or 1)
+        gain_weight: Soft confidence map of shape (B, H, W) in range [0, 1]
+        gain_valid: Valid pixel indicator mask of shape (B, H, W) (0 or 1)
+    """
+    # Ensure shapes match
+    if seg_logits.dim() == 4 and seg_logits.size(1) == 1:
+        seg_logits = seg_logits.squeeze(1)
+
+    per_px = F.binary_cross_entropy_with_logits(
+        seg_logits, gain_mask.float(), reduction="none"
+    )
     weight = gain_weight * gain_valid
     denom = weight.sum().clamp(min=1.0)
     return (per_px * weight).sum() / denom
 
 
-def weighted_soft_ce_loss(
-    cls_logits: torch.Tensor, class_dist: torch.Tensor, cls_weight: torch.Tensor
-) -> torch.Tensor:
-    """Soft-label cross-entropy against a class distribution (not a hard
-    one-hot), scaled per-tile by pseudo-label confidence. Degenerates to
-    standard CE if class_dist happens to be one-hot. Only call this when
-    cls_logits is not None -- i.e. never for a p2 (typology-free) model,
-    see MultiTaskGainModel.include_classification_head."""
-    log_probs = F.log_softmax(cls_logits, dim=-1)
-    per_tile = -(class_dist * log_probs).sum(dim=-1)
-    denom = cls_weight.sum().clamp(min=1e-6)
-    return (per_tile * cls_weight).sum() / denom
+class FocalWeightedBCELoss(nn.Module):
+    """
+    Optional Focal-weighted BCE for handling severe class imbalance in forest gain detection.
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(
+        self,
+        seg_logits: torch.Tensor,
+        gain_mask: torch.Tensor,
+        gain_weight: torch.Tensor,
+        gain_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        if seg_logits.dim() == 4 and seg_logits.size(1) == 1:
+            seg_logits = seg_logits.squeeze(1)
+
+        bce = F.binary_cross_entropy_with_logits(
+            seg_logits, gain_mask.float(), reduction="none"
+        )
+        p = torch.sigmoid(seg_logits)
+        p_t = p * gain_mask + (1 - p) * (1 - gain_mask)
+        focal_factor = (1 - p_t) ** self.gamma
+
+        alpha_factor = self.alpha * gain_mask + (1 - self.alpha) * (1 - gain_mask)
+        loss = alpha_factor * focal_factor * bce
+
+        weight = gain_weight * gain_valid
+        denom = weight.sum().clamp(min=1.0)
+        return (loss * weight).sum() / denom

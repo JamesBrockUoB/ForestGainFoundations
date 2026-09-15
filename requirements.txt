@@ -7,7 +7,6 @@ tqdm
 folium
 seaborn
 scipy
-geoai-py
 geotessera
 numpy
 pyproj
@@ -17,3 +16,4 @@ terratorch
 streamlit
 streamlit-folium
 pytest
+wandb

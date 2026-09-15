@@ -1,85 +1,130 @@
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
+import torchmetrics
+from config import DEFAULT_IMAGE_SIZE, DEFAULT_LR, NUM_INPUT_CHANNELS
+from models import build_model
 
-from .config import PERIOD_HAS_TYPOLOGY
-from .losses import weighted_bce_loss, weighted_soft_ce_loss
-from .models import MultiTaskGainModel
 
+class GainDetectionTask(pl.LightningModule):
+    """PyTorch Lightning Task for N-timestep satellite change/gain detection."""
 
-class GainMultiTaskTask(pl.LightningModule):
     def __init__(
         self,
-        period: str,
-        seg_loss_weight=1.0,
-        cls_loss_weight=1.0,
-        backbone_lr=1e-4,
-        head_lr=1e-3,
+        model_type: str = "sits_scd",
+        in_channels: int = NUM_INPUT_CHANNELS,
+        img_size: int = DEFAULT_IMAGE_SIZE,
+        lr: float = DEFAULT_LR,
+        pos_weight: float = 3.0,
+        **model_kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters(
-            {
-                "period": period,
-                "seg_loss_weight": seg_loss_weight,
-                "cls_loss_weight": cls_loss_weight,
-                "backbone_lr": backbone_lr,
-                "head_lr": head_lr,
-            }
+        self.save_hyperparameters()
+
+        self.lr = lr
+        self.pos_weight = pos_weight
+
+        # Instantiate Network via models factory
+        self.model = build_model(
+            model_type=model_type,
+            in_channels=in_channels,
+            img_size=img_size,
+            **model_kwargs,
         )
-        self.has_typology = PERIOD_HAS_TYPOLOGY[period]
-        self.model = MultiTaskGainModel(include_classification_head=self.has_typology)
 
-    def forward(self, pixels):
-        return self.model(pixels)
+        metrics_kwargs = {"task": "binary", "threshold": 0.5}
+        self.val_f1 = torchmetrics.F1Score(**metrics_kwargs)
+        self.val_iou = torchmetrics.JaccardIndex(**metrics_kwargs)
+        self.val_precision = torchmetrics.Precision(**metrics_kwargs)
+        self.val_recall = torchmetrics.Recall(**metrics_kwargs)
 
-    def _step(self, batch, stage):
-        seg_logits, cls_logits = self(batch["pixels"])
-        batch_size = batch["pixels"].shape[0]
+    def _compute_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        valid_mask: torch.Tensor,
+        sample_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pos_weight_tensor = torch.where(targets == 1.0, self.pos_weight, 1.0)
+        weighted_loss = bce_loss * pos_weight_tensor * sample_weights
+        masked_loss = weighted_loss * valid_mask
 
-        seg_loss = weighted_bce_loss(
-            seg_logits, batch["gain_mask"], batch["gain_weight"], batch["gain_valid"]
+        total_valid = valid_mask.sum()
+        if total_valid > 0:
+            return masked_loss.sum() / total_valid
+        return masked_loss.sum()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        logits = self(batch["pixels"])
+        loss = self._compute_loss(
+            logits,
+            batch["gain_mask"],
+            batch["gain_valid"],
+            batch["gain_weight"],
         )
-        self.log(f"{stage}_seg_loss", seg_loss, prog_bar=True, batch_size=batch_size)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch["pixels"].shape[0],
+        )
+        return loss
 
-        if self.has_typology:
-            cls_loss = weighted_soft_ce_loss(
-                cls_logits, batch["class_dist"], batch["cls_weight"]
-            )
-            self.log(
-                f"{stage}_cls_loss", cls_loss, prog_bar=True, batch_size=batch_size
-            )
-            total = (
-                self.hparams.seg_loss_weight * seg_loss
-                + self.hparams.cls_loss_weight * cls_loss
-            )
-        else:
-            total = seg_loss
+    def validation_step(self, batch: dict, batch_idx: int):
+        logits = self(batch["pixels"])
+        loss = self._compute_loss(
+            logits,
+            batch["gain_mask"],
+            batch["gain_valid"],
+            batch["gain_weight"],
+        )
 
-        self.log(f"{stage}_loss", total, prog_bar=True, batch_size=batch_size)
-        return total
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        valid_indices = batch["gain_valid"] == 1.0
 
-    def training_step(self, batch, batch_idx):
-        return self._step(batch, "train")
+        if valid_indices.any():
+            v_preds = preds[valid_indices]
+            v_targets = batch["gain_mask"][valid_indices].int()
 
-    def validation_step(self, batch, batch_idx):
-        return self._step(batch, "val")
+            self.val_f1.update(v_preds, v_targets)
+            self.val_iou.update(v_preds, v_targets)
+            self.val_precision.update(v_preds, v_targets)
+            self.val_recall.update(v_preds, v_targets)
+
+        self.log(
+            "val_loss",
+            loss,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch["pixels"].shape[0],
+        )
+
+    def on_validation_epoch_end(self):
+        self.log("val_f1", self.val_f1.compute(), prog_bar=True)
+        self.log("val_iou", self.val_iou.compute(), prog_bar=True)
+        self.log("val_precision", self.val_precision.compute())
+        self.log("val_recall", self.val_recall.compute())
+
+        self.val_f1.reset()
+        self.val_iou.reset()
+        self.val_precision.reset()
+        self.val_recall.reset()
 
     def configure_optimizers(self):
-        # Differential LR: LoRA params get a lower LR than the randomly
-        # initialized heads, which need to learn from scratch.
-        lora_params = [
-            p for _, p in self.model.backbone.named_parameters() if p.requires_grad
-        ]
-        head_params = list(self.model.seg_head.parameters())
-        if self.model.cls_head is not None:
-            head_params += list(self.model.cls_head.parameters())
-
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": lora_params, "lr": self.hparams.backbone_lr},
-                {"params": head_params, "lr": self.hparams.head_lr},
-            ],
-            weight_decay=0.05,
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.trainer.max_epochs, eta_min=1e-6
         )
-
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }

@@ -18,7 +18,9 @@ def hemisphere_from_tile(min_lat: float, max_lat: float) -> bool:
     return (min_lat + max_lat) / 2.0 >= 0
 
 
-def _join_cloud_score_plus(ic: ee.ImageCollection, geom, start: str, end: str) -> ee.ImageCollection:
+def _join_cloud_score_plus(
+    ic: ee.ImageCollection, geom, start: str, end: str
+) -> ee.ImageCollection:
     """Link Cloud Score+ QA band onto each S2 image via
     ImageCollection.linkCollection — Google's recommended pattern for
     this dataset. The linked band is attached directly as a band on
@@ -32,7 +34,9 @@ def _join_cloud_score_plus(ic: ee.ImageCollection, geom, start: str, end: str) -
     return ic.linkCollection(cs_col, [CLOUD_SCORE_PLUS_BAND])
 
 
-def _mask_cloud_score_plus(img: ee.Image, threshold: float = settings.cloud_score_thresh) -> ee.Image:
+def _mask_cloud_score_plus(
+    img: ee.Image, threshold: float = settings.cloud_score_thresh
+) -> ee.Image:
     """Mask using the linked Cloud Score+ cs_cdf band — a plain band on
     img after linkCollection, no unwrapping needed."""
     cs = img.select(CLOUD_SCORE_PLUS_BAND)
@@ -116,7 +120,9 @@ def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
     return s2.median()
 
 
-def valid_mask_from_composite(img: ee.Image, *, out_band_name: str = "s2_valid") -> ee.Image:
+def valid_mask_from_composite(
+    img: ee.Image, *, out_band_name: str = "s2_valid"
+) -> ee.Image:
     """
     Derive a 0/1 validity mask from a composite image `img`.
     Uses img.mask() — returns 1 where any band is valid, 0 otherwise.
@@ -145,12 +151,7 @@ def s2_peak_ndvi(geom: ee.Geometry, year: int, *, north: bool) -> ee.Image:
     )
     ic = _join_cloud_score_plus(ic, geom, start, end)
 
-    return (
-        ic.map(_mask_cloud_score_plus)
-        .map(_add_ndvi)
-        .select(["NDVI"])
-        .median()
-    )
+    return ic.map(_mask_cloud_score_plus).map(_add_ndvi).select(["NDVI"]).median()
 
 
 def s2_ndvi_trend(geom: ee.Geometry, years: list[int], *, north: bool) -> ee.Image:
@@ -200,7 +201,9 @@ def submit_composite_exports(
         image = build_year_composite(geom, year).updateMask(full_valid).toFloat()
 
         mask_band_name = f"s2_valid_{year}"
-        mask_img = valid_mask_from_composite(image, out_band_name=mask_band_name).toFloat()
+        mask_img = valid_mask_from_composite(
+            image, out_band_name=mask_band_name
+        ).toFloat()
         image = image.addBands(mask_img)
 
         name = f"s1s2_{year}"
@@ -224,4 +227,3 @@ def submit_composite_exports(
         tasks[key] = task
 
     return tasks
-    

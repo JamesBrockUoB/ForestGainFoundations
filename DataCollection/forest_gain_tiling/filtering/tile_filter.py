@@ -6,6 +6,7 @@ import time
 from config import settings
 from enums import TileStatus
 from filtering.raster_stats import (
+    check_tessera_coverage,
     fetch_cheap_stats,
     fetch_imagery_stats,
 )
@@ -41,7 +42,7 @@ def evaluate_cheap_stats(
 
         if pseudo_frac < settings.min_pseudo_gain_frac:
             if logger:
-                logger.debug(f"low_pseudo_coverage: " f"{pseudo_frac:.3f}")
+                logger.debug(f"low_pseudo_coverage: {pseudo_frac:.3f}")
 
             return (
                 str(TileStatus.REJECTED),
@@ -79,7 +80,61 @@ def filter_batch_cheap(
     t0 = time.time()
 
     try:
-        stats_by_tile = fetch_cheap_stats(tiles, ds)
+        covered_tiles, missing_tessera = check_tessera_coverage(
+            tiles,
+            logger=logger,
+        )
+
+        logger.debug(
+            f"  {batch_label} TESSERA coverage check: "
+            f"{time.time()-t0:.1f}s | "
+            f"covered={len(covered_tiles)} | "
+            f"missing={len(missing_tessera)}"
+        )
+
+    except Exception as exc:
+        logger.error(
+            f"  {batch_label} TESSERA coverage check failed after "
+            f"{time.time()-t0:.1f}s — {exc}"
+        )
+
+        for t in tiles:
+            update_tile(
+                t["tile_id"],
+                status=TileStatus.FAILED,
+                error=f"TESSERA coverage check failed: {exc}",
+            )
+
+        return {"failed": len(tiles)}
+
+    counts = {
+        "cheap_valid": 0,
+        "rejected": 0,
+        "tessera_no_coverage": 0,
+    }
+
+    for tile_id, missing_years in missing_tessera.items():
+        update_tile(
+            tile_id,
+            status=TileStatus.REJECTED,
+            rejection_reason="missing_tessera_coverage",
+        )
+        counts["rejected"] += 1
+        counts["tessera_no_coverage"] += 1
+
+        logger.debug(
+            f"  {batch_label} rejected {tile_id}: "
+            f"TESSERA missing years={missing_years}"
+        )
+
+    if not covered_tiles:
+        logger.debug(f"  {batch_label}: all tiles rejected by TESSERA coverage")
+        return counts
+
+    t0 = time.time()
+
+    try:
+        stats_by_tile = fetch_cheap_stats(covered_tiles, ds)
         logger.debug(f"  {batch_label} cheap fetch: {time.time()-t0:.1f}s")
 
     except Exception as exc:
@@ -88,21 +143,16 @@ def filter_batch_cheap(
             f"{time.time()-t0:.1f}s — {exc}"
         )
 
-        for t in tiles:
+        for t in covered_tiles:
             update_tile(
                 t["tile_id"],
                 status=TileStatus.FAILED,
                 error=str(exc),
             )
 
-        return {"failed": len(tiles)}
+        return {"failed": len(covered_tiles)}
 
-    counts = {
-        "cheap_valid": 0,
-        "rejected": 0,
-    }
-
-    for t in tiles:
+    for t in covered_tiles:
         tile_id = t["tile_id"]
 
         stats = stats_by_tile.get(tile_id)
@@ -139,7 +189,8 @@ def filter_batch_cheap(
     logger.debug(
         f"  {batch_label} cheap eval: "
         f"cheap_valid={counts['cheap_valid']} "
-        f"rejected={counts['rejected']}"
+        f"rejected={counts['rejected']} "
+        f"tessera_no_coverage={counts['tessera_no_coverage']}"
     )
 
     return counts

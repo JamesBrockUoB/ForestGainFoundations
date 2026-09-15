@@ -6,7 +6,6 @@ from threading import Event
 from typing import Any, Callable
 
 from config import settings
-from embeddings.aee import download_embeddings as download_aee
 from embeddings.tessera import download_embeddings as download_tessera
 
 
@@ -40,7 +39,6 @@ def _process_embedding_source_with_retry(
     tile_id = tile["tile_id"]
 
     for attempt in range(retries):
-
         if cancel_event.is_set():
             logger.warning(f"{tile_id} | {name} cancelled")
             return False
@@ -77,7 +75,7 @@ def process_tessera_with_retry(
     cancel_event: Event,
     retries: int = 5,
 ) -> bool:
-    return _process_embedding_source_with_retry(
+    ok = _process_embedding_source_with_retry(
         "TESSERA",
         download_tessera,
         tile,
@@ -86,24 +84,9 @@ def process_tessera_with_retry(
         cancel_event,
         retries,
     )
-
-
-def process_aee_with_retry(
-    tile: dict[str, Any],
-    output_dir: Path,
-    logger: logging.Logger,
-    cancel_event: Event,
-    retries: int = 5,
-) -> bool:
-    return _process_embedding_source_with_retry(
-        "AEE",
-        download_aee,
-        tile,
-        output_dir,
-        logger,
-        cancel_event,
-        retries,
-    )
+    if not ok:
+        cancel_event.set()
+    return ok
 
 
 def process_all_embeddings_with_retry(
@@ -114,13 +97,10 @@ def process_all_embeddings_with_retry(
     retries: int = 5,
 ) -> bool:
     """
-    TESSERA always runs here. AEE only runs here when
-    settings.aee_source == "geoai" — when it's "gee", AEE was already
-    submitted as a Drive export task alongside composites/static/labels
-    (export/aee.py's submit_aee_exports, wired into process_tile) and
-    has already landed on disk via rclone by the time this function
-    runs; calling download_aee again here would be redundant.
+    Downloads TESSERA embeddings for the tile.
+    If TESSERA fails and exhausts retries, cancel_event is set.
     """
+    tile_id = tile["tile_id"]
 
     tessera_ok = process_tessera_with_retry(
         tile,
@@ -131,18 +111,6 @@ def process_all_embeddings_with_retry(
     )
 
     if not tessera_ok:
-        return False
+        logger.error(f"{tile_id} | embedding download failed, aborting tile")
 
-    aee_ok = (
-        process_aee_with_retry(
-            tile,
-            output_dir,
-            logger,
-            cancel_event,
-            retries,
-        )
-        if settings.aee_source == "geoai"
-        else True
-    )
-
-    return aee_ok
+    return tessera_ok

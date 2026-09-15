@@ -3,123 +3,79 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import torch
+from config import BACKBONE_BAND_INDICES, PERIOD_YEARS, VALID_MASK_BAND_INDEX
 from torch.utils.data import Dataset
 
-from .config import (
-    BACKBONE_BAND_INDICES,
-    NUM_CLASSES,
-    PERIOD_HAS_TYPOLOGY,
-    PERIOD_YEARS,
-)
 
-
-class GainTileDataset(Dataset):
+class MultiTemporalGainDataset(Dataset):
     """
-    One item per tile: multi-year 6-band Prithvi-native stack plus weak
-    labels. `period` ("p1" or "p2") determines both the year sequence
-    (PERIOD_YEARS) and whether typology labels are even attempted
-    (PERIOD_HAS_TYPOLOGY) -- p2 tiles never read pseudo_labels.tif, since
-    that label source doesn't exist for p2 at all, not just at low
-    coverage. A dataset instance is always single-period: p1 and p2 tiles
-    have different T and can't be collated into the same batch, so build
-    one dataset/dataloader per period.
-
-    Expected layout:
-        <tile_dir>/composites/s1s2_<year>.tif   (13-band composite)
-        <tile_dir>/labels/pseudo_labels.tif      (band 5 = dominant class,
-                                                   band 6 = confidence;
-                                                   p1 only)
-        <tile_dir>/labels/gain_confidence.tif    (continuous, 50-100 range,
-                                                   NaN outside gain coverage;
-                                                   both periods)
-        <tile_dir>/embeddings/aee_<year>.tif    64-band embeddings product
-        <tile_dir>/embeddings/tessera_<year>.tif 128-band embeddings product
-        <tile_dir>/static/fabdem.tif             elevation map product
-        <tile_dir>/static/slope.tif              slope data map
-        <tile_dir>/static/protected_area.tif             protected area map
-        <tile_dir>/metadata.json                 collection of tile-level data for stratification and feature use
+    Dataset loading N-timestep S1/S2 composite stacks exported by GEE.
+    Extracts embedded validity mask directly from Band 14 (s2_valid_<year>).
     """
 
-    def __init__(
-        self,
-        tile_dirs: list[Path],
-        period: str,
-        band_stats: dict[str, tuple[float, float]] | None = None,
-    ):
-        if period not in PERIOD_YEARS:
-            raise ValueError(f"Unknown period '{period}'")
-        self.tile_dirs = tile_dirs
+    def __init__(self, tile_dirs: list[Path], period: str = "p1"):
+        self.tile_dirs = sorted(tile_dirs)
         self.period = period
         self.years = PERIOD_YEARS[period]
-        self.has_typology = PERIOD_HAS_TYPOLOGY[period]
-        self.band_stats = band_stats or {b: (0.0, 1.0) for b in BACKBONE_BAND_INDICES}
+        self.band_indices = list(BACKBONE_BAND_INDICES.values())
 
     def __len__(self):
         return len(self.tile_dirs)
 
-    @property
-    def num_frames(self) -> int:
-        return len(self.years)
-
-    def _read_year(self, tile_dir: Path, year: int) -> np.ndarray:
-        path = tile_dir / "composites" / f"s1s2_{year}.tif"
+    def _load_tif_bands(self, path: Path, channels: list[int]) -> np.ndarray:
         with rasterio.open(path) as src:
-            bands = []
-            for name, idx in BACKBONE_BAND_INDICES.items():
-                arr = src.read(idx).astype(np.float32)
-                mean, std = self.band_stats[name]
-                bands.append((arr - mean) / std)
-            return np.stack(bands, axis=0)  # (C, H, W)
+            data = src.read(channels)
+        return data.astype(np.float32)
 
-    def _read_typology(self, tile_dir: Path, gain_valid: np.ndarray):
-        if not self.has_typology:
-            return np.zeros(NUM_CLASSES, dtype=np.float32), 0.0
+    def __getitem__(self, idx: int) -> dict:
+        tile_dir = self.tile_dirs[idx]
 
-        with rasterio.open(tile_dir / "labels" / "pseudo_labels.tif") as src:
-            pseudo = src.read()
-        dominant = pseudo[4]
-        confidence = pseudo[5]
-        labelled = (dominant != -9999) & (confidence != -9999) & gain_valid
+        frames = []
+        valid_masks = []
 
-        if labelled.sum() == 0:
-            return np.zeros(NUM_CLASSES, dtype=np.float32), 0.0
+        for year in self.years:
+            img_path = tile_dir / "composites" / f"s1s2_{year}.tif"
+            if not img_path.exists():
+                raise FileNotFoundError(f"Missing composite geotiff: {img_path}")
 
-        counts = np.bincount(dominant[labelled].astype(np.int64), minlength=NUM_CLASSES)
-        class_dist = counts / counts.sum()
-        cls_weight = float(confidence[labelled].mean())
-        return class_dist.astype(np.float32), cls_weight
+            # 1. Read model input features (S1 + S2 bands)
+            frame = self._load_tif_bands(img_path, self.band_indices)  # (C, H, W)
 
-    def __getitem__(self, i):
-        tile_dir = self.tile_dirs[i]
+            # S2 Reflectance scaling (0-10000 -> 0-1), leave SAR (VV, VH, VVVH) intact
+            # Band positions 3 to 9 correspond to S2 optical bands in BACKBONE_BAND_INDICES
+            frame[3:, :, :] = np.clip(frame[3:, :, :] / 10000.0, 0.0, 1.0)
+            frames.append(frame)
 
-        frames = [self._read_year(tile_dir, y) for y in self.years]
-        stack = np.stack(frames, axis=0)  # (T, C, H, W)
-        stack = np.transpose(stack, (1, 0, 2, 3))  # (C, T, H, W)
-        pixels = torch.from_numpy(stack).float()
+            # 2. Extract embedded validity mask from Band 14
+            valid_mask = self._load_tif_bands(img_path, [VALID_MASK_BAND_INDEX])[
+                0
+            ]  # (H, W)
+            valid_masks.append(valid_mask)
 
-        with rasterio.open(tile_dir / "labels" / "gain_confidence.tif") as src:
-            gain_conf = src.read(1).astype(np.float32)
-        gain_valid = ~np.isnan(gain_conf)
-        # Map the 50..100 confidence range to 0..1 for soft targets.
-        gain_weight = np.clip(
-            (np.nan_to_num(gain_conf, nan=50.0) - 50.0) / 50.0, 0.0, 1.0
-        )
-        # gain_mask keeps previous semantic (valid pixel presence) as float32 0/1
-        gain_mask = gain_valid.astype(np.float32)
+        # Stack into (T, C, H, W)
+        pixels = np.stack(frames, axis=0)
+        pixels = np.nan_to_num(pixels, nan=0.0)
 
-        class_dist, cls_weight = self._read_typology(tile_dir, gain_valid)
+        # Combine temporal validity: pixel must be valid across all timesteps
+        combined_valid = np.prod(np.stack(valid_masks, axis=0), axis=0)  # (H, W)
+
+        confidence = self._load_tif_bands(
+            tile_dir / "labels" / "gain_confidence.tif", [1]
+        )[0]
+
+        # Treat NaN confidence pixels as no-gain, zero weight
+        confidence = np.nan_to_num(confidence, nan=0.0)
+
+        # Derive binary presence mask
+        gain_mask = (confidence > 0).astype(np.float32)
+
+        # Derive soft confidence weight, normalized to 0-1
+        gain_weight = np.clip(confidence / 100.0, 0.0, 1.0).astype(np.float32)
 
         return {
-            "pixels": pixels,
-            # soft target probability in [0,1]
-            "gain_target": torch.from_numpy(gain_weight),
-            # keep legacy name for backward compatibility
-            "gain_weight": torch.from_numpy(gain_weight),
-            # 1.0 for valid pixels, 0.0 for nodata
-            "gain_mask": torch.from_numpy(gain_mask),
-            # value 1.0 where gain was valid, 0.0 otherwise (float32 preserved)
-            "gain_valid": torch.from_numpy(gain_valid.astype(np.float32)),
-            "class_dist": torch.from_numpy(class_dist),
-            "cls_weight": torch.tensor(cls_weight, dtype=torch.float32),
+            "pixels": torch.from_numpy(pixels).float(),  # (T, C, H, W)
+            "gain_mask": torch.from_numpy(gain_mask).float(),  # (H, W)
+            "gain_weight": torch.from_numpy(gain_weight).float(),  # (H, W)
+            "gain_valid": torch.from_numpy(combined_valid).float(),  # (H, W)
             "tile_id": tile_dir.name,
         }

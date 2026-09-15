@@ -22,11 +22,6 @@ def submit_aee_exports(
     """
     One Drive export task per year, landing at embeddings/aee_<year>.tif
     via the same Export->Drive->rclone path as composites/static/labels.
-    Only submitted when settings.aee_source == "gee" — the default
-    ("geoai") fetches AEE via direct HTTPS reads in the synchronous
-    embeddings step instead (see embeddings/aee.py), costing no GEE
-    task-queue quota. Not masked by full_valid — AEE is an independent
-    embedding source, not derived from S1/S2 coverage.
     """
     tasks: dict[str, ee.batch.Task] = {}
 

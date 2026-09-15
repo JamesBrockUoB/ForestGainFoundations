@@ -1,9 +1,7 @@
 import logging
 import os
-import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 from config import settings
 
@@ -75,8 +73,7 @@ def rclone_all_products(
     if not products:
         return True
 
-    cpu_count = os.cpu_count() or 4
-    default_workers = min(len(products), max(2, cpu_count * 2))
+    default_workers = min(len(products), 6)
     max_workers = max_workers or default_workers
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
