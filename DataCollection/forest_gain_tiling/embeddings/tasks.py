@@ -5,7 +5,6 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Callable
 
-from config import settings
 from embeddings.tessera import download_embeddings as download_tessera
 
 

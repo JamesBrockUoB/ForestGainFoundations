@@ -12,7 +12,7 @@ WANDB_ENTITY = os.environ.get("WANDB_USERNAME")
 
 sweep_configuration = {
     "method": "bayes",
-    "metric": {"goal": "maximize", "name": "val/f1"},
+    "metric": {"goal": "maximize", "name": "val_iou"},
     "parameters": {
         "learning_rate": {
             "distribution": "log_uniform_values",

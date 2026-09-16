@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import random
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,10 @@ from tiling.grid import crs_transform, tile_geom
 
 def get_local_output_dir(tile_id: str) -> Path:
     return settings.data_dir / "test_tiles" / tile_id
+
+
+def get_embeddings_scratch_dir(tile_id: str) -> Path:
+    return settings.data_dir / "tessera_scratch" / tile_id
 
 
 def _wait_for_all(
@@ -181,13 +186,42 @@ def process_tile(
 
         embeddings_result: dict[str, bool] = {}
 
+        # When writing to the real HPC destination, stage TESSERA
+        # downloads on local scratch disk instead of writing them
+        # straight into output_dir (which lives under hpc_path). Only
+        # the finished, verified .tif files get moved into output_dir;
+        # the scratch dir itself is always deleted afterward, whether
+        # the download succeeded or not.
+        embeddings_scratch = (
+            None if local_output else get_embeddings_scratch_dir(tile_id)
+        )
+        embeddings_target_dir = output_dir if local_output else embeddings_scratch
+
         def _run_embeddings() -> None:
-            embeddings_result["ok"] = process_all_embeddings_with_retry(
-                tile,
-                output_dir,
-                logger,
-                cancel_event,
-            )
+            try:
+                if embeddings_scratch is not None:
+                    shutil.rmtree(embeddings_scratch, ignore_errors=True)
+                    embeddings_scratch.mkdir(parents=True, exist_ok=True)
+
+                ok = process_all_embeddings_with_retry(
+                    tile,
+                    embeddings_target_dir,
+                    logger,
+                    cancel_event,
+                )
+
+                if ok and embeddings_scratch is not None:
+                    final_embeddings_dir = output_dir / "embeddings"
+                    final_embeddings_dir.mkdir(parents=True, exist_ok=True)
+                    scratch_embeddings_dir = embeddings_scratch / "embeddings"
+                    if scratch_embeddings_dir.exists():
+                        for tif in scratch_embeddings_dir.glob("*.tif"):
+                            shutil.move(str(tif), str(final_embeddings_dir / tif.name))
+
+                embeddings_result["ok"] = ok
+            finally:
+                if embeddings_scratch is not None:
+                    shutil.rmtree(embeddings_scratch, ignore_errors=True)
 
         t_embeddings = threading.Thread(target=_run_embeddings)
         t_embeddings.start()

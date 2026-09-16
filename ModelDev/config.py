@@ -16,6 +16,9 @@ BACKBONE_BAND_INDICES = {
     "B12": 10,
 }
 
+S1_BANDS = ("S1_VV", "S1_VH", "S1_VVVH")
+S2_BANDS = ("B2", "B3", "B4", "B8", "B8A", "B11", "B12")
+
 VALID_MASK_BAND_INDEX = 14  # s2_valid_<year> embedded directly in the GeoTIFF
 NUM_INPUT_CHANNELS = len(BACKBONE_BAND_INDICES)
 
