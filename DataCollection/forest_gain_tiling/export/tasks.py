@@ -4,6 +4,7 @@ import logging
 import multiprocessing as mp
 import random
 import shutil
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -19,6 +20,8 @@ from export.composites import submit_composite_exports
 from export.drive import (
     check_hpc_available,
     rclone_all_products,
+    rclone_push,
+    rclone_read_bytes,
 )
 from export.labels import submit_label_exports
 from export.metadata import write_tile_metadata
@@ -36,8 +39,8 @@ def get_local_output_dir(tile_id: str) -> Path:
     return settings.data_dir / "test_tiles" / tile_id
 
 
-def get_embeddings_scratch_dir(tile_id: str) -> Path:
-    return settings.data_dir / "tessera_scratch" / tile_id
+def get_embeddings_scratch_dir() -> Path:
+    return settings.data_dir / "tessera_scratch"
 
 
 def _wait_for_all(
@@ -46,6 +49,7 @@ def _wait_for_all(
     tile_id: str,
     submitted_times: dict[str, float] | None = None,
     poll_interval: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     if poll_interval is None:
         poll_interval = settings.poll_interval
@@ -58,6 +62,17 @@ def _wait_for_all(
         submitted_times = {k: time.time() for k in tasks.keys()}
 
     while pending:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.warning(
+                f"{tile_id} | cancellation requested; cancelling GEE exports"
+            )
+            for task in pending.values():
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
+            return False
+
         for key, task in list(pending.items()):
             try:
                 status = task.status()
@@ -108,26 +123,36 @@ def _wait_for_all(
     return True
 
 
-def _verify_tile_outputs(output_dir: Path, gee_product_keys: list[str]) -> list[str]:
-    """
-    Final gate before COMPLETE: confirm every GEE-derived product and
-    every expected TESSERA embedding file for the active period actually landed
-    on disk. Embedding years are scoped to settings.period_years (p1:
-    2017-2020, p2: 2020-2024). Returns a list of missing relative product
-    keys (empty = fully verified).
-    """
+def _dest_file_exists(dest_root: str, rel_path: str) -> bool:
+    full_path = f"{dest_root}/{rel_path}"
+
+    if ":" not in dest_root:
+        return Path(full_path).exists()
+
+    parent, filename = full_path.rsplit("/", 1)
+    result = subprocess.run(["rclone", "lsf", parent], capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    return filename in result.stdout.splitlines()
+
+
+def _verify_tile_outputs(
+    tile_id: str,
+    dest_root: str,
+    gee_product_keys: list[str],
+) -> list[str]:
     missing: list[str] = []
 
     for key in gee_product_keys:
         category, name = key.split("/", 1)
-        if not (output_dir / category / f"{name}.tif").exists():
+        rel_path = f"{tile_id}/{category}/{name}.tif"
+        if not _dest_file_exists(dest_root, rel_path):
             missing.append(key)
 
     for year in settings.period_years:
-        if not (output_dir / "embeddings" / f"tessera_{year}.tif").exists():
+        rel_path = f"{tile_id}/embeddings/tessera_{year}.tif"
+        if not _dest_file_exists(dest_root, rel_path):
             missing.append(f"embeddings/tessera_{year}")
-        if not (output_dir / "embeddings" / f"aee_{year}.tif").exists():
-            missing.append(f"embeddings/aee_{year}")
 
     return missing
 
@@ -138,12 +163,6 @@ def process_tile(
     logger: logging.Logger,
     local_output: bool = False,
 ) -> str:
-    """
-    Process one tile: submit every GEE export (composites/static/labels),
-    start TESSERA embeddings downloading IMMEDIATELY in parallel, wait for all
-    GEE tasks, rclone, then join the embeddings thread and verify everything landed.
-    A tile is only ever marked COMPLETE after every product has been confirmed on disk.
-    """
     tile_id = tile["tile_id"]
     geom = tile_geom(tile)
     ct = crs_transform(tile)
@@ -152,6 +171,7 @@ def process_tile(
     output_dir: Path | None = None
     cancel_event = threading.Event()
     t_embeddings: threading.Thread | None = None
+    rclone_completed = False
 
     try:
         _, _, gain_confidence = build_gain_layer(geom, ds)
@@ -164,7 +184,6 @@ def process_tile(
         )
         tasks.update(submit_aee_exports(geom, ct, tile_id))
 
-        # record local submit timestamps for timing diagnostics
         submitted_times = {k: time.time() for k in tasks.keys()}
 
         update_tile(
@@ -181,61 +200,83 @@ def process_tile(
         else:
             if not settings.hpc_path:
                 raise RuntimeError("HPC_PATH is not configured")
-            output_dir = Path(settings.hpc_path) / tile_id
+            output_dir = get_local_output_dir(tile_id)
             dest_root = settings.hpc_path
 
         embeddings_result: dict[str, bool] = {}
 
-        # When writing to the real HPC destination, stage TESSERA
-        # downloads on local scratch disk instead of writing them
-        # straight into output_dir (which lives under hpc_path). Only
-        # the finished, verified .tif files get moved into output_dir;
-        # the scratch dir itself is always deleted afterward, whether
-        # the download succeeded or not.
-        embeddings_scratch = (
-            None if local_output else get_embeddings_scratch_dir(tile_id)
-        )
+        embeddings_scratch = None if local_output else get_embeddings_scratch_dir()
         embeddings_target_dir = output_dir if local_output else embeddings_scratch
 
         def _run_embeddings() -> None:
             try:
                 if embeddings_scratch is not None:
-                    shutil.rmtree(embeddings_scratch, ignore_errors=True)
+                    if embeddings_scratch.exists():
+                        shutil.rmtree(embeddings_scratch)
                     embeddings_scratch.mkdir(parents=True, exist_ok=True)
 
                 ok = process_all_embeddings_with_retry(
-                    tile,
-                    embeddings_target_dir,
-                    logger,
-                    cancel_event,
+                    tile, embeddings_target_dir, logger, cancel_event
                 )
+                embeddings_result["ok"] = ok
 
-                if ok and embeddings_scratch is not None:
+                if not ok:
+                    cancel_event.set()
+                    return
+
+                if embeddings_scratch is not None:
+                    scratch_embeddings_dir = embeddings_scratch / "embeddings"
+
+                    if not scratch_embeddings_dir.exists():
+                        raise RuntimeError(
+                            f"{tile_id} | TESSERA embeddings directory missing: "
+                            f"{scratch_embeddings_dir}"
+                        )
+
                     final_embeddings_dir = output_dir / "embeddings"
                     final_embeddings_dir.mkdir(parents=True, exist_ok=True)
-                    scratch_embeddings_dir = embeddings_scratch / "embeddings"
-                    if scratch_embeddings_dir.exists():
-                        for tif in scratch_embeddings_dir.glob("*.tif"):
-                            shutil.move(str(tif), str(final_embeddings_dir / tif.name))
 
-                embeddings_result["ok"] = ok
+                    for tif in scratch_embeddings_dir.glob("*.tif"):
+                        destination = final_embeddings_dir / tif.name
+                        if destination.exists():
+                            destination.unlink()
+                        shutil.move(str(tif), str(destination))
+
             finally:
                 if embeddings_scratch is not None:
-                    shutil.rmtree(embeddings_scratch, ignore_errors=True)
+                    try:
+                        if embeddings_scratch.exists():
+                            shutil.rmtree(embeddings_scratch, ignore_errors=False)
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        logger.exception(
+                            "%s | failed to remove TESSERA scratch: %s",
+                            tile_id,
+                            embeddings_scratch,
+                        )
 
         t_embeddings = threading.Thread(target=_run_embeddings)
         t_embeddings.start()
 
-        if not _wait_for_all(tasks, logger, tile_id, submitted_times=submitted_times):
-            raise RuntimeError("one or more GEE export tasks failed")
+        if not _wait_for_all(
+            tasks,
+            logger,
+            tile_id,
+            submitted_times=submitted_times,
+            cancel_event=cancel_event,
+        ):
+            raise RuntimeError(
+                "one or more GEE export tasks failed or processing was cancelled"
+            )
 
         logger.info(f"{tile_id} | all exports complete")
 
         logger.info(f"{tile_id} | rcloning data")
         products = [tuple(key.split("/", 1)) for key in tasks.keys()]
         rclone_ok = rclone_all_products(tile_id, products, dest_root, logger)
+        rclone_completed = rclone_ok
 
-        # Embeddings thread runs concurrently -- join to wait for completion
         t_embeddings.join()
 
         if not rclone_ok:
@@ -252,13 +293,49 @@ def process_tile(
         if not embeddings_result.get("ok"):
             raise RuntimeError("embedding acquisition failed")
 
-        missing = _verify_tile_outputs(output_dir, list(tasks.keys()))
+        if not local_output:
+            if not rclone_push(
+                str(output_dir / "embeddings"),
+                f"{dest_root}/{tile_id}/embeddings",
+                logger,
+            ):
+                raise RuntimeError("failed to push TESSERA embeddings to destination")
+
+        missing = _verify_tile_outputs(tile_id, dest_root, list(tasks.keys()))
         if missing:
             raise RuntimeError(f"missing outputs after processing: {missing}")
 
         logger.info(f"{tile_id} | rcloning complete")
 
-        write_tile_metadata(tile, output_dir, logger)
+        if local_output:
+            write_tile_metadata(tile, output_dir, logger)
+        else:
+            remote_labels_dir = f"{dest_root}/{tile_id}/labels"
+            gain_bytes = rclone_read_bytes(
+                f"{remote_labels_dir}/gain_confidence.tif", logger
+            )
+            if gain_bytes is None:
+                raise RuntimeError(
+                    f"{tile_id} | could not read gain_confidence.tif from "
+                    f"{dest_root} for metadata computation"
+                )
+            pseudo_bytes = rclone_read_bytes(
+                f"{remote_labels_dir}/pseudo_labels.tif", logger
+            )
+            write_tile_metadata(tile, output_dir, logger, gain_bytes, pseudo_bytes)
+            if not rclone_push(
+                str(output_dir / "metadata.json"),
+                f"{dest_root}/{tile_id}/metadata.json",
+                logger,
+            ):
+                raise RuntimeError("failed to push metadata.json to destination")
+
+            try:
+                shutil.rmtree(output_dir)
+            except OSError as exc:
+                logger.warning(
+                    f"{tile_id} | failed to remove local output dir {output_dir}: {exc}"
+                )
 
         update_tile(
             tile_id,
@@ -270,7 +347,6 @@ def process_tile(
 
     except Exception as exc:
         logger.exception(f"{tile_id} | processing failed")
-
         return _cleanup_failed_tile(
             tile_id=tile_id,
             reason=str(exc),
@@ -279,6 +355,7 @@ def process_tile(
             output_dir=output_dir,
             embeddings_thread=t_embeddings,
             cancel_event=cancel_event,
+            drive_already_cleared=rclone_completed,
         )
 
 
@@ -288,7 +365,6 @@ def run_local(
     logger: logging.Logger,
     local_output: bool = False,
 ) -> None:
-    """Process tiles sequentially."""
     if not local_output:
         if not settings.hpc_path:
             raise RuntimeError("HPC_PATH is not configured")
@@ -309,7 +385,6 @@ def _mp_worker(
     worker_id: int,
     local_output: bool,
 ) -> None:
-    """HPC worker."""
     time.sleep(worker_id * 5)
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
@@ -372,7 +447,6 @@ def run_hpc(
     candidates: list[dict],
     logger: logging.Logger,
 ) -> None:
-    """Process tiles with HPC workers."""
     if not settings.hpc_path:
         raise RuntimeError("HPC_PATH is not configured")
     if not check_hpc_available(settings.hpc_path, logger):

@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 earthengine-api
 requests
 rasterio
@@ -17,3 +19,8 @@ streamlit
 streamlit-folium
 pytest
 wandb
+
+torch==2.14.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.14.0+cu128
+pytorch-lightning

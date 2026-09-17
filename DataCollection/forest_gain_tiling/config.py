@@ -118,6 +118,41 @@ class Settings:
     filter_batch_size_cheap: int = 200
     filter_batch_size_imagery: int = 40
 
+    tessera_year_timeout_s: int = field(
+        default_factory=lambda: int(os.getenv("TESSERA_YEAR_TIMEOUT_S", "60"))
+    )
+    tessera_max_concurrent_years: int = field(
+        default_factory=lambda: int(os.getenv("TESSERA_MAX_CONCURRENT_YEARS", "2"))
+    )
+
+    rclone_transfers: int = field(
+        default_factory=lambda: int(os.getenv("RCLONE_TRANSFERS", "8"))
+    )
+    rclone_checkers: int = field(
+        default_factory=lambda: int(os.getenv("RCLONE_CHECKERS", "8"))
+    )
+    rclone_fast_list: bool = field(
+        default_factory=lambda: os.getenv("RCLONE_FAST_LIST", "1") == "1"
+    )
+    rclone_verify_checksum: bool = field(
+        default_factory=lambda: os.getenv("RCLONE_VERIFY_CHECKSUM", "0") == "1"
+    )
+    rclone_contimeout: str = field(
+        default_factory=lambda: os.getenv("RCLONE_CONTIMEOUT", "30s")
+    )
+    rclone_timeout: str = field(
+        default_factory=lambda: os.getenv("RCLONE_TIMEOUT", "120s")
+    )
+    rclone_low_level_retries: int = field(
+        default_factory=lambda: int(os.getenv("RCLONE_LOW_LEVEL_RETRIES", "10"))
+    )
+    rclone_drive_chunk_size: str | None = field(
+        default_factory=lambda: os.getenv("RCLONE_DRIVE_CHUNK_SIZE")
+    )
+    rclone_max_workers: int = field(
+        default_factory=lambda: int(os.getenv("RCLONE_MAX_WORKERS", "3"))
+    )
+
     def __post_init__(self) -> None:
         if self.period not in PERIOD_YEARS:
             raise ValueError(

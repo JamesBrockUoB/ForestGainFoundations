@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Callable
 
+from embeddings.tessera import TesseraNoDataError
 from embeddings.tessera import download_embeddings as download_tessera
 
 
@@ -21,6 +22,8 @@ def _process_embedding_source(
         download_fn(tile, output_dir, logger)
         logger.info(f"{tile_id} | {name} complete")
         return True
+    except TesseraNoDataError:
+        raise
     except Exception as exc:
         logger.error(f"{tile_id} | {name} failed: {exc}")
         return False
@@ -33,7 +36,7 @@ def _process_embedding_source_with_retry(
     output_dir: Path,
     logger: logging.Logger,
     cancel_event: Event,
-    retries: int = 5,
+    retries: int = 2,
 ) -> bool:
     tile_id = tile["tile_id"]
 
@@ -42,14 +45,20 @@ def _process_embedding_source_with_retry(
             logger.warning(f"{tile_id} | {name} cancelled")
             return False
 
-        if _process_embedding_source(
-            name,
-            download_fn,
-            tile,
-            output_dir,
-            logger,
-        ):
-            return True
+        try:
+            if _process_embedding_source(
+                name,
+                download_fn,
+                tile,
+                output_dir,
+                logger,
+            ):
+                return True
+        except TesseraNoDataError as exc:
+            logger.error(
+                f"{tile_id} | {name} has no data for this tile; not retrying: {exc}"
+            )
+            return False
 
         if attempt < retries - 1:
             wait = (2**attempt) + 1
@@ -72,7 +81,7 @@ def process_tessera_with_retry(
     output_dir: Path,
     logger: logging.Logger,
     cancel_event: Event,
-    retries: int = 5,
+    retries: int = 2,
 ) -> bool:
     ok = _process_embedding_source_with_retry(
         "TESSERA",
@@ -93,7 +102,7 @@ def process_all_embeddings_with_retry(
     output_dir: Path,
     logger: logging.Logger,
     cancel_event: Event,
-    retries: int = 5,
+    retries: int = 2,
 ) -> bool:
     """
     Downloads TESSERA embeddings for the tile.

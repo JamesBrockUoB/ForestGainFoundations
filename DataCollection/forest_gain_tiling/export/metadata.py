@@ -11,6 +11,7 @@ import numpy as np
 import rasterio
 from config import settings
 from enums import PseudoLabel
+from rasterio.io import MemoryFile
 from tiling.grid import tile_geom
 
 SOIL_BANDS = ["soc", "clay_pct", "ph"]
@@ -23,17 +24,6 @@ ERA5_YEARLY_BANDS = [
 
 
 def _fetch_soil(geom: ee.Geometry) -> dict[str, float | None]:
-    """
-    Tile-level soil scalars — SoilGrids (250m) is coarser than or
-    comparable to tile size, so a per-pixel raster would be
-    interpolation artifact rather than real spatial signal. Static,
-    single value, no period dependency.
-
-    SoilGrids stores values as scaled integers ("mapped" units) to save
-    space; divide by the documented conversion factor to get real-world
-    ("conventional") units. clay/soc/phh2o all use factor 10:
-    clay -> g/100g (%), soc -> g/kg, phh2o (pH*10) -> pH.
-    """
     soil = (
         ee.Image.cat(
             [
@@ -66,21 +56,6 @@ def _fetch_soil(geom: ee.Geometry) -> dict[str, float | None]:
 
 
 def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
-    """
-    One year of ERA5-Land Monthly Aggregated stats -- precipitation and
-    2m air temperature. All values are aggregated to a single tile-level scalar
-
-    ERA5-Land masks ocean at its own (~9km) native landmask resolution --
-    a coastal tile can be unambiguously on land at Sentinel-2 resolution
-    while still landing on an ERA5-Land cell classified as sea and
-    masked out. Filled from nearby valid (land) cells via focal_mean
-    before sampling -- GEE's focal_mean only averages over unmasked
-    neighbors within the kernel, so a masked coastal cell gets filled
-    from whichever real land cells surround it, without pulling sea
-    values into the average. Whether a given year/tile needed filling is
-    recorded via climate_source, so a real per-pixel reading is never
-    silently conflated with a filled one.
-    """
     ic = (
         ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR")
         .filterDate(f"{year}-01-01", f"{year + 1}-01-01")
@@ -123,10 +98,6 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
             "climate_source": "ERA5_LAND",
         }
 
-    # Masked (sea) cell -- fill from nearby land cells. Radius is in
-    # pixel units of stacked's own (~11.1km) resolution; try progressively
-    # wider radii rather than committing to one that might not reach land
-    # for a tile in a small bay/inlet.
     for radius_px in (3, 6, 10):
         filled = stacked.focal_mean(
             radius=radius_px, kernelType="square", units="pixels"
@@ -156,8 +127,12 @@ def _fetch_yearly_climate(
     return {str(year): _fetch_year_climate(geom, year) for year in period_years}
 
 
-def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
-    with rasterio.open(output_dir / "labels" / "gain_confidence.tif") as src:
+def _compute_tile_metadata(
+    tile: dict,
+    gain_confidence_bytes: bytes,
+    pseudo_labels_bytes: bytes | None,
+) -> dict[str, Any]:
+    with MemoryFile(gain_confidence_bytes) as memfile, memfile.open() as src:
         gain = src.read(1)
 
     gain_pixels = np.isfinite(gain) & (gain > 0)
@@ -197,23 +172,13 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
         metadata["climate_yearly"] = None
         metadata["climate_yearly_error"] = str(exc)
 
-    pseudo_path = output_dir / "labels" / "pseudo_labels.tif"
-
-    if pseudo_path.exists():
-        with rasterio.open(pseudo_path) as src:
+    if pseudo_labels_bytes is not None:
+        with MemoryFile(pseudo_labels_bytes) as memfile, memfile.open() as src:
             pseudo = src.read()
 
         dominant, confidence = pseudo[4], pseudo[5]
-
         gain_bool = np.nan_to_num(gain, nan=0.0) > 0
-
-        # -9999 is the sentinel written for "gain pixel with no
-        # pseudo-label" and is a finite value, so np.isfinite alone
-        # doesn't exclude it — that's what was letting -9999 through into
-        # dominant[pseudo_valid].astype(int) and then into bincount below,
-        # which rejects negative values.
         labelled = (dominant != -9999) & (confidence != -9999)
-
         pseudo_valid = (
             gain_bool & labelled & np.isfinite(dominant) & np.isfinite(confidence)
         )
@@ -223,7 +188,6 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
         if pseudo_valid.any():
             vals = dominant[pseudo_valid].astype(int)
             conf = confidence[pseudo_valid]
-
             counts = np.bincount(vals, minlength=len(class_names))
 
             metadata["pseudo_labels"] = {
@@ -245,8 +209,24 @@ def _compute_tile_metadata(tile: dict, output_dir: Path) -> dict[str, Any]:
     return metadata
 
 
-def write_tile_metadata(tile: dict, output_dir: Path, logger: logging.Logger) -> None:
-    metadata = _compute_tile_metadata(tile, output_dir)
+def write_tile_metadata(
+    tile: dict,
+    output_dir: Path,
+    logger: logging.Logger,
+    gain_confidence_bytes: bytes | None = None,
+    pseudo_labels_bytes: bytes | None = None,
+) -> None:
+    if gain_confidence_bytes is None:
+        gain_confidence_bytes = (
+            output_dir / "labels" / "gain_confidence.tif"
+        ).read_bytes()
+
+    if pseudo_labels_bytes is None:
+        pseudo_path = output_dir / "labels" / "pseudo_labels.tif"
+        if pseudo_path.exists():
+            pseudo_labels_bytes = pseudo_path.read_bytes()
+
+    metadata = _compute_tile_metadata(tile, gain_confidence_bytes, pseudo_labels_bytes)
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"{tile['tile_id']} | metadata written")
