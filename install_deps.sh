@@ -11,6 +11,7 @@
 set -euo pipefail
 
 REQ_FILE="requirements.txt"
+
 CU128_TORCH="torch==2.11.0+cu128"
 CU128_TORCHVISION="torchvision==0.26.0+cu128"
 CU128_TORCHAUDIO="torchaudio==2.11.0+cu128"
@@ -50,7 +51,7 @@ install_linux() {
     DRIVER_CUDA="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | head -n1 | awk '{print $3}')"
 
     if [ -z "$DRIVER_CUDA" ]; then
-        echo "WARNING: nvidia-smi ran but CUDA version couldn't be parsed from its output." >&2
+        echo "WARNING: nvidia-smi ran but CUDA version couldn't be parsed." >&2
         install_linux_cpu_fallback
         return
     fi
@@ -91,10 +92,14 @@ case "$OS_NAME" in
         ;;
 esac
 
+echo "== Installing project requirements =="
+pip install -r "$REQ_FILE" --no-deps
+
 echo "== Installing pytorch-lightning =="
 pip install pytorch-lightning
 
-echo "== Done. Verifying torch install =="
+echo "== Verifying installation =="
+
 python3 -c "
 import torch
 print(f'torch {torch.__version__}')
