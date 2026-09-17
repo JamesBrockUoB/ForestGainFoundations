@@ -16,6 +16,7 @@ def run_training(
     model_type: str = "tsvit",
     sources: tuple[str, ...] = ("s1", "s2"),
     batch_size: int = 8,
+    patience: int = 10,
     epochs: int = 50,
     lr: float = 3e-4,
     project_name: str = "Forest-Gain-CD",
@@ -75,6 +76,7 @@ def run_training(
             "sources": list(sources),
             "num_input_channels": train_ds.num_channels,
             "batch_size": batch_size,
+            "patience": patience,
             "epochs": epochs,
             "lr": lr,
         },
@@ -92,7 +94,7 @@ def run_training(
     early_stop_callback = EarlyStopping(
         monitor="val_iou",
         mode="max",
-        patience=25,
+        patience=patience,
         verbose=True,
     )
 
@@ -151,6 +153,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--patience",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
         "--epochs",
         type=int,
         default=50,
@@ -174,6 +182,7 @@ if __name__ == "__main__":
         model_type=args.model,
         sources=tuple(args.sources),
         batch_size=args.batch_size,
+        patience=args.patience,
         epochs=args.epochs,
         entity=args.wandb_entity,
     )
