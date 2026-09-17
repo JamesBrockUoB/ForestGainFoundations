@@ -61,11 +61,8 @@ if torch.cuda.is_available():
     print(f'CUDA device: {torch.cuda.get_device_name(0)}')
 "
 
-echo "== Installing project requirements from $REQ_FILE =="
-$PIP install $PIP_FLAGS -r "$REQ_FILE"
-
-echo "== Installing pytorch-lightning =="
-$PIP install $PIP_FLAGS pytorch-lightning
+echo "== Installing project requirements and pytorch-lightning =="
+$PIP install $PIP_FLAGS -r "$REQ_FILE" pytorch-lightning
 
 echo "== Verifying PyTorch installation =="
 
