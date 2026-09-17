@@ -24,7 +24,7 @@ sweep_configuration = {
             "min": 1e-6,
             "max": 1e-2,
         },
-        "model_type": {"values": ["sits_scd", "unet_lstm"]},
+        "model_type": {"values": ["sits_scd", "unet_lstm", "tsvit"]},
         "batch_size": {"values": [4, 8, 16]},
     },
 }
@@ -69,7 +69,7 @@ def sweep_train():
     # active from wandb.init() above, so this just attaches the PL logger to it
     # rather than starting a second, competing run.
     trainer = pl.Trainer(
-        max_epochs=20,
+        max_epochs=25,
         accelerator="auto",
         precision="16-mixed",
         logger=pl.loggers.WandbLogger(),

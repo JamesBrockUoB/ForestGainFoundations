@@ -92,7 +92,7 @@ def run_training(
     early_stop_callback = EarlyStopping(
         monitor="val_iou",
         mode="max",
-        patience=10,
+        patience=25,
         verbose=True,
     )
 
