@@ -2,9 +2,8 @@
 #
 # Installs project dependencies, picking the correct torch/torchvision/
 # torchaudio build for the current machine:
-#   - macOS            -> plain PyPI wheels (CPU/MPS build)
-#   - Linux + CUDA 12.x -> pinned cu128 build from download.pytorch.org
-#   - Linux, no usable NVIDIA driver -> plain CPU wheels, with a warning
+#   - macOS -> plain PyPI wheels (CPU/MPS build)
+#   - Linux -> pinned cu128 build from download.pytorch.org
 #
 # Run from the repo root: ./install_deps.sh
 
@@ -32,54 +31,11 @@ install_mac() {
     $PIP install $PIP_FLAGS torch torchvision torchaudio
 }
 
-install_linux_cpu_fallback() {
-    echo "WARNING: no usable NVIDIA driver detected; installing CPU-only torch." >&2
-    echo "         GPU-accelerated code will not run. If this is wrong, check" >&2
-    echo "         that 'nvidia-smi' works and the driver is loaded, then re-run." >&2
-    $PIP install $PIP_FLAGS torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cpu
-}
-
 install_linux() {
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo "WARNING: nvidia-smi not found; installing CPU-only PyTorch." >&2
-        install_linux_cpu_fallback
-        return
-    fi
-
-    # nvidia-smi's header reports the maximum CUDA version the installed
-    # driver supports (not necessarily what's currently loaded) -- e.g.
-    # "CUDA Version: 12.8". Parse that out.
-    DRIVER_CUDA="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | head -n1 | awk '{print $3}')"
-
-    if [ -z "$DRIVER_CUDA" ]; then
-        echo "WARNING: could not determine CUDA version from nvidia-smi; installing CPU-only PyTorch." >&2
-        install_linux_cpu_fallback
-        return
-    fi
-
-    DRIVER_MAJOR="${DRIVER_CUDA%%.*}"
-
-    echo "== NVIDIA driver reports CUDA $DRIVER_CUDA =="
-
-    if [ "$DRIVER_MAJOR" = "12" ]; then
-        echo "== Installing torch 2.11.0 pinned to CUDA 12.8 build =="
-        echo "   (PyPI's own default wheel for torch>=2.11 targets CUDA 13.0," >&2
-        echo "   which will not run on a 12.x-only driver -- hence the explicit" >&2
-        echo "   +cu128 pin and extra index below.)" >&2
-        $PIP install $PIP_FLAGS \
-            "$CU128_TORCH" "$CU128_TORCHVISION" "$CU128_TORCHAUDIO" \
-            --extra-index-url "$CU128_INDEX"
-    elif [ "$DRIVER_MAJOR" -ge 13 ] 2>/dev/null; then
-        echo "== Driver supports CUDA $DRIVER_CUDA (>=13); installing plain PyPI torch =="
-        echo "   (PyPI's default wheel now targets CUDA 13.0, which matches.)" >&2
-        $PIP install $PIP_FLAGS torch torchvision torchaudio
-    else
-        echo "WARNING: driver reports CUDA $DRIVER_CUDA, which this script doesn't" >&2
-        echo "         have a known-good pin for. Falling back to CPU-only torch." >&2
-        echo "         Install manually if you need GPU support at this CUDA version." >&2
-        install_linux_cpu_fallback
-    fi
+    echo "== Installing torch 2.11.0 pinned to CUDA 12.8 build =="
+    $PIP install $PIP_FLAGS \
+        "$CU128_TORCH" "$CU128_TORCHVISION" "$CU128_TORCHAUDIO" \
+        --extra-index-url "$CU128_INDEX"
 }
 
 case "$OS_NAME" in
