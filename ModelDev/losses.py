@@ -25,7 +25,10 @@ def weighted_bce_loss(
     per_px = F.binary_cross_entropy_with_logits(
         seg_logits, gain_mask.float(), reduction="none"
     )
-    weight = gain_weight * gain_valid
+    pixel_weight = torch.where(
+        gain_mask.bool(), gain_weight, torch.ones_like(gain_weight)
+    )
+    weight = pixel_weight * gain_valid
     denom = weight.sum().clamp(min=1.0)
     return (per_px * weight).sum() / denom
 
@@ -60,6 +63,9 @@ class FocalWeightedBCELoss(nn.Module):
         alpha_factor = self.alpha * gain_mask + (1 - self.alpha) * (1 - gain_mask)
         loss = alpha_factor * focal_factor * bce
 
-        weight = gain_weight * gain_valid
+        pixel_weight = torch.where(
+            gain_mask.bool(), gain_weight, torch.ones_like(gain_weight)
+        )
+        weight = pixel_weight * gain_valid
         denom = weight.sum().clamp(min=1.0)
         return (loss * weight).sum() / denom

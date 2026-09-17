@@ -14,18 +14,6 @@ from torch.utils.data import Dataset
 
 
 class MultiTemporalGainDataset(Dataset):
-    """
-    Dataset loading N-timestep S1/S2 composite stacks exported by GEE.
-
-    `sources` controls which modalities are loaded:
-        ("s1",)          -> S1 only
-        ("s2",)          -> S2 only
-        ("s1", "s2")     -> S1 + S2
-
-    The channel count and S2 scaling are derived automatically from the
-    selected bands.
-    """
-
     BAND_GROUPS = {
         "s1": S1_BANDS,
         "s2": S2_BANDS,
@@ -43,26 +31,22 @@ class MultiTemporalGainDataset(Dataset):
 
         invalid_sources = set(sources) - self.BAND_GROUPS.keys()
         if invalid_sources:
-            raise ValueError(
-                f"Unknown sources: {invalid_sources}. "
-                f"Expected one or more of: {tuple(self.BAND_GROUPS)}"
-            )
-
+            raise ValueError(f"Unknown sources: {invalid_sources}")
         if not sources:
             raise ValueError("At least one source must be selected")
 
         self.sources = sources
-
-        # Resolve semantic band names -> 1-based GeoTIFF band indices.
         self.band_names = tuple(
             band for source in sources for band in self.BAND_GROUPS[source]
         )
-
         self.band_indices = [BACKBONE_BAND_INDICES[band] for band in self.band_names]
 
-        # Track which loaded channels need S2 reflectance scaling.
+        # Classify band array positions for fast vectorised scaling
         self.s2_channel_indices = [
-            i for i, band in enumerate(self.band_names) if band in S2_BANDS
+            i for i, b in enumerate(self.band_names) if b in S2_BANDS
+        ]
+        self.s1_channel_indices = [
+            i for i, b in enumerate(self.band_names) if b in S1_BANDS
         ]
 
     def __len__(self):
@@ -72,83 +56,61 @@ class MultiTemporalGainDataset(Dataset):
     def num_channels(self) -> int:
         return len(self.band_indices)
 
-    def _load_tif_bands(
-        self,
-        path: Path,
-        channels: list[int],
-    ) -> np.ndarray:
+    def _load_tif_bands(self, path: Path, channels: list[int]) -> np.ndarray:
         with rasterio.open(path) as src:
-            data = src.read(channels)
+            return src.read(channels).astype(np.float32)
 
-        return data.astype(np.float32)
+    def _scale_physical_units(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Scales optical reflectance and radar dB backscatter to [0.0, 1.0]
+        using global physical boundaries (Sentinel Hub best practices).
+        """
+        scaled = np.empty_like(frame, dtype=np.float32)
+
+        # 1. Sentinel-2: Convert DN (0-10000) to reflectance factor [0.0, 1.0]
+        if self.s2_channel_indices:
+            s2_data = frame[self.s2_channel_indices] / 10000.0
+            scaled[self.s2_channel_indices] = np.clip(s2_data, 0.0, 1.0)
+
+        # 2. Sentinel-1: Clip dB backscatter to [-35.0, 5.0] dB and scale linearly to [0.0, 1.0]
+        if self.s1_channel_indices:
+            s1_data = frame[self.s1_channel_indices]
+            s1_clipped = np.clip(s1_data, -35.0, 5.0)
+            scaled[self.s1_channel_indices] = (s1_clipped + 35.0) / 40.0
+
+        return scaled
 
     def __getitem__(self, idx: int) -> dict:
         tile_dir = self.tile_dirs[idx]
-
-        frames = []
-        valid_masks = []
+        frames, valid_masks = [], []
 
         for year in self.years:
             img_path = tile_dir / "composites" / f"s1s2_{year}.tif"
-
             if not img_path.exists():
                 raise FileNotFoundError(f"Missing composite geotiff: {img_path}")
 
-            # Load only the requested modalities.
-            frame = self._load_tif_bands(
-                img_path,
-                self.band_indices,
-            )
+            # Read selected bands in exact channel order
+            raw_frame = self._load_tif_bands(img_path, self.band_indices)
 
-            # Scale S2 reflectance from 0-10000 -> 0-1.
-            # S1 SAR channels are left unchanged.
-            if self.s2_channel_indices:
-                frame[self.s2_channel_indices] = np.clip(
-                    frame[self.s2_channel_indices] / 10000.0,
-                    0.0,
-                    1.0,
-                )
+            # Apply physical normalization per modality
+            norm_frame = self._scale_physical_units(raw_frame)
+            frames.append(norm_frame)
 
-            frames.append(frame)
-
-            # Extract embedded validity mask from Band 14.
-            valid_mask = self._load_tif_bands(
-                img_path,
-                [VALID_MASK_BAND_INDEX],
-            )[0]
-
+            valid_mask = self._load_tif_bands(img_path, [VALID_MASK_BAND_INDEX])[0]
             valid_masks.append(valid_mask)
 
-        # Stack into (T, C, H, W).
         pixels = np.stack(frames, axis=0)
         pixels = np.nan_to_num(pixels, nan=0.0)
 
-        # Pixel must be valid across all timesteps.
-        combined_valid = np.prod(
-            np.stack(valid_masks, axis=0),
-            axis=0,
-        )
+        combined_valid = np.prod(np.stack(valid_masks, axis=0), axis=0)
 
         confidence = self._load_tif_bands(
-            tile_dir / "labels" / "gain_confidence.tif",
-            [1],
+            tile_dir / "labels" / "gain_confidence.tif", [1]
         )[0]
+        confidence = np.nan_to_num(confidence, nan=0.0)
 
-        # NaN confidence = no gain, zero weight.
-        confidence = np.nan_to_num(
-            confidence,
-            nan=0.0,
-        )
-
-        # Binary gain-presence mask.
         gain_mask = (confidence > 0).astype(np.float32)
-
-        # Soft confidence weight in [0, 1].
-        gain_weight = np.clip(
-            confidence / 100.0,
-            0.0,
-            1.0,
-        ).astype(np.float32)
+        gain_weight = np.clip(confidence / 100.0, 0.0, 1.0).astype(np.float32)
 
         return {
             "pixels": torch.from_numpy(pixels).float(),

@@ -2,24 +2,28 @@
 Configuration settings aligned with GEE export outputs.
 """
 
-# 1-based band indices mapping directly to exported s1s2_<year>.tif
 BACKBONE_BAND_INDICES = {
-    "S1_VV": 11,
-    "S1_VH": 12,
-    "S1_VVVH": 13,
+    # Sentinel-2
     "B2": 1,
     "B3": 2,
     "B4": 3,
     "B8": 4,
+    "B5": 5,
+    "B6": 6,
+    "B7": 7,
     "B8A": 8,
     "B11": 9,
     "B12": 10,
+    # Sentinel-1 (dB scale)
+    "S1_VV": 11,
+    "S1_VH": 12,
+    "S1_VVVH": 13,
 }
 
+VALID_MASK_BAND_INDEX = 14
 S1_BANDS = ("S1_VV", "S1_VH", "S1_VVVH")
-S2_BANDS = ("B2", "B3", "B4", "B8", "B8A", "B11", "B12")
+S2_BANDS = ("B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12")
 
-VALID_MASK_BAND_INDEX = 14  # s2_valid_<year> embedded directly in the GeoTIFF
 NUM_INPUT_CHANNELS = len(BACKBONE_BAND_INDICES)
 
 PERIOD_YEARS = {

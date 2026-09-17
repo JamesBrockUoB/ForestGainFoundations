@@ -46,8 +46,14 @@ class GainDetectionTask(pl.LightningModule):
         sample_weights: torch.Tensor,
     ) -> torch.Tensor:
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+
         pos_weight_tensor = torch.where(targets == 1.0, self.pos_weight, 1.0)
-        weighted_loss = bce_loss * pos_weight_tensor * sample_weights
+
+        pixel_weight = torch.where(
+            targets == 1.0, sample_weights, torch.ones_like(sample_weights)
+        )
+
+        weighted_loss = bce_loss * pos_weight_tensor * pixel_weight
         masked_loss = weighted_loss * valid_mask
 
         total_valid = valid_mask.sum()
