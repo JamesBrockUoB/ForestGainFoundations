@@ -8,7 +8,7 @@
 #
 # Run from the repo root: ./install_deps.sh
 
-set -euo pipefail
+set -eu
 
 REQ_FILE="requirements.txt"
 
@@ -47,7 +47,7 @@ install_linux() {
         return
     fi
 
-    # nvidia-smi's header reports the *maximum* CUDA version the installed
+    # nvidia-smi's header reports the maximum CUDA version the installed
     # driver supports (not necessarily what's currently loaded) -- e.g.
     # "CUDA Version: 12.8". Parse that out.
     DRIVER_CUDA="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | head -n1 | awk '{print $3}')"
@@ -70,7 +70,7 @@ install_linux() {
         $PIP install $PIP_FLAGS \
             "$CU128_TORCH" "$CU128_TORCHVISION" "$CU128_TORCHAUDIO" \
             --extra-index-url "$CU128_INDEX"
-    elif [ "$DRIVER_MAJOR" -ge "13" ] 2>/dev/null; then
+    elif [ "$DRIVER_MAJOR" -ge 13 ] 2>/dev/null; then
         echo "== Driver supports CUDA $DRIVER_CUDA (>=13); installing plain PyPI torch =="
         echo "   (PyPI's default wheel now targets CUDA 13.0, which matches.)" >&2
         $PIP install $PIP_FLAGS torch torchvision torchaudio
