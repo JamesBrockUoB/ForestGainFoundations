@@ -41,7 +41,8 @@ install_linux_cpu_fallback() {
 
 install_linux() {
     if ! command -v nvidia-smi >/dev/null 2>&1; then
-        install_linux_cpu_fallback
+        echo "WARNING: nvidia-smi not found; installing CPU-only PyTorch." >&2
+        install_linux_cpu
         return
     fi
 
@@ -51,14 +52,14 @@ install_linux() {
     DRIVER_CUDA="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | head -n1 | awk '{print $3}')"
 
     if [ -z "$DRIVER_CUDA" ]; then
-        echo "WARNING: nvidia-smi ran but CUDA version couldn't be parsed." >&2
-        install_linux_cpu_fallback
+        echo "WARNING: could not determine CUDA version from nvidia-smi; installing CPU-only PyTorch." >&2
+        install_linux_cpu
         return
     fi
 
     DRIVER_MAJOR="${DRIVER_CUDA%%.*}"
 
-    echo "== Detected NVIDIA driver supporting CUDA $DRIVER_CUDA =="
+    echo "== NVIDIA driver reports CUDA $DRIVER_CUDA =="
 
     if [ "$DRIVER_MAJOR" = "12" ]; then
         echo "== Installing torch 2.11.0 pinned to CUDA 12.8 build =="
@@ -92,13 +93,13 @@ case "$OS_NAME" in
         ;;
 esac
 
-echo "== Installing project requirements =="
-pip install -r "$REQ_FILE" --no-deps
+echo "== Installing project requirements from $REQ_FILE =="
+pip install -r "$REQ_FILE"
 
 echo "== Installing pytorch-lightning =="
 pip install pytorch-lightning
 
-echo "== Verifying installation =="
+echo "== Verifying PyTorch installation =="
 
 python3 -c "
 import torch
