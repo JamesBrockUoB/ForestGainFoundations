@@ -247,7 +247,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
 
     if settings.use_hpc:
         logger.info(
-            f"Mode: HPC | workers={settings.num_workers} | stage={args.stage} "
+            f"Mode: HPC | stage={args.stage} "
             f"| period={settings.period} | batch_size={batch_size}"
             + (
                 f" | stratify={args.stratify} mode={args.stratify_mode} "
@@ -347,7 +347,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     ds = Datasets()
 
     if settings.use_hpc:
-        logger.info(f"Mode: HPC | workers={settings.num_workers}")
+        logger.info("Mode: HPC")
         run_hpc(candidates, logger)
     else:
         logger.info("Mode: local")

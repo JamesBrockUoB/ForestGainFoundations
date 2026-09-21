@@ -26,7 +26,6 @@ from export.drive import (
 from export.labels import submit_label_exports
 from export.metadata import write_tile_metadata
 from export.static import submit_static_exports
-from gee.auth import get_ee_credentials
 from gee.cleanup import _cleanup_failed_tile
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
@@ -379,31 +378,31 @@ def run_local(
         time.sleep(0.2)
 
 
-def _mp_worker(
-    tile_queue: mp.Queue,
-    result_queue: mp.Queue,
-    worker_id: int,
-    local_output: bool,
+def run_hpc(
+    candidates: list[dict],
+    logger: logging.Logger,
 ) -> None:
-    time.sleep(worker_id * 5)
-    ee.Initialize(get_ee_credentials(), project=settings.gee_project)
+    if not settings.hpc_path:
+        raise RuntimeError("HPC_PATH is not configured")
+    if not check_hpc_available(settings.hpc_path, logger):
+        logger.error(f"HPC destination unreachable: {settings.hpc_path}")
+        return
 
     ds = Datasets()
-    logger = logging.getLogger(f"gee.worker.{worker_id}")
+    total = len(candidates)
+    start = time.time()
 
-    while True:
-        tile = tile_queue.get()
-        if tile is None:
-            break
+    from registry.store import _get_db, load_registry_entry
 
+    db = _get_db()
+
+    for i, tile in enumerate(candidates, 1):
         tile_id = tile["tile_id"]
 
         for attempt in range(8):
-            status = process_tile(tile, ds, logger, local_output)
+            status = process_tile(tile, ds, logger, local_output=False)
             if status != str(TileStatus.FAILED):
                 break
-
-            from registry.store import load_registry_entry
 
             entry = load_registry_entry(tile_id)
             error = entry.get("error", "") if entry else ""
@@ -417,64 +416,15 @@ def _mp_worker(
             else:
                 break
 
-        result_queue.put(tile_id)
-
-
-def _mp_writer(result_queue: mp.Queue, total: int, logger: logging.Logger) -> None:
-    from registry.store import _get_db
-
-    db = _get_db()
-    done = 0
-    start = time.time()
-
-    while done < total:
-        _ = result_queue.get()
-        done += 1
-
-        if done % 20 == 0:
+        if i % 20 == 0:
             elapsed = (time.time() - start) / 60
-            rate = done / elapsed if elapsed else 0
+            rate = i / elapsed if elapsed else 0
             counts = db.status_counts()
             logger.info(
-                f"{done}/{total} "
+                f"{i}/{total} "
                 f"complete={counts.get(str(TileStatus.COMPLETE),0)} "
                 f"failed={counts.get(str(TileStatus.FAILED),0)} "
                 f"{rate:.1f} tiles/min"
             )
 
-
-def run_hpc(
-    candidates: list[dict],
-    logger: logging.Logger,
-) -> None:
-    if not settings.hpc_path:
-        raise RuntimeError("HPC_PATH is not configured")
-    if not check_hpc_available(settings.hpc_path, logger):
-        logger.error(f"HPC destination unreachable: {settings.hpc_path}")
-        return
-    tile_queue: mp.Queue = mp.Queue()
-    result_queue: mp.Queue = mp.Queue()
-
-    workers = [
-        mp.Process(
-            target=_mp_worker,
-            args=(tile_queue, result_queue, i, False),
-        )
-        for i in range(settings.num_workers)
-    ]
-    writer = threading.Thread(
-        target=_mp_writer, args=(result_queue, len(candidates), logger)
-    )
-
-    for worker in workers:
-        worker.start()
-    writer.start()
-
-    for tile in candidates:
-        tile_queue.put(tile)
-    for _ in workers:
-        tile_queue.put(None)
-
-    for worker in workers:
-        worker.join()
-    writer.join()
+        time.sleep(0.2)
