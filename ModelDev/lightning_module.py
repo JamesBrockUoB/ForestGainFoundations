@@ -1,8 +1,8 @@
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import torchmetrics
 from config import DEFAULT_IMAGE_SIZE, DEFAULT_LR, NUM_INPUT_CHANNELS
+from losses import CombinedDiceBCELoss
 from models import build_model
 
 
@@ -15,14 +15,15 @@ class GainDetectionTask(pl.LightningModule):
         in_channels: int = NUM_INPUT_CHANNELS,
         img_size: int = DEFAULT_IMAGE_SIZE,
         lr: float = DEFAULT_LR,
-        pos_weight: float = 3.0,
+        loss_type: str = "hard",
+        eval_threshold: float = 0.50,
         **model_kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
 
         self.lr = lr
-        self.pos_weight = pos_weight
+        self.eval_threshold = eval_threshold
 
         # Instantiate Network via models factory
         self.model = build_model(
@@ -32,45 +33,25 @@ class GainDetectionTask(pl.LightningModule):
             **model_kwargs,
         )
 
-        metrics_kwargs = {"task": "binary", "threshold": 0.5}
+        # Dynamic Loss Strategy
+        self.criterion = CombinedDiceBCELoss(loss_type=loss_type)
+
+        metrics_kwargs = {"task": "binary", "threshold": self.eval_threshold}
         self.val_f1 = torchmetrics.F1Score(**metrics_kwargs)
         self.val_iou = torchmetrics.JaccardIndex(**metrics_kwargs)
         self.val_precision = torchmetrics.Precision(**metrics_kwargs)
         self.val_recall = torchmetrics.Recall(**metrics_kwargs)
-
-    def _compute_loss(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        valid_mask: torch.Tensor,
-        sample_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-
-        pos_weight_tensor = torch.where(targets == 1.0, self.pos_weight, 1.0)
-
-        pixel_weight = torch.where(
-            targets == 1.0, sample_weights, torch.ones_like(sample_weights)
-        )
-
-        weighted_loss = bce_loss * pos_weight_tensor * pixel_weight
-        masked_loss = weighted_loss * valid_mask
-
-        total_valid = valid_mask.sum()
-        if total_valid > 0:
-            return masked_loss.sum() / total_valid
-        return masked_loss.sum()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         logits = self(batch["pixels"])
-        loss = self._compute_loss(
-            logits,
-            batch["gain_mask"],
-            batch["gain_valid"],
-            batch["gain_weight"],
+        loss = self.criterion(
+            seg_logits=logits,
+            gain_mask=batch["gain_mask"],
+            gain_weight=batch["gain_weight"],
+            gain_valid=batch["gain_valid"],
         )
         self.log(
             "train_loss",
@@ -84,14 +65,15 @@ class GainDetectionTask(pl.LightningModule):
 
     def validation_step(self, batch: dict, batch_idx: int):
         logits = self(batch["pixels"])
-        loss = self._compute_loss(
-            logits,
-            batch["gain_mask"],
-            batch["gain_valid"],
-            batch["gain_weight"],
+        loss = self.criterion(
+            seg_logits=logits,
+            gain_mask=batch["gain_mask"],
+            gain_weight=batch["gain_weight"],
+            gain_valid=batch["gain_valid"],
         )
 
-        preds = (torch.sigmoid(logits) > 0.5).float()
+        probs = torch.sigmoid(logits)
+        preds = (probs > self.eval_threshold).float()
         valid_indices = batch["gain_valid"] == 1.0
 
         if valid_indices.any():

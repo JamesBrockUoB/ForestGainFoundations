@@ -1,10 +1,9 @@
 import json
 import logging
-import os
 import subprocess
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from config import settings
 
@@ -230,7 +229,18 @@ def check_hpc_available(
     timeout: float = 15.0,
 ) -> bool:
     if ":" not in dest_root:
-        logger.error(f"Invalid HPC rclone destination: {dest_root}")
+        path = Path(dest_root)
+        if path.exists():
+            logger.info(f"HPC destination available (local path): {dest_root}")
+            return True
+        # Local dest doesn't exist yet — that's fine, it'll be created on write.
+        parent = path.parent
+        if parent.exists():
+            logger.info(
+                f"HPC local destination does not yet exist, parent is writable: {dest_root}"
+            )
+            return True
+        logger.warning(f"HPC local destination unreachable: {dest_root}")
         return False
 
     remote, path = dest_root.split(":", 1)
