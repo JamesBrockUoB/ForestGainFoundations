@@ -39,18 +39,12 @@ def save_tiles_batch(tiles: list[dict[str, Any]], batch_size: int = 1000000) -> 
 
 def reset_tiles(
     status: str | None = None,
-    period: str | None = None,
     clear_history: bool = False,
     to_status: str = str(TileStatus.PENDING),
 ) -> int:
-    """Bulk-reset tile statuses to `to_status`. Returns rows affected.
-
-    `period` defaults to None (all periods) at this layer — callers that
-    want to scope resets to the active period (main.py's `reset` command
-    does) should pass settings.period explicitly.
-    """
+    """Bulk-reset tile statuses to `to_status`. Returns rows affected."""
     return _get_db().reset_tiles(
-        status=status, period=period, clear_history=clear_history, to_status=to_status
+        status=status, clear_history=clear_history, to_status=to_status
     )
 
 
@@ -63,25 +57,17 @@ def update_tile(tile_id: str, **kwargs: Any) -> None:
 
 def iter_tiles(
     status: str | None = None,
-    period: str | None = None,
     batch_size: int = 1000,
 ) -> list[dict[str, Any]]:
     """
     Stream tiles in batches.
     Use for large-scale iteration without memory buildup.
-
-    `period` defaults to settings.period — pass period=None explicitly to
-    iterate across every period in the registry.
     """
-    if period is None:
-        period = settings.period
 
     db = _get_db()
     offset = 0
     while True:
-        batch = db.list_tiles(
-            status=status, period=period, limit=batch_size, offset=offset
-        )
+        batch = db.list_tiles(status=status, limit=batch_size, offset=offset)
         if not batch:
             break
         for tile in batch:
@@ -89,33 +75,32 @@ def iter_tiles(
         offset += batch_size
 
 
-def get_registry_stats(period: str | None = None) -> dict[str, Any]:
-    """Get aggregate statistics about the registry, optionally scoped to a period."""
+def get_registry_stats() -> dict[str, Any]:
+    """Get aggregate statistics about the registry"""
     db = _get_db()
     return {
-        "total": db.count_tiles(period=period),
-        "by_status": db.status_counts(period=period),
-        "by_biome": db.biome_counts(period=period),
-        "by_region": db.region_counts(period=period),
-        "by_country": db.country_counts(period=period),
-        "rejections": db.rejection_counts(period=period),
+        "total": db.count_tiles(),
+        "by_status": db.status_counts(),
+        "by_biome": db.biome_counts(),
+        "by_region": db.region_counts(),
+        "by_country": db.country_counts(),
+        "rejections": db.rejection_counts(),
     }
 
 
 def registry_summary(
-    period: str | None = None,
     verbose: int = 0,
 ) -> str:
     """Generate registry summary, optionally including biome/region/country breakdowns."""
     db = _get_db()
 
-    status_counts = db.status_counts(period=period)
-    total = db.count_tiles(period=period)
+    status_counts = db.status_counts()
+    total = db.count_tiles()
 
     lines = [
         "",
         "═" * 60,
-        f"  REGISTRY SUMMARY  (period={period})",
+        f"  REGISTRY SUMMARY",
         "═" * 60,
         f"  Total tiles : {total:>10,}",
         "",
@@ -126,9 +111,9 @@ def registry_summary(
         lines.append(f"    {status:<20} {cnt:>8,}")
 
     if verbose:
-        biome_counts = db.biome_counts(period=period)
-        region_counts = db.region_counts(period=period)
-        country_counts = db.country_counts(period=period)
+        biome_counts = db.biome_counts()
+        region_counts = db.region_counts()
+        country_counts = db.country_counts()
 
         lines += ["", "  By biome:"]
         for biome, count in sorted(biome_counts.items(), key=lambda x: -x[1]):

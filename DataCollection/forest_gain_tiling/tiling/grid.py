@@ -6,11 +6,10 @@ from typing import Any, Generator
 
 import ee
 import numpy as np
-from pyproj import Transformer
-from tqdm import tqdm
-
 from config import settings
 from enums import TileStatus
+from pyproj import Transformer
+from tqdm import tqdm
 
 # Equal-area CRS for grid math — ensures every tile covers the same ground
 # area regardless of latitude. EPSG:3857 (Web Mercator) does not preserve
@@ -57,20 +56,8 @@ def build_grid(
     Build and yield tiles from global grid as a generator.
     Never materialises the full grid - yields one tile at a time.
     Database handles deduplication via INSERT OR IGNORE.
-
-    Tiles are tagged with settings.period. `valid_aois` is expected to
-    already be period-scoped (loaded from settings.valid_aois_path, e.g.
-    data/aois/valid_aois_p1.json), since gain/imagery validity differs by
-    period even for AOIs at the same grid location.
-
-    tile_id encodes the period ("tile_{xi}_{yi}_{period}") because the same
-    (xi, yi) grid cell is a legitimate, independently-valid tile in both p1
-    and p2 — without the period suffix, planning p2 after p1 would collide
-    on the primary key and silently produce zero new rows (INSERT OR
-    IGNORE), rather than adding p2's tiles alongside p1's.
     """
-    period = settings.period
-    logger.info(f"Projecting AOI bounds to {_GRID_CRS} (equal-area) | period={period}…")
+    logger.info(f"Projecting AOI bounds to {_GRID_CRS} (equal-area)…")
     aoi_bounds_m = [_aoi_to_grid_crs(a) for a in valid_aois]
 
     sz = settings.tile_size_m
@@ -141,7 +128,7 @@ def build_grid(
         max_lon, max_lat = _xy2lonlat(float(x_maxs[k]), float(y_maxs[k]))
 
         yield {
-            "tile_id": f"tile_{xi}_{yi}_{period}",
+            "tile_id": f"tile_{xi}_{yi}",
             "xi": xi,
             "yi": yi,
             "x_min_m": float(x_mins[k]),
@@ -155,7 +142,6 @@ def build_grid(
             "biome": primary.get("biome_name", "Unknown"),
             "region": primary.get("region", "Unknown"),
             "country": primary.get("country", "Unknown"),
-            "period": period,
             "aoi_ids": [primary["id"]],
             "status": str(TileStatus.PENDING),
             "gee_task_id": None,

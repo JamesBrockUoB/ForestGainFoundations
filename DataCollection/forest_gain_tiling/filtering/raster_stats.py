@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import ee
 from config import settings
 from export.composites import (
@@ -18,11 +20,8 @@ CHEAP_BAND_NAMES = [
     "ndvi_trend",
 ]
 
-if settings.period == "p1":
-    CHEAP_BAND_NAMES.append("pseudo_gain_frac")
-
-S2_BAND_NAMES = [f"s2_{y}" for y in settings.period_years]
-S1_BAND_NAMES = [f"s1_{y}" for y in settings.period_years]
+S2_BAND_NAMES = [f"s2_{y}" for y in settings.years]
+S1_BAND_NAMES = [f"s1_{y}" for y in settings.years]
 IMAGERY_BAND_NAMES = S2_BAND_NAMES + S1_BAND_NAMES
 
 
@@ -36,47 +35,34 @@ def split_by_hemisphere(tiles: list[dict]) -> tuple[list[dict], list[dict]]:
     return north, south
 
 
-def check_tessera_coverage(
-    tiles: list[dict],
-    logger=None,
-) -> tuple[list[dict], dict[str, list[int]]]:
+def check_tessera_coverage(tiles, logger=None):
     from geotessera import GeoTessera
 
     gt = GeoTessera()
 
-    covered_tiles = []
-    missing_by_tile = {}
-
-    for tile in tiles:
-        bbox = (
-            tile["min_lon"],
-            tile["min_lat"],
-            tile["max_lon"],
-            tile["max_lat"],
-        )
-
+    def check_one(tile):
+        bbox = (tile["min_lon"], tile["min_lat"], tile["max_lon"], tile["max_lat"])
         missing_years = []
-
-        for year in settings.period_years:
-            blocks = gt.registry.load_blocks_for_region(
-                bounds=bbox,
-                year=year,
-            )
-
+        for year in settings.years:
+            blocks = gt.registry.load_blocks_for_region(bounds=bbox, year=year)
             if not blocks:
                 missing_years.append(year)
+        return tile["tile_id"], missing_years
 
-        if missing_years:
-            missing_by_tile[tile["tile_id"]] = missing_years
+    covered_tiles = []
+    missing_by_tile = {}
+    tiles_by_id = {t["tile_id"]: t for t in tiles}
 
-            if logger:
-                logger.debug(
-                    f"TESSERA coverage missing | "
-                    f"tile={tile['tile_id']} | "
-                    f"years={missing_years}"
-                )
-        else:
-            covered_tiles.append(tile)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for tile_id, missing_years in ex.map(check_one, tiles):
+            if missing_years:
+                missing_by_tile[tile_id] = missing_years
+                if logger:
+                    logger.debug(
+                        f"TESSERA coverage missing | tile={tile_id} | years={missing_years}"
+                    )
+            else:
+                covered_tiles.append(tiles_by_id[tile_id])
 
     return covered_tiles, missing_by_tile
 
@@ -91,35 +77,15 @@ def build_cheap_stats_image(
     gain_mask = gain_validated.selfMask()
 
     ndvi_trend = (
-        s2_ndvi_trend(geom, settings.period_years, north=north)
+        s2_ndvi_trend(geom, settings.years, north=north)
         .updateMask(gain_mask)
         .rename("ndvi_trend")
     )
-
-    forty = ds.forty.clip(geom)
-
-    forty_valid = (
-        ee.Image.cat(
-            [
-                forty.select("TreeCropsAndAgroforestry"),
-                forty.select("NaturallyRegeneratingForest"),
-                forty.select("PlantationForest"),
-                forty.select("PlantedForest"),
-            ]
-        )
-        .reduce(ee.Reducer.sum())
-        .gt(0)
-    )
-
-    pseudo_gain = gain_mask.And(forty_valid).rename("pseudo_gain")
 
     bands = [
         gain_binary.rename("gain_frac"),
         ndvi_trend,
     ]
-
-    if settings.period == "p1":
-        bands.append(pseudo_gain.rename("pseudo_gain_frac"))
 
     return ee.Image.cat(bands).clip(geom)
 
@@ -127,8 +93,7 @@ def build_cheap_stats_image(
 def build_imagery_stats_image(geom: ee.Geometry) -> ee.Image:
     """Full-year, Cloud Score+ masked S2 availability"""
     bands = [
-        s2_availability(geom, year).rename(f"s2_{year}")
-        for year in settings.period_years
+        s2_availability(geom, year).rename(f"s2_{year}") for year in settings.years
     ]
     return ee.Image.cat(bands).clip(geom)
 
@@ -214,7 +179,7 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
         tile_image = ee.Image.cat(
             [
                 s2_availability(geom, year).rename(f"s2_{year}")
-                for year in settings.period_years
+                for year in settings.years
             ]
         ).clip(geom)
 
@@ -230,7 +195,7 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
     )
 
     def add_s1_stats(feature):
-        for year in settings.period_years:
+        for year in settings.years:
             feature = feature.set(
                 f"s1_{year}",
                 s1_availability(feature, year),
@@ -245,7 +210,7 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
 
         out.setdefault(tile_id, {})
 
-        for year in settings.period_years:
+        for year in settings.years:
             out[tile_id][f"s1_{year}"] = props.get(f"s1_{year}")
 
     return out

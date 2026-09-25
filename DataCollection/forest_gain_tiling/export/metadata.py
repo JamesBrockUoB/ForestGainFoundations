@@ -8,13 +8,13 @@ from typing import Any
 
 import ee
 import numpy as np
-import rasterio
 from config import settings
-from enums import PseudoLabel
 from rasterio.io import MemoryFile
 from tiling.grid import tile_geom
 
 SOIL_BANDS = ["soc", "clay_pct", "ph"]
+DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
+
 ERA5_YEARLY_BANDS = [
     "precip_sum",
     "temp_mean",
@@ -122,15 +122,70 @@ def _fetch_year_climate(geom: ee.Geometry, year: int) -> dict[str, Any]:
 
 
 def _fetch_yearly_climate(
-    geom: ee.Geometry, period_years: list[int]
+    geom: ee.Geometry, years: list[int]
 ) -> dict[str, dict[str, float | None]]:
-    return {str(year): _fetch_year_climate(geom, year) for year in period_years}
+    return {str(year): _fetch_year_climate(geom, year) for year in years}
+
+
+def _dw_label_mode(geom: ee.Geometry, year: int) -> ee.Image:
+    """Modal (most frequent) Dynamic World label per pixel across the
+    calendar year — same logic as generate_aois.py's _dw_label_mode,
+    reused here at tile scale."""
+    start = f"{year}-01-01"
+    end = f"{year + 1}-01-01"
+    dw = ee.ImageCollection(DW_COLLECTION).filterDate(start, end).filterBounds(geom)
+    return dw.select("label").reduce(ee.Reducer.mode()).rename("dw_label")
+
+
+def _fetch_dt_dw_agreement(
+    geom: ee.Geometry, year_start: int
+) -> dict[str, float | None]:
+    """
+    Fraction of DT-non-forest pixels (at year_start) that Dynamic World
+    also calls non-forest (label != 1, "trees") — same definition used
+    at AOI level in generate_aois.py's _build_gee_datasets/process_batch,
+    just reduced over one tile geometry instead of a FeatureCollection.
+    """
+    dt_cover_start = (
+        ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year_start}_v2")
+        .select([0])
+        .divide(2.55)
+        .rename("tree_cover_pct")
+    )
+    forest_start = dt_cover_start.gt(settings.non_tree_threshold_frac).unmask(0)
+    dt_non_forest_start = forest_start.Not().rename("dt_non_forest_start")
+
+    dw_label_start = _dw_label_mode(geom, year_start)
+    dw_forest_like = dw_label_start.eq(1).Or(dw_label_start.eq(3))
+    dw_agrees_non_forest = dt_non_forest_start.And(dw_forest_like.Not()).rename(
+        "dt_non_forest_start_dw_agrees"
+    )
+
+    qa_img = dt_non_forest_start.addBands(dw_agrees_non_forest)
+
+    stats = qa_img.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=geom,
+        scale=settings.scale,
+        bestEffort=True,
+        maxPixels=1_000_000_000,
+    ).getInfo()
+
+    non_forest_px = float(stats.get("dt_non_forest_start", 0.0) or 0.0)
+    agree_px = float(stats.get("dt_non_forest_start_dw_agrees", 0.0) or 0.0)
+
+    return {
+        "dt_dw_agreement_frac": (
+            agree_px / non_forest_px if non_forest_px > 0 else None
+        ),
+        "dt_non_forest_px": non_forest_px,
+        "dt_dw_agree_px": agree_px,
+    }
 
 
 def _compute_tile_metadata(
     tile: dict,
     gain_confidence_bytes: bytes,
-    pseudo_labels_bytes: bytes | None,
 ) -> dict[str, Any]:
     with MemoryFile(gain_confidence_bytes) as memfile, memfile.open() as src:
         gain = src.read(1)
@@ -139,7 +194,6 @@ def _compute_tile_metadata(
 
     metadata: dict[str, Any] = {
         "tile_id": tile["tile_id"],
-        "period": tile.get("period"),
         "biome": tile.get("biome"),
         "region": tile.get("region"),
         "country": tile.get("country"),
@@ -166,45 +220,19 @@ def _compute_tile_metadata(
 
     try:
         metadata["climate_yearly"] = _fetch_yearly_climate(
-            tile_geom(tile), settings.period_years
+            tile_geom(tile), settings.years
         )
     except Exception as exc:
         metadata["climate_yearly"] = None
         metadata["climate_yearly_error"] = str(exc)
 
-    if pseudo_labels_bytes is not None:
-        with MemoryFile(pseudo_labels_bytes) as memfile, memfile.open() as src:
-            pseudo = src.read()
-
-        dominant, confidence = pseudo[4], pseudo[5]
-        gain_bool = np.nan_to_num(gain, nan=0.0) > 0
-        labelled = (dominant != -9999) & (confidence != -9999)
-        pseudo_valid = (
-            gain_bool & labelled & np.isfinite(dominant) & np.isfinite(confidence)
+    try:
+        metadata["dt_dw_qa"] = _fetch_dt_dw_agreement(
+            tile_geom(tile), min(settings.years)
         )
-
-        class_names = PseudoLabel._member_names_
-
-        if pseudo_valid.any():
-            vals = dominant[pseudo_valid].astype(int)
-            conf = confidence[pseudo_valid]
-            counts = np.bincount(vals, minlength=len(class_names))
-
-            metadata["pseudo_labels"] = {
-                "class_pixel_counts": {n: int(c) for n, c in zip(class_names, counts)},
-                "dominant_class": class_names[int(counts.argmax())],
-                "mean_confidence": float(np.mean(conf)),
-                "labelled_gain_pixel_fraction": float(
-                    pseudo_valid.sum() / gain_bool.sum()
-                ),
-            }
-        else:
-            metadata["pseudo_labels"] = {
-                "class_pixel_counts": {},
-                "dominant_class": None,
-                "mean_confidence": None,
-                "labelled_gain_pixel_fraction": 0.0,
-            }
+    except Exception as exc:
+        metadata["dt_dw_qa"] = None
+        metadata["dt_dw_qa_error"] = str(exc)
 
     return metadata
 
@@ -214,19 +242,13 @@ def write_tile_metadata(
     output_dir: Path,
     logger: logging.Logger,
     gain_confidence_bytes: bytes | None = None,
-    pseudo_labels_bytes: bytes | None = None,
 ) -> None:
     if gain_confidence_bytes is None:
         gain_confidence_bytes = (
             output_dir / "labels" / "gain_confidence.tif"
         ).read_bytes()
 
-    if pseudo_labels_bytes is None:
-        pseudo_path = output_dir / "labels" / "pseudo_labels.tif"
-        if pseudo_path.exists():
-            pseudo_labels_bytes = pseudo_path.read_bytes()
-
-    metadata = _compute_tile_metadata(tile, gain_confidence_bytes, pseudo_labels_bytes)
+    metadata = _compute_tile_metadata(tile, gain_confidence_bytes)
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"{tile['tile_id']} | metadata written")

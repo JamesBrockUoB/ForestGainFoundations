@@ -15,6 +15,7 @@ class GainDetectionTask(pl.LightningModule):
         in_channels: int = NUM_INPUT_CHANNELS,
         img_size: int = DEFAULT_IMAGE_SIZE,
         lr: float = DEFAULT_LR,
+        weight_decay: float = 1e-2,
         loss_type: str = "hard",
         eval_threshold: float = 0.50,
         **model_kwargs,
@@ -23,6 +24,7 @@ class GainDetectionTask(pl.LightningModule):
         self.save_hyperparameters()
 
         self.lr = lr
+        self.weight_decay = weight_decay
         self.eval_threshold = eval_threshold
 
         # Instantiate Network via models factory
@@ -105,14 +107,17 @@ class GainDetectionTask(pl.LightningModule):
         self.val_recall.reset()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.trainer.max_epochs, eta_min=1e-6
+            optimizer,
+            T_max=self.trainer.max_epochs,
+            eta_min=1e-6,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-            },
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
         }

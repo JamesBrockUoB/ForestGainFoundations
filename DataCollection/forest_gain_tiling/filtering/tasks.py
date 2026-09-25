@@ -34,7 +34,6 @@ STAGES = {
 
 def _resolve_batch_iter(
     cfg: dict,
-    period: str,
     batch_size: int,
     limit_batches: int | None,
     stratify_field: str | None,
@@ -58,30 +57,29 @@ def _resolve_batch_iter(
         batch_iter = iter_stratified_pending_tile_batches(
             cfg["input_status"],
             batch_size,
-            period,
             stratify_field,
             tile_limit,
             mode=stratify_mode,
             logger=logger,
         )
         logger.info(
-            f"starting | period={period} | batch_size={batch_size} | "
+            f"starting | batch_size={batch_size} | "
             f"stratify={stratify_field} mode={stratify_mode} | "
             f"tile_limit={tile_limit:,} | total_batches(est)={total_batches:,}"
         )
         return batch_iter, total_batches
 
-    total_pending = count_pending(cfg["input_status"], period)
+    total_pending = count_pending(cfg["input_status"])
     total_batches = -(-total_pending // batch_size)
     if limit_batches is not None:
         total_batches = min(total_batches, limit_batches)
 
-    batch_iter = iter_pending_tile_batches(cfg["input_status"], batch_size, period)
+    batch_iter = iter_pending_tile_batches(cfg["input_status"], batch_size)
     if limit_batches is not None:
         batch_iter = islice(batch_iter, limit_batches)
 
     logger.info(
-        f"starting | period={period} | batch_size={batch_size} | "
+        f"starting | batch_size={batch_size} | "
         f"pending={total_pending:,} | total_batches={total_batches:,}"
     )
     return batch_iter, total_batches
@@ -97,12 +95,10 @@ def run_filter_local(
     tile_limit: int | None = None,
 ) -> None:
     cfg = STAGES[stage]
-    period = settings.period
-    ds = Datasets() if stage == "cheap" else None  # <-- build once, reused every batch
+    ds = Datasets() if stage == "cheap" else None
 
     batch_iter, total_batches = _resolve_batch_iter(
         cfg,
-        period,
         batch_size,
         limit_batches,
         stratify_field,
@@ -215,7 +211,6 @@ def run_filter_hpc(
     tile_limit: int | None = None,
 ) -> None:
     cfg = STAGES[stage]
-    period = settings.period
     batch_queue: mp.Queue = mp.Queue()
     result_queue: mp.Queue = mp.Queue()
 
@@ -223,7 +218,6 @@ def run_filter_hpc(
 
     batch_iter, _ = _resolve_batch_iter(
         cfg,
-        period,
         batch_size,
         limit_batches,
         stratify_field,
@@ -246,7 +240,7 @@ def run_filter_hpc(
             break
 
     if not batches:
-        logger.info(f"no tiles pending for stage '{stage}' | period={period}.")
+        logger.info(f"no tiles pending for stage '{stage}'.")
         return
 
     # find the active logfile so workers can attach their own handlers to it
@@ -271,7 +265,7 @@ def run_filter_hpc(
     writer_thread.start()
 
     logger.info(
-        f"started {settings.num_workers} workers for period={period} | "
+        f"started {settings.num_workers} workers | "
         f"{len(batches):,} batches ({sum(len(b) for b in batches):,} tiles)"
         + (
             f" | stratify={stratify_field} mode={stratify_mode}"

@@ -148,7 +148,7 @@ def _verify_tile_outputs(
         if not _dest_file_exists(dest_root, rel_path):
             missing.append(key)
 
-    for year in settings.period_years:
+    for year in settings.years:
         rel_path = f"{tile_id}/embeddings/tessera_{year}.tif"
         if not _dest_file_exists(dest_root, rel_path):
             missing.append(f"embeddings/tessera_{year}")
@@ -179,7 +179,7 @@ def process_tile(
         tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
         tasks.update(
-            submit_label_exports(geom, ct, full_valid, ds, gain_confidence, tile_id)
+            submit_label_exports(geom, ct, full_valid, gain_confidence, tile_id)
         )
         tasks.update(submit_aee_exports(geom, ct, tile_id))
 
@@ -318,10 +318,8 @@ def process_tile(
                     f"{tile_id} | could not read gain_confidence.tif from "
                     f"{dest_root} for metadata computation"
                 )
-            pseudo_bytes = rclone_read_bytes(
-                f"{remote_labels_dir}/pseudo_labels.tif", logger
-            )
-            write_tile_metadata(tile, output_dir, logger, gain_bytes, pseudo_bytes)
+
+            write_tile_metadata(tile, output_dir, logger, gain_bytes)
             if not rclone_push(
                 str(output_dir / "metadata.json"),
                 f"{dest_root}/{tile_id}/metadata.json",

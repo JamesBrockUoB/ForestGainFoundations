@@ -27,16 +27,17 @@ def export_inspector_tile(
     tile: dict[str, Any],
     ds: Datasets,
     logger: logging.Logger,
-    output_root: Path,
+    output_dir: Path,
 ) -> Path:
-    """Export a point-centred tile to ``output_root`` without registry writes.
+    """Export a point-centred tile to ``output_dir`` without registry writes.
 
     It uses the same product builders as the production exporter, but owns its
     task lifecycle and local directory so no ad-hoc tile can affect a planned
-    tile's state or destination.
+    tile's state or destination. ``output_dir`` is the tile's own directory
+    (already including the tile_id) -- callers pick where that lives.
     """
     tile_id = tile["tile_id"]
-    output_dir = output_root / tile_id
+    dest_root = str(output_dir.parent)
     geom = tile_geom(tile)
     tasks: dict[str, ee.batch.Task] = {}
     cancel_event = threading.Event()
@@ -51,9 +52,7 @@ def export_inspector_tile(
         tasks.update(submit_composite_exports(geom, transform, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, transform, full_valid, tile_id))
         tasks.update(
-            submit_label_exports(
-                geom, transform, full_valid, ds, gain_confidence, tile_id
-            )
+            submit_label_exports(geom, transform, full_valid, gain_confidence, tile_id)
         )
         tasks.update(submit_aee_exports(geom, transform, tile_id))
 
@@ -69,14 +68,14 @@ def export_inspector_tile(
             raise RuntimeError("one or more Earth Engine export tasks failed")
 
         products = [tuple(key.split("/", 1)) for key in tasks]
-        if not rclone_all_products(tile_id, products, str(output_root), logger):
+        if not rclone_all_products(tile_id, products, dest_root, logger):
             raise RuntimeError("rclone transfer failed")
 
         embeddings_thread.join()
         if not embeddings_result.get("ok"):
             raise RuntimeError("embedding acquisition failed")
 
-        missing = _verify_tile_outputs(output_dir, list(tasks))
+        missing = _verify_tile_outputs(tile_id, dest_root, list(tasks))
         if missing:
             raise RuntimeError(f"missing outputs after export: {missing}")
 

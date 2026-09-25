@@ -26,10 +26,7 @@ S2_BANDS = ("B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12")
 
 NUM_INPUT_CHANNELS = len(BACKBONE_BAND_INDICES)
 
-PERIOD_YEARS = {
-    "p1": [2017, 2018, 2019, 2020],  # T = 4
-    "p2": [2020, 2021, 2022, 2023, 2024],  # T = 5
-}
+YEARS = list(range(2017, 2025))  # 2017 - 2024 inclusive
 
 DEFAULT_IMAGE_SIZE = 256
 DEFAULT_BATCH_SIZE = 8

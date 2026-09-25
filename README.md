@@ -96,7 +96,7 @@
       - GEE_PROJECT - Your GEE project name
       - OUTPUT_DIR - data/ (or full path to the /data folder in DataCollection)
       - BATCH_SIZE - 100 - AOI batch size processing
-      - AOI_STEP - 0.25
+      - AOI_STEP - 0.1
       - TILE_PIXELS - 256
       - NUM_WORKERS - 2 - used on HPC for scaling AOI generation and filtering - still limited by GEE concurrency, so set to 2 to be cautious
       - TILE_SCALE - 10
@@ -106,6 +106,5 @@
       - USE_HPC - 0 if local, 1 if processing from a HPC resource
       - EE_CREDENTIALS_PATH - Your Earth Engine credentials for GDrive authorisations
       - SEARCH_MODE - `asset` for limiting search area to geographic extent of deadtrees.earth product, or `global` for the whole world
-      - PERIOD - The time period for collecting and processing imagery for. `p1` for 2017-2020, or `p2` for 2020-2024. Note that there are no pseudo-labels for forest typology for `p2`
       WANDB_USERNAME - Weights and Biases username for model training
     </details>

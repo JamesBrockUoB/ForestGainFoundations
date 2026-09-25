@@ -3,16 +3,11 @@ from __future__ import annotations
 import ee
 from config import settings
 
-# Snapshot matched to each period's start
-WDPA_SNAPSHOT_BY_PERIOD = {
-    "p1": "201707",  # nearest available snapshot at/before p1's 2017 start
-    "p2": "202001",  # nearest available snapshot at/before p2's 2020 start
-}
+WDPA_SNAPSHOT = "201707"
 
 
 def _protected_area_mask(geom: ee.Geometry) -> ee.Image:
-    snapshot = WDPA_SNAPSHOT_BY_PERIOD[settings.period]
-    fc = ee.FeatureCollection(f"WCMC/WDPA/{snapshot}/polygons").filterBounds(geom)
+    fc = ee.FeatureCollection(f"WCMC/WDPA/{WDPA_SNAPSHOT}/polygons").filterBounds(geom)
     return ee.Image().byte().paint(fc, 1).unmask(0).rename("protected_area")
 
 

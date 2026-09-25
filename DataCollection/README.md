@@ -34,6 +34,31 @@ forest cover, accuracy is generally very high. When comparing year over year
 cover values for change detection, consider applying a minimum threshold of
 20%. Also, the years 2017 and 2018 can be less stable. 
 
+In addition, one layer applies to all years:
+
+3) Inference day of year (`inference_day_of_year.tif`): The day of year (1-366)
+that the cover values at this location were predicted for. Each year's value
+comes from one 7-day Sentinel-2 composite, and within a processing block that
+composite sits at the same day of year every year. Across the product the day
+ranges from 61 to 213 (early March to early August), so consult this layer when
+the season matters, e.g. when comparing regions or dating a disturbance within
+a year.
+
+`UInt16`, `0` = no data, **100 m pixels** - coarser than the cover maps because
+the value is constant over each ~30 km processing block; the grid is aligned
+with the 10 m cover maps.
+
+## Known issues
+
+- **Inference dates are not at the intended point of the season.** The day of
+  year a block is predicted for (`inference_day_of_year.tif`) is taken from a
+  MODIS phenology look-up at the middle of the growing season, but a projection
+  error in the pipeline samples that look-up at the wrong longitude. Against the
+  phenology at the true block location, the median block is 12 days off, 28% are
+  off by more than 30 days, and the worst cases - in the Mediterranean - are
+  predicted for late March instead of mid August. Expect seasonal artefacts
+  there, and use `inference_day_of_year.tif` to tell which areas are affected.
+
 ## Download (example)
 
 - using wget: `wget

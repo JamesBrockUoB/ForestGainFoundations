@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import rasterio
 import streamlit as st
-from matplotlib.colors import BoundaryNorm, ListedColormap
 
 REJECTION_CODE = {
     "no_land": 1,
@@ -21,10 +20,6 @@ REJECTION_COLOR = {
     4: "#8e44ad",
 }
 VALID_COLOR = "#27ae60"
-
-PSEUDO_CLASS_NAMES = ["AGROCROP", "NAT_REGEN", "PLANTATION", "PLANTED"]
-PSEUDO_CLASS_COLORS = ["#e6ab02", "#1b9e77", "#7570b3", "#d95f02"]
-PSEUDO_LABEL_NODATA = -9999
 
 # Units shown on static-layer colorbars, keyed by the layer names used in
 # tile_inspector.py's static_paths dict. A missing/blank entry just means
@@ -202,8 +197,8 @@ def render_yearly_products(
     """Show each yearly product (S1 / S2 / AEE / TESSERA) as plain images.
 
     No overlay between products here -- stacking, say, AEE on top of S2
-    doesn't mean anything. Overlays live in render_gain_pseudo_diagnostics,
-    where they're actually meaningful (gain/pseudo-label maps over imagery).
+    doesn't mean anything. Overlays live in render_gain_diagnostics,
+    where they're actually meaningful (gain map over imagery).
     """
     products = {
         "S1": s1_images,
@@ -270,10 +265,12 @@ def render_static_layers(
                 ax.imshow(s2_images[first_year])
 
             if layer_name == "Protected area":
-                cmap = ListedColormap([
-                    "#d9d9d9",
-                    "#1b9e77",
-                ])
+                cmap = ListedColormap(
+                    [
+                        "#d9d9d9",
+                        "#1b9e77",
+                    ]
+                )
 
                 norm = BoundaryNorm(
                     [-0.5, 0.5, 1.5],
@@ -287,11 +284,7 @@ def render_static_layers(
                     cmap=cmap,
                     norm=norm,
                     interpolation="nearest",
-                    alpha=(
-                        opacity
-                        if display_mode == "Overlay on S2"
-                        else 1.0
-                    ),
+                    alpha=(opacity if display_mode == "Overlay on S2" else 1.0),
                 )
 
                 ax.set_title("Protected area")
@@ -303,10 +296,12 @@ def render_static_layers(
                     fraction=0.046,
                     pad=0.04,
                 )
-                cbar.ax.set_yticklabels([
-                    "Not protected",
-                    "Protected",
-                ])
+                cbar.ax.set_yticklabels(
+                    [
+                        "Not protected",
+                        "Protected",
+                    ]
+                )
 
             else:
                 # Continuous layer.
@@ -319,11 +314,7 @@ def render_static_layers(
                     vmin=vmin,
                     vmax=vmax,
                     interpolation="nearest",
-                    alpha=(
-                        opacity
-                        if display_mode == "Overlay on S2"
-                        else 1.0
-                    ),
+                    alpha=(opacity if display_mode == "Overlay on S2" else 1.0),
                 )
 
                 ax.set_title(layer_name)
@@ -335,9 +326,7 @@ def render_static_layers(
                     pad=0.04,
                 )
 
-                cbar.set_label(
-                    f"{layer_name}{f' ({unit})' if unit else ''}"
-                )
+                cbar.set_label(f"{layer_name}{f' ({unit})' if unit else ''}")
 
             ax.axis("off")
 
@@ -362,106 +351,51 @@ def read_gain_confidence(path: str) -> np.ndarray:
         return src.read(1).astype(np.float32)
 
 
-def read_pseudo_labels(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Read the dominant-class (band 5) and confidence (band 6) bands.
-
-    Nodata (-9999) is converted to NaN so masking downstream is a plain
-    isnan check.
-    """
-    with rasterio.open(path) as src:
-        dominant, confidence = src.read([5, 6]).astype(np.float32)
-
-    dominant[dominant == PSEUDO_LABEL_NODATA] = np.nan
-    confidence[confidence == PSEUDO_LABEL_NODATA] = np.nan
-
-    return dominant, confidence
-
-
-def render_gain_pseudo_diagnostics(
+def render_gain_diagnostics(
     base_image: np.ndarray,
     base_label: str,
     gain_confidence: np.ndarray | None,
-    dominant: np.ndarray | None,
-    confidence: np.ndarray | None,
 ) -> None:
-    """Render gain-mask / pseudo-label panels over a chosen imagery composite.
+    """Render gain-mask panels over a chosen imagery composite.
 
-    Shows, wherever the underlying raster is available: the dominant
-    pseudo-class, per-pixel pseudo-label confidence, continuous gain
-    confidence, and the binary gain mask derived from it -- each drawn
-    as its own panel, only over pixels with valid gain coverage.
+    Shows the continuous gain confidence and the binary gain mask derived
+    from it, drawn over pixels with valid gain coverage.
     """
     import matplotlib.pyplot as plt
 
-    gain_valid = ~np.isnan(gain_confidence) if gain_confidence is not None else None
-
-    panels = []
-
-    if dominant is not None and gain_valid is not None:
-        panels.append(("dominant", dominant))
-    if confidence is not None and gain_valid is not None:
-        panels.append(("confidence", confidence))
-    if gain_confidence is not None:
-        panels.append(("gain_confidence", gain_confidence))
-    if gain_valid is not None:
-        panels.append(("gain_mask", gain_valid.astype(np.float32)))
-
-    if not panels:
-        st.info("No gain confidence or pseudo-label rasters found for this tile.")
+    if gain_confidence is None:
+        st.info("No gain confidence raster found for this tile.")
         return
 
-    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 5))
-    if len(panels) == 1:
-        axes = [axes]
+    gain_valid = ~np.isnan(gain_confidence)
 
-    fig.suptitle(f"Gain & pseudo-label diagnostics — {base_label}")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    fig.suptitle(f"Gain diagnostics — {base_label}")
 
-    cmap_classes = ListedColormap(PSEUDO_CLASS_COLORS)
-    norm_classes = BoundaryNorm(
-        [i - 0.5 for i in range(len(PSEUDO_CLASS_NAMES) + 1)],
-        cmap_classes.N,
+    ax_conf, ax_mask = axes
+
+    ax_conf.imshow(base_image)
+    masked = np.ma.masked_where(np.isnan(gain_confidence), gain_confidence)
+    im = ax_conf.imshow(masked, cmap="plasma", vmin=50, vmax=100, alpha=0.85)
+    ax_conf.set_title("Gain confidence mask\n(continuous)")
+    fig.colorbar(im, ax=ax_conf, fraction=0.046, pad=0.04).set_label(
+        "Gain confidence (canopy cover %, year_end)"
     )
+    ax_conf.axis("off")
 
-    for ax, (kind, arr) in zip(axes, panels):
-        ax.imshow(base_image)
-
-        if kind == "dominant":
-            masked = np.ma.masked_where(~gain_valid | np.isnan(arr), arr)
-            im = ax.imshow(masked, cmap=cmap_classes, norm=norm_classes, alpha=0.8)
-            ax.set_title("Dominant pseudo-class\n(gain pixels)")
-            cbar = fig.colorbar(
-                im, ax=ax, ticks=range(len(PSEUDO_CLASS_NAMES)), fraction=0.046, pad=0.04
-            )
-            cbar.ax.set_yticklabels(PSEUDO_CLASS_NAMES)
-
-        elif kind == "confidence":
-            masked = np.ma.masked_where(~gain_valid | np.isnan(arr), arr)
-            im = ax.imshow(masked, cmap="viridis", vmin=0, vmax=1, alpha=0.85)
-            ax.set_title("Pseudo-label confidence\n(gain pixels)")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).set_label("ForTy confidence")
-
-        elif kind == "gain_confidence":
-            masked = np.ma.masked_where(np.isnan(arr), arr)
-            im = ax.imshow(masked, cmap="plasma", vmin=50, vmax=100, alpha=0.85)
-            ax.set_title("Gain confidence mask\n(continuous)")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).set_label(
-                "Gain confidence (canopy cover %, year_end)"
-            )
-
-        else:  # gain_mask
-            masked = np.ma.masked_where(arr == 0, arr)
-            ax.imshow(masked, cmap="viridis", vmin=0, vmax=1, alpha=0.8)
-            ax.set_title("Gain mask\n(binary)")
-
-        ax.axis("off")
+    ax_mask.imshow(base_image)
+    mask_arr = gain_valid.astype(np.float32)
+    masked_mask = np.ma.masked_where(mask_arr == 0, mask_arr)
+    ax_mask.imshow(masked_mask, cmap="viridis", vmin=0, vmax=1, alpha=0.8)
+    ax_mask.set_title("Gain mask\n(binary)")
+    ax_mask.axis("off")
 
     fig.tight_layout()
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-    if gain_valid is not None:
-        n_gain = int(gain_valid.sum())
-        st.caption(f"Gain pixels: {n_gain} ({100 * n_gain / gain_valid.size:.2f}% of tile)")
+    n_gain = int(gain_valid.sum())
+    st.caption(f"Gain pixels: {n_gain} ({100 * n_gain / gain_valid.size:.2f}% of tile)")
 
 
 def display_climate(metadata: dict) -> None:
@@ -508,9 +442,8 @@ def display_climate(metadata: dict) -> None:
 def render_tile_metadata(metadata: dict) -> None:
     bounds = metadata.get("bounds", {})
     soil = metadata.get("soil", {})
-    pseudo = metadata.get("pseudo_labels", {})
 
-    overview_cols = st.columns(3)
+    overview_cols = st.columns(2)
 
     with overview_cols[0]:
         gain_pct = metadata.get("gain_pct")
@@ -524,15 +457,6 @@ def render_tile_metadata(metadata: dict) -> None:
         st.write(f"SOC: {_fmt(soil.get('soc'))}")
         st.write(f"Clay: {_fmt(soil.get('clay_pct'), suffix='%')}")
         st.write(f"pH: {_fmt(soil.get('ph'))}")
-
-    with overview_cols[2]:
-        st.write("**Pseudo labels**")
-        st.write(f"Dominant class: {pseudo.get('dominant_class', '—')}")
-        st.write(f"Mean confidence: {_fmt(pseudo.get('mean_confidence'))}")
-
-        labelled_fraction = pseudo.get("labelled_gain_pixel_fraction")
-        labelled_pct = labelled_fraction * 100 if labelled_fraction is not None else None
-        st.write(f"Labelled gain: {_fmt(labelled_pct, suffix='%')}")
 
     st.write("**Bounds**")
     bounds_cols = st.columns(4)
@@ -553,15 +477,6 @@ def render_tile_metadata(metadata: dict) -> None:
     if metadata.get("climate_yearly"):
         st.subheader("Climate by year")
         display_climate(metadata)
-
-    with st.expander("Pseudo-label class counts"):
-        class_counts = pseudo.get("class_pixel_counts", {})
-        if class_counts:
-            st.dataframe(
-                [{"Class": name, "Pixels": count} for name, count in class_counts.items()],
-                hide_index=True,
-                use_container_width=True,
-            )
 
     with st.expander("Full metadata JSON"):
         st.json(metadata)

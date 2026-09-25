@@ -194,10 +194,10 @@ def submit_composite_exports(
     full_valid: ee.Image,
     tile_id: str,
 ) -> dict[str, ee.batch.Task]:
-    """Submit one export task per year in settings.period_years."""
+    """Submit one export task per year"""
     tasks: dict[str, ee.batch.Task] = {}
 
-    for year in settings.period_years:
+    for year in settings.years:
         image = build_year_composite(geom, year).updateMask(full_valid).toFloat()
 
         mask_band_name = f"s2_valid_{year}"

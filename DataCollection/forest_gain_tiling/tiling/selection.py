@@ -16,12 +16,11 @@ from registry.store import _get_db, iter_tiles
 STRATA_FIELDS = ("biome", "region", "country")
 
 
-def _strata_ratios_path(period: str) -> Path:
-    return settings.valid_aois_path.parent / f"strata_ratios_{period}.json"
+def _strata_ratios_path() -> Path:
+    return settings.valid_aois_path.parent / f"strata_ratios.json"
 
 
 def save_strata_ratios(
-    period: str,
     counts_by_field: dict[str, Counter],
     total: int,
 ) -> None:
@@ -38,7 +37,6 @@ def save_strata_ratios(
     true distribution.
     """
     payload = {
-        "period": period,
         "computed_at": datetime.now(timezone.utc).isoformat(),
         "total_tiles": total,
         "fields": {
@@ -47,7 +45,7 @@ def save_strata_ratios(
         },
     }
 
-    path = _strata_ratios_path(period)
+    path = _strata_ratios_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
@@ -55,73 +53,66 @@ def save_strata_ratios(
     tmp.replace(path)
 
 
-def _compute_strata_ratios_from_registry(period: str) -> dict:
+def _compute_strata_ratios_from_registry() -> dict:
     """
     Fallback: rebuilds the ratio cache directly from the registry's
-    per-field aggregate queries (biome_counts/region_counts/country_counts,
-    each a single GROUP BY over the whole period — no per-status looping
-    needed). Used when `plan` hasn't been (re)run since the cache went
+    per-field aggregate queries (biome_counts/region_counts/country_counts.
+    Used when `plan` hasn't been (re)run since the cache went
     stale or missing.
     """
     db = _get_db()
-    total = db.count_tiles(period=period)
+    total = db.count_tiles()
 
     if total == 0:
-        raise RuntimeError(
-            f"No tiles found for period={period} — run `plan` first."
-        )
+        raise RuntimeError("No tiles found for — run `plan` first.")
 
     counts_by_field = {
-        "biome": Counter(db.biome_counts(period=period)),
-        "region": Counter(db.region_counts(period=period)),
-        "country": Counter(db.country_counts(period=period)),
+        "biome": Counter(db.biome_counts()),
+        "region": Counter(db.region_counts()),
+        "country": Counter(db.country_counts()),
     }
 
-    save_strata_ratios(period, counts_by_field, total)
+    save_strata_ratios(counts_by_field, total)
 
-    with open(_strata_ratios_path(period)) as f:
+    with open(_strata_ratios_path()) as f:
         return json.load(f)["fields"]
 
 
 def load_or_compute_strata_ratios(
-    period: str,
     logger: logging.Logger | None = None,
     force_recompute: bool = False,
 ) -> dict[str, dict[str, float]]:
     """
-    Load cached population strata ratios for `period`. Computes (and
+    Load cached population strata ratios. Computes (and
     caches) them from the registry only if the cache is missing, stale,
     or force_recompute=True.
 
     Returns {"biome": {name: ratio, ...}, "region": {...}, "country": {...}}.
     """
-    path = _strata_ratios_path(period)
+    path = _strata_ratios_path()
 
     if path.exists() and not force_recompute:
         with open(path) as f:
             cached = json.load(f)
 
-        db_total = _get_db().count_tiles(period=period)
+        db_total = _get_db().count_tiles()
 
         if cached["total_tiles"] != db_total:
             msg = (
-                f"Strata ratio cache (period={period}) was computed over "
+                "Strata ratio cache was computed over "
                 f"{cached['total_tiles']:,} tiles; registry now has "
                 f"{db_total:,}. Ratios may be stale — re-run `plan`, or "
-                f"call load_or_compute_strata_ratios(force_recompute=True) "
-                f"if the AOI universe genuinely changed."
+                "call load_or_compute_strata_ratios(force_recompute=True) "
+                "if the AOI universe genuinely changed."
             )
             (logger.warning if logger else print)(msg)
 
         return cached["fields"]
 
     if logger:
-        logger.info(
-            f"No strata ratio cache for period={period} — "
-            f"computing from registry…"
-        )
+        logger.info("No strata ratio cache — computing from registry…")
 
-    return _compute_strata_ratios_from_registry(period)
+    return _compute_strata_ratios_from_registry()
 
 
 def filter_candidates(
@@ -131,22 +122,16 @@ def filter_candidates(
     biome: str | None = None,
     region: str | None = None,
     country: str | None = None,
-    period: str | None = None,
     logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     """
     Stream and filter candidate tiles from database.
     Returns list after applying all filters (for compatibility with stratified_sample).
     Never materializes the entire grid - only the filtered results.
-
-    `period` defaults to settings.period.
     """
-    if period is None:
-        period = settings.period
-
     candidates = []
 
-    for tile in iter_tiles(status=status, period=period):
+    for tile in iter_tiles(status=status):
         if tile_id and tile.get("tile_id") != tile_id:
             continue
 
@@ -165,10 +150,7 @@ def filter_candidates(
         candidates.append(tile)
 
     if logger:
-        logger.info(
-            f"Found {len(candidates):,} candidate tiles after filtering "
-            f"(period={period})"
-        )
+        logger.info(f"Found {len(candidates):,} candidate tiles after filtering")
 
     return candidates
 
@@ -216,18 +198,14 @@ def stratified_sample(
             for stratum_tiles in strata.values():
                 stratum_count = max(1, int(limit * len(stratum_tiles) / total))
                 sampled.extend(
-                    random.sample(
-                        stratum_tiles, min(stratum_count, len(stratum_tiles))
-                    )
+                    random.sample(stratum_tiles, min(stratum_count, len(stratum_tiles)))
                 )
         else:
             for stratum, stratum_tiles in strata.items():
                 ratio = ratios.get(stratum, 0.0)
                 stratum_count = round(limit * ratio)
                 sampled.extend(
-                    random.sample(
-                        stratum_tiles, min(stratum_count, len(stratum_tiles))
-                    )
+                    random.sample(stratum_tiles, min(stratum_count, len(stratum_tiles)))
                 )
 
     return sampled[:limit]

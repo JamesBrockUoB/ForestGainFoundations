@@ -25,7 +25,7 @@ def submit_aee_exports(
     """
     tasks: dict[str, ee.batch.Task] = {}
 
-    for year in settings.period_years:
+    for year in settings.years:
         image = build_year_aee(geom, year).toFloat()
         name = f"aee_{year}"
         key = f"embeddings/{name}"

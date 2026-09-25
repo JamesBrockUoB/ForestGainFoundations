@@ -1,36 +1,34 @@
 """
 generate_aois.py
 
-Generate and validate 0.25° AOIs for the active forest-gain period.
+Generate and validate 0.1° AOIs for 2017-2024.
 
 Environment
 -----------
-  PERIOD=p1 (default) — 2017 → 2020
-  PERIOD=p2           — 2020 → 2024
   USE_HPC=0 (default) — local sequential processing
   USE_HPC=1           — multiprocessing for HPC/SLURM
-  NUM_WORKERS=4       — HPC worker count
+  NUM_WORKERS=2       — HPC worker count
   BATCH_SIZE=50       — AOIs per processing batch
-  AOI_STEP=0.25       — AOI grid size in degrees
+  AOI_STEP=0.1       — AOI grid size in degrees
   SEARCH_MODE=asset    — derive search bounds from DT assets
   CLOUD_SCORE_THRESH=0.6 — Cloud Score+ cs_cdf threshold for S2 masking
 
 Usage
 -----
-  PERIOD=p1 python generate_aois.py
-  PERIOD=p2 USE_HPC=1 NUM_WORKERS=4 sbatch submit_aoi_generation.sh
+  python generate_aois.py
+  USE_HPC=1 NUM_WORKERS=2 sbatch submit_aoi_generation.sh
 
-The script resumes from its period-specific checkpoint and writes:
-  data/aois/valid_aois_<period>.json
-  data/aois/rejected_aois_<period>.json
+The script resumes from its checkpoint and writes:
+  data/aois/valid_aois.json
+  data/aois/rejected_aois.json
 
 Validity checks
 ---------------
   • Land coverage
-  • ≥1% Dynamic World vegetation
+  • ≥1% Dynamic World vegetation (at the END year, checking for sufficient vegetation by end of study period)
   • S2: pixel coverage (Cloud Score+ masked, full year) ≥ MIN_IMAGERY_FRACTION
   • S1: ≥ settings.min_s1_observations qualifying acquisitions, every year
-  • ≥0.1% forest gain between the period's start and end year
+  • ≥0.1% forest gain between the start and end year
 
 Output fields include
 ---------------------
@@ -40,11 +38,13 @@ Output fields include
 
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import ee
@@ -58,26 +58,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/"))
 
-PERIOD = os.getenv("PERIOD", "p1")  # "p1" = 2017→2020, "p2" = 2020→2024
+YEARS = (2017, 2024)
 
-PERIOD_YEARS = {
-    "p1": (2017, 2020),
-    "p2": (2020, 2024),
-}
+YEAR_START, YEAR_END = YEARS
 
-if PERIOD not in PERIOD_YEARS:
-    raise ValueError(f"PERIOD must be one of {list(PERIOD_YEARS)}, got {PERIOD!r}")
-
-YEAR_START, YEAR_END = PERIOD_YEARS[PERIOD]
-
-OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois_{PERIOD}.json"
-REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/rejected_aois_{PERIOD}.json"
-CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / f"aois/aoi_filter_checkpoint_{PERIOD}.json"
+OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois.json"
+REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/rejected_aois.json"
+CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / f"aois/aoi_filter_checkpoint.json"
 
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))
-AOI_STEP = float(os.getenv("AOI_STEP", 0.25))
+AOI_STEP = float(os.getenv("AOI_STEP", 0.1))
 
 USE_HPC = os.getenv("USE_HPC", "0") == "1"
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 4))
@@ -86,7 +78,7 @@ SEARCH_MODE = os.getenv("SEARCH_MODE", "asset")
 
 MIN_VEG_FRACTION = 0.01
 MIN_LAND_FRACTION = 0.01
-MIN_GAIN_FRACTION = 0.001
+MIN_GAIN_FRACTION = 0.01
 
 MIN_IMAGERY_FRACTION = 0.05
 
@@ -109,7 +101,7 @@ CLOUD_SCORE_THRESH = float(os.getenv("CLOUD_SCORE_THRESH", "0.6"))
 DT_FOOTPRINT_SCALE = 5000
 DT_FOOTPRINT_BAND = 0
 
-AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / f"aois/all_aois_{PERIOD}.json"
+AOI_LIST_CACHE = PROJECT_ROOT / OUTPUT_DIR / f"aois/all_aois.json"
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,14 +124,12 @@ logger = logging.getLogger(__name__)
 # merges in ee's bundled OAuth client id/secret/token_uri.
 ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
-logger.info(
-    f"GEE initialised | project={settings.gee_project} | HPC={USE_HPC} | PERIOD={PERIOD}"
-)
+logger.info(f"GEE initialised | project={settings.gee_project} | HPC={USE_HPC}")
 
 
 def get_dt_domain_geometry(
     band_index: int = DT_FOOTPRINT_BAND,
-    years: tuple[int, ...] = PERIOD_YEARS[PERIOD],
+    years: tuple[int, ...] = YEARS,
     working_scale: int = DT_FOOTPRINT_SCALE,
 ) -> ee.Geometry:
     """
@@ -151,7 +141,7 @@ def get_dt_domain_geometry(
     mask = ee.Image.constant(0)
     for year in years:
         img = (
-            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_mosaic")
+            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v2")
             .select(band_index)
             .reproject(crs="EPSG:3035", scale=working_scale)
         )
@@ -191,19 +181,28 @@ def _dw_vegetation_mask(year):
     )
 
 
+def _dw_label_mode(year):
+    """
+    Modal (most frequent) Dynamic World label per pixel across the
+    calendar year
+    """
+    start = f"{year}-01-01"
+    end = f"{year + 1}-01-01"
+    dw = ee.ImageCollection(DW_COLLECTION).filterDate(start, end)
+    return dw.select("label").reduce(ee.Reducer.mode()).rename("dw_label")
+
+
 def _build_gee_datasets():
     _land_fc = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
     _land_raster = ee.Image(0).paint(_land_fc, 1).unmask(0).rename("land")
 
-    _dw_veg = _dw_vegetation_mask(YEAR_START).rename("dw_veg")
+    _dw_veg = _dw_vegetation_mask(YEAR_END).rename("dw_veg")
 
     _land_veg = _land_raster.addBands(_dw_veg)
 
     def load_dt_mosaic(year):
         return (
-            ee.Image(
-                f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_mosaic"
-            )
+            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v2")
             .select([0])
             .divide(2.55)
             .rename("tree_cover_pct")
@@ -216,6 +215,16 @@ def _build_gee_datasets():
     _forest_end = _cover_end.gt(settings.min_tree_threshold_frac).unmask(0)
 
     _gain_mask = _forest_start.Not().And(_forest_end).rename("gain").unmask(0)
+
+    _dw_label_start = _dw_label_mode(YEAR_START)
+    _dt_non_forest_start = _forest_start.Not().rename("dt_non_forest_start")
+    _dw_forest_like = _dw_label_start.eq(1).Or(
+        _dw_label_start.eq(3)
+    )  # trees OR flooded_vegetation
+    _dw_agrees_non_forest = _dt_non_forest_start.And(_dw_forest_like.Not()).rename(
+        "dt_non_forest_start_dw_agrees"
+    )
+    _dt_dw_qa = _dt_non_forest_start.addBands(_dw_agrees_non_forest)
 
     _ecoregions = ee.FeatureCollection("RESOLVE/ECOREGIONS/2017")
     _countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
@@ -270,17 +279,25 @@ def _build_gee_datasets():
         "country": _id_to_country_name,
     }
 
-    return _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups
+    return (
+        _land_veg,
+        _gain_mask,
+        _ecoregions,
+        _countries,
+        _eco_country_img,
+        _lookups,
+        _dt_dw_qa,
+    )
 
 
-def get_asset_bounds(year_start=2017, year_end=2020, padding=0.5):
+def get_asset_bounds(year_start=2017, year_end=2024, padding=0.5):
     """
     Derive the geographic bounding box from the REAL dt coverage
     footprint (nonzero-value extent), not the asset's raw rectangular
     grid -- avoids over-including regions like Ukraine/Russia that sit
     inside the EPSG:3035 grid but have no real product coverage.
     """
-    domain = get_dt_domain_geometry()
+    domain = get_dt_domain_geometry(years=(year_start, year_end))
     coords = ee.List(domain.bounds(1, "EPSG:4326").coordinates().get(0)).getInfo()
 
     lons = [c[0] for c in coords]
@@ -361,7 +378,9 @@ def _s2_year_valid_mask(geom, start, end, bands):
     return counts.gt(0).unmask(0).rename("valid")
 
 
-def build_year_sensor_masks_combined(batch_geom, year_start=YEAR_START, year_end=YEAR_END):
+def build_year_sensor_masks_combined(
+    batch_geom, year_start=YEAR_START, year_end=YEAR_END
+):
     """
     Combined multi-band S2 coverage image: one band per year
     (s2_<year>), each built once against the batch-wide geometry. Bands
@@ -478,8 +497,6 @@ def generate_aois(
     max_lon=180.0,
     max_lat=85.0,
 ):
-    import math
-
     cells = []
 
     # Snap to grid boundaries
@@ -541,7 +558,7 @@ def generate_aois(
             frac = land_mask.reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=f.geometry(),
-                scale=1000,
+                scale=100,
                 maxPixels=1e9,
             ).get("discrete_classification")
             return f.set("land_frac", frac)
@@ -572,7 +589,14 @@ def _clean_str(raw):
 
 
 def process_batch(
-    _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups, batch
+    _land_veg,
+    _gain_mask,
+    _ecoregions,
+    _countries,
+    _eco_country_img,
+    _lookups,
+    _dt_dw_qa,
+    batch,
 ):
     batch = [a.get("properties", a) if isinstance(a, dict) else a for a in batch]
 
@@ -586,16 +610,97 @@ def process_batch(
     fc = ee.FeatureCollection(features)
     batch_geom = fc.geometry().bounds(maxError=1)
 
+    year_names = [f"s2_{y}" for y in range(YEAR_START, YEAR_END + 1)]
+    combined_s2 = build_year_sensor_masks_combined(batch_geom)
+
+    # --- 1) fire off all independent reductions concurrently ---
     t0 = time.time()
 
-    year_names = [f"s2_{y}" for y in range(YEAR_START, YEAR_END + 1)]
+    def _get_s2():
+        rr = combined_s2.reduceRegions(
+            collection=fc, reducer=ee.Reducer.mean(), scale=500, tileScale=4
+        )
+        return _reduce_regions_getinfo_with_retry(rr)
 
-    combined_s2 = build_year_sensor_masks_combined(batch_geom)
-    s2_rr = combined_s2.reduceRegions(
-        collection=fc, reducer=ee.Reducer.mean(), scale=500, tileScale=4
+    def _get_land_veg():
+        rr = _land_veg.reduceRegions(
+            collection=fc, reducer=ee.Reducer.mean(), scale=250, tileScale=4
+        )
+        return _reduce_regions_getinfo_with_retry(rr)
+
+    def _get_gain():
+        rr = _gain_mask.reduceRegions(
+            collection=fc, reducer=ee.Reducer.mean(), scale=100, tileScale=4
+        )
+        return _reduce_regions_getinfo_with_retry(rr)
+
+    def _get_qa():
+        rr = _dt_dw_qa.reduceRegions(
+            collection=fc, reducer=ee.Reducer.sum(), scale=100, tileScale=4
+        )
+        return _reduce_regions_getinfo_with_retry(rr)
+
+    def _get_s1():
+        return {
+            year: s1_scene_counts_for_batch(fc, year)
+            for year in range(YEAR_START, YEAR_END + 1)
+        }
+
+    def _get_centroid():
+        def add_centroid_lookup(f):
+            centroid = f.geometry().centroid(1)
+
+            eco_hit = _ecoregions.filterBounds(centroid)
+            country_hit = _countries.filterBounds(centroid)
+            has_eco = eco_hit.size().gt(0)
+            has_country = country_hit.size().gt(0)
+
+            eco = eco_hit.first()
+            country = country_hit.first()
+
+            biome_name = ee.Algorithms.If(
+                has_eco, _clean_str(eco.get("BIOME_NAME")), None
+            )
+            biome_num = ee.Algorithms.If(has_eco, eco.get("BIOME_NUM"), None)
+            realm = ee.Algorithms.If(has_eco, _clean_str(eco.get("REALM")), None)
+            country_name = ee.Algorithms.If(
+                has_country, _clean_str(country.get("country_na")), None
+            )
+
+            return f.set(
+                {
+                    "has_eco": has_eco,
+                    "has_country": has_country,
+                    "biome_name": biome_name,
+                    "biome_num": biome_num,
+                    "realm": realm,
+                    "country_name": country_name,
+                }
+            )
+
+        fc_centroid = fc.map(add_centroid_lookup)
+        return _reduce_regions_getinfo_with_retry(fc_centroid)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        s2_fut = ex.submit(_get_s2)
+        lv_fut = ex.submit(_get_land_veg)
+        gain_fut = ex.submit(_get_gain)
+        qa_fut = ex.submit(_get_qa)
+        s1_fut = ex.submit(_get_s1)
+        centroid_fut = ex.submit(_get_centroid)
+
+        s2_info = s2_fut.result()
+        lv_info = lv_fut.result()
+        gain_info = gain_fut.result()
+        qa_info = qa_fut.result()
+        s1_counts_by_year = s1_fut.result()
+        centroid_info = centroid_fut.result()
+
+    logger.info(
+        f"  [timing] parallel reductions (s2/land-veg/gain/qa/s1/centroid): {time.time() - t0:.1f}s"
     )
-    s2_info = _reduce_regions_getinfo_with_retry(s2_rr)
 
+    # --- 2) parse s2 masks ---
     mask_results = {("s2", y): {} for y in range(YEAR_START, YEAR_END + 1)}
     for f in s2_info.get("features", []):
         props = f.get("properties", {})
@@ -604,20 +709,7 @@ def process_batch(
             val = props.get(band)
             mask_results[("s2", y)][aid] = float(val or 0.0)
 
-    logger.info(f"  [timing] s2 imagery masks: {time.time() - t0:.1f}s")
-
-    t0 = time.time()
-    s1_counts_by_year = {
-        year: s1_scene_counts_for_batch(fc, year)
-        for year in range(YEAR_START, YEAR_END + 1)
-    }
-    logger.info(f"  [timing] s1 scene counts: {time.time() - t0:.1f}s")
-
-    t0 = time.time()
-    lv_rr = _land_veg.reduceRegions(
-        collection=fc, reducer=ee.Reducer.mean(), scale=1000
-    )
-    lv_info = _reduce_regions_getinfo_with_retry(lv_rr)
+    # --- 3) parse land/veg ---
     landveg_map = {}
     for f in lv_info.get("features", []):
         props = f.get("properties", {})
@@ -629,13 +721,8 @@ def process_batch(
         if dw is None:
             dw = props.get("mean_dw_veg") or 0.0
         landveg_map[key] = {"land": float(land or 0.0), "dw_veg": float(dw or 0.0)}
-    logger.info(f"  [timing] land/veg: {time.time() - t0:.1f}s")
 
-    t0 = time.time()
-    gain_rr = _gain_mask.reduceRegions(
-        collection=fc, reducer=ee.Reducer.mean(), scale=100
-    )
-    gain_info = _reduce_regions_getinfo_with_retry(gain_rr)
+    # --- 4) parse gain ---
     gain_map = {}
     for f in gain_info.get("features", []):
         props = f.get("properties", {})
@@ -644,42 +731,21 @@ def process_batch(
         if gain_val is None:
             gain_val = props.get("mean") or 0.0
         gain_map[key] = float(gain_val or 0.0)
-    logger.info(f"  [timing] gain: {time.time() - t0:.1f}s")
 
-    t0 = time.time()
+    # --- 5) parse qa ---
+    qa_map = {}
+    for f in qa_info.get("features", []):
+        props = f.get("properties", {})
+        aid = props.get("id") or f.get("id")
+        non_forest_px = float(props.get("dt_non_forest_start", 0.0) or 0.0)
+        agree_px = float(props.get("dt_non_forest_start_dw_agrees", 0.0) or 0.0)
+        qa_map[aid] = {
+            "dt_dw_agreement_frac": (
+                agree_px / non_forest_px if non_forest_px > 0 else None
+            ),
+        }
 
-    def add_centroid_lookup(f):
-        centroid = f.geometry().centroid(1)
-
-        eco_hit = _ecoregions.filterBounds(centroid)
-        country_hit = _countries.filterBounds(centroid)
-        has_eco = eco_hit.size().gt(0)
-        has_country = country_hit.size().gt(0)
-
-        eco = eco_hit.first()
-        country = country_hit.first()
-
-        biome_name = ee.Algorithms.If(has_eco, _clean_str(eco.get("BIOME_NAME")), None)
-        biome_num = ee.Algorithms.If(has_eco, eco.get("BIOME_NUM"), None)
-        realm = ee.Algorithms.If(has_eco, _clean_str(eco.get("REALM")), None)
-        country_name = ee.Algorithms.If(
-            has_country, _clean_str(country.get("country_na")), None
-        )
-
-        return f.set(
-            {
-                "has_eco": has_eco,
-                "has_country": has_country,
-                "biome_name": biome_name,
-                "biome_num": biome_num,
-                "realm": realm,
-                "country_name": country_name,
-            }
-        )
-
-    fc_centroid = fc.map(add_centroid_lookup)
-    centroid_info = _reduce_regions_getinfo_with_retry(fc_centroid)
-
+    # --- 6) parse centroid lookups ---
     eco_map = {}
     country_map = {}
     fallback_ids = set()
@@ -714,7 +780,7 @@ def process_batch(
         else:
             fallback_ids.add(aid)
 
-    # --- 4b) slow path, only for AOIs whose centroid missed. Majority-pixel
+    # --- 6b) slow path, only for AOIs whose centroid missed. Majority-pixel
     # vote via the pre-rasterized image, targeted at just this subset
     # instead of running for every AOI in the batch.
     if fallback_ids:
@@ -764,7 +830,7 @@ def process_batch(
                 except (TypeError, ValueError):
                     country_map[aid] = "Unknown"
 
-    # --- 5) assemble outputs ---
+    # --- 7) assemble outputs ---
     valid_out = []
     rejected_out = []
 
@@ -778,6 +844,8 @@ def process_batch(
 
         fg = gain_map.get(aid, 0.0)
         has_gain = fg >= MIN_GAIN_FRACTION
+
+        qa = qa_map.get(aid, {"dt_dw_agreement_frac": None})
 
         worst_s2 = 1.0
         for (sensor, year), per in mask_results.items():
@@ -801,13 +869,12 @@ def process_batch(
         centroid_lon = (a["minLon"] + a["maxLon"]) / 2.0
         centroid_lat = (a["minLat"] + a["maxLat"]) / 2.0
         R = 6371.0088
-        import math as _math
 
-        lon1 = _math.radians(a["minLon"])
-        lon2 = _math.radians(a["maxLon"])
-        lat1 = _math.radians(a["minLat"])
-        lat2 = _math.radians(a["maxLat"])
-        area_km2 = abs(R * R * (lon2 - lon1) * (_math.sin(lat2) - _math.sin(lat1)))
+        lon1 = math.radians(a["minLon"])
+        lon2 = math.radians(a["maxLon"])
+        lat1 = math.radians(a["minLat"])
+        lat2 = math.radians(a["maxLat"])
+        area_km2 = abs(R * R * (lon2 - lon1) * (math.sin(lat2) - math.sin(lat1)))
 
         props = {
             "id": aid,
@@ -824,6 +891,7 @@ def process_batch(
             "has_veg": int(has_veg),
             "forest_gain_frac": float(fg),
             "has_gain": int(has_gain),
+            "dt_dw_agreement_frac": qa["dt_dw_agreement_frac"],
             "has_imagery": int(has_img),
             "biome_name": biome["biome_name"],
             "biome_num": int(biome["biome_num"]),
@@ -852,9 +920,15 @@ def process_batch(
 
 
 def run_local(remaining, loaded_valid, loaded_rejected):
-    _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups = (
-        _build_gee_datasets()
-    )
+    (
+        _land_veg,
+        _gain_mask,
+        _ecoregions,
+        _countries,
+        _eco_country_img,
+        _lookups,
+        _dt_dw_qa,
+    ) = _build_gee_datasets()
 
     valid_aois = []
     rejected_aois = []
@@ -870,6 +944,7 @@ def run_local(remaining, loaded_valid, loaded_rejected):
                 _countries,
                 _eco_country_img,
                 _lookups,
+                _dt_dw_qa,
                 batch,
             )
             valid_aois.extend([f["properties"] for f in valid_batch])
@@ -903,9 +978,15 @@ def _worker(batch_queue, result_queue, worker_id):
     # process needs its own ee.Initialize call since GEE state isn't
     # inherited across the multiprocessing fork/spawn boundary.
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
-    _land_veg, _gain_mask, _ecoregions, _countries, _eco_country_img, _lookups = (
-        _build_gee_datasets()
-    )
+    (
+        _land_veg,
+        _gain_mask,
+        _ecoregions,
+        _countries,
+        _eco_country_img,
+        _lookups,
+        _dt_dw_qa,
+    ) = _build_gee_datasets()
 
     while True:
         item = batch_queue.get()
@@ -924,6 +1005,7 @@ def _worker(batch_queue, result_queue, worker_id):
                     _countries,
                     _eco_country_img,
                     _lookups,
+                    _dt_dw_qa,
                     batch,
                 )
                 result_queue.put(

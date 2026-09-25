@@ -30,25 +30,6 @@ def evaluate_cheap_stats(
     if ndvi_trend <= settings.ndvi_trend_min:
         return str(TileStatus.REJECTED), "low_viability"
 
-    if settings.period == "p1":
-
-        pseudo_frac = stats.get("pseudo_gain_frac")
-
-        if pseudo_frac is None:
-            return (
-                str(TileStatus.REJECTED),
-                "missing_pseudo_gain_stats",
-            )
-
-        if pseudo_frac < settings.min_pseudo_gain_frac:
-            if logger:
-                logger.debug(f"low_pseudo_coverage: {pseudo_frac:.3f}")
-
-            return (
-                str(TileStatus.REJECTED),
-                "low_pseudo_gain_coverage",
-            )
-
     return str(TileStatus.CHEAP_VALID), None
 
 

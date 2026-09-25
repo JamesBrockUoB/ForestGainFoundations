@@ -48,7 +48,7 @@ def build_gain_layer(
 
     intervening_years = sorted(
         y
-        for y in settings.period_years
+        for y in settings.years
         if y
         not in (
             settings.year_start,

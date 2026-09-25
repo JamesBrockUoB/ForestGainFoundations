@@ -5,6 +5,7 @@ import multiprocessing as mp
 import queue
 import shutil
 import tempfile
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -22,6 +23,22 @@ class TesseraNoDataError(RuntimeError):
 
 _MP_CTX = mp.get_context("spawn")
 _GDAL_CACHEMAX_MB = 256
+
+# Per-year fetch budget. If a subprocess hasn't reported back within this
+# window it's reaped and treated as a failure, freeing its slot for the
+# next pending year -- without this, one stuck fetch blocks a slot (and,
+# at max concurrency, potentially the whole tile) forever.
+_YEAR_TIMEOUT_S = 60
+
+# How many years fetch concurrently. This is the actual RAM/CPU knob:
+# each running subprocess holds its own reprojected arrays plus a
+# _GDAL_CACHEMAX_MB cache, so peak memory scales with this number, not
+# with the total year count. Override by adding tessera_max_concurrent_years
+# to settings; otherwise defaults to 2.
+_DEFAULT_MAX_CONCURRENT_YEARS = 2
+_MAX_CONCURRENT_YEARS = getattr(
+    settings, "tessera_max_concurrent_years", _DEFAULT_MAX_CONCURRENT_YEARS
+)
 
 
 def tile_bbox(tile: dict) -> tuple[float, float, float, float]:
@@ -194,122 +211,126 @@ def download_tessera(
     embeddings_dir: Path,
     logger: logging.Logger,
 ) -> None:
+    """
+    Fetch every missing year for this tile, running at most
+    _MAX_CONCURRENT_YEARS subprocesses at a time. As soon as a running
+    subprocess finishes -- success, failure, or timeout -- its slot is
+    immediately handed to the next pending year, so peak RAM/CPU is
+    bounded by the concurrency cap rather than by the total year count.
+    """
     bbox = tile_bbox(tile)
 
     years_to_fetch: list[tuple[int, Path]] = []
-
-    for year in settings.period_years:
+    for year in settings.years:
         dest = embeddings_dir / f"tessera_{year}.tif"
-
         if not dest.exists():
             years_to_fetch.append((year, dest))
 
     if not years_to_fetch:
         return
 
+    max_concurrent = max(1, min(len(years_to_fetch), _MAX_CONCURRENT_YEARS))
+    logger.info(
+        f"TESSERA: fetching {len(years_to_fetch)} year(s), "
+        f"{max_concurrent} at a time"
+    )
+
     result_queue = _MP_CTX.Queue()
-    procs: list[tuple[mp.Process, str, int, Path]] = []
+    pending: list[tuple[int, Path]] = list(years_to_fetch)
+    # year -> (proc, raw_dir, dest, launched_at)
+    running: dict[int, tuple[mp.Process, str, Path, float]] = {}
     errors: list[str] = []
     no_data_errors: list[str] = []
-    completed: set[int] = set()
+    aborted = False
+
+    def _launch(year: int, dest: Path) -> None:
+        raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
+        proc = _MP_CTX.Process(
+            target=_fetch_and_align_year,
+            args=(raw_dir, bbox, year, str(dest), tile, result_queue),
+        )
+        proc.start()
+        running[year] = (proc, raw_dir, dest, time.monotonic())
+
+    def _finish(year: int) -> None:
+        """Reap a running process, clean up its scratch dir, and pull the
+        next pending year into its freed slot (unless we're aborting)."""
+        proc, raw_dir, _dest, _launched_at = running.pop(year)
+        proc.join(timeout=5)
+        if proc.is_alive():
+            _reap(proc)
+        shutil.rmtree(raw_dir, ignore_errors=True)
+        if not aborted and pending:
+            nyear, ndest = pending.pop(0)
+            _launch(nyear, ndest)
+
+    def _reap_timed_out() -> None:
+        now = time.monotonic()
+        for year, (proc, _raw_dir, dest, launched_at) in list(running.items()):
+            if now - launched_at > _YEAR_TIMEOUT_S:
+                errors.append(
+                    f"TESSERA {year}: fetch exceeded {_YEAR_TIMEOUT_S}s "
+                    f"timeout for bbox={bbox} -- subprocess terminated"
+                )
+                _finish(year)
 
     try:
-        for year, dest in years_to_fetch:
-            raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
+        while pending and len(running) < max_concurrent:
+            year, dest = pending.pop(0)
+            _launch(year, dest)
 
-            proc = _MP_CTX.Process(
-                target=_fetch_and_align_year,
-                args=(
-                    raw_dir,
-                    bbox,
-                    year,
-                    str(dest),
-                    tile,
-                    result_queue,
-                ),
-            )
+        while running:
+            _reap_timed_out()
+            if not running:
+                break
 
-            proc.start()
-
-            procs.append(
-                (
-                    proc,
-                    raw_dir,
-                    year,
-                    dest,
-                )
-            )
-
-        remaining = {year for _, _, year, _ in procs}
-
-        while remaining:
             try:
                 result = result_queue.get(timeout=0.5)
             except queue.Empty:
-                dead_without_result = []
-
-                for proc, raw_dir, year, dest in procs:
-                    if year in remaining and not proc.is_alive():
-                        dead_without_result.append((proc, year, dest))
-
-                for proc, year, dest in dead_without_result:
-                    remaining.discard(year)
-
-                    if proc.exitcode != 0:
-                        errors.append(
-                            f"TESSERA {year}: subprocess failed "
-                            f"(exitcode={proc.exitcode})"
-                        )
-                    elif not dest.exists():
-                        errors.append(
-                            f"TESSERA {year}: subprocess exited "
-                            f"cleanly but {dest} was not written"
-                        )
-
+                # a process may have died without ever pushing a result
+                for year, (proc, _raw_dir, dest, _launched_at) in list(running.items()):
+                    if not proc.is_alive():
+                        if proc.exitcode != 0:
+                            errors.append(
+                                f"TESSERA {year}: subprocess failed "
+                                f"(exitcode={proc.exitcode})"
+                            )
+                        elif not dest.exists():
+                            errors.append(
+                                f"TESSERA {year}: subprocess exited "
+                                f"cleanly but {dest} was not written"
+                            )
+                        _finish(year)
                 continue
 
             year = result["year"]
-            remaining.discard(year)
-            completed.add(year)
+            if year not in running:
+                continue  # stray/duplicate result -- ignore
 
-            if result["success"]:
-                continue
+            if not result["success"]:
+                if result["error_type"] == "no_data":
+                    no_data_errors.append(result["error"])
+                else:
+                    errors.append(
+                        f"TESSERA {year}: {result['error_type']}: " f"{result['error']}"
+                    )
 
-            if result["error_type"] == "no_data":
-                no_data_errors.append(result["error"])
-            else:
-                errors.append(
-                    f"TESSERA {year}: {result['error_type']}: " f"{result['error']}"
-                )
+            _finish(year)
 
-            if no_data_errors:
-                for proc, raw_dir, proc_year, dest in procs:
-                    if proc_year not in completed:
-                        _reap(proc)
-
+            if no_data_errors and not aborted:
+                aborted = True
+                pending.clear()
+                for y, (proc, raw_dir, _dest, _launched_at) in list(running.items()):
+                    _reap(proc)
+                    shutil.rmtree(raw_dir, ignore_errors=True)
+                running.clear()
                 raise TesseraNoDataError("; ".join(no_data_errors))
-
-        for proc, raw_dir, year, dest in procs:
-            proc.join(timeout=1)
-
-            if proc.is_alive():
-                _reap(proc)
-
-            if proc.exitcode != 0:
-                errors.append(
-                    f"TESSERA {year}: subprocess failed " f"(exitcode={proc.exitcode})"
-                )
-            elif not dest.exists():
-                errors.append(
-                    f"TESSERA {year}: subprocess exited cleanly "
-                    f"but {dest} was not written"
-                )
 
         if errors:
             raise RuntimeError("; ".join(errors))
 
     finally:
-        for proc, raw_dir, year, dest in procs:
+        for year, (proc, raw_dir, _dest, _launched_at) in list(running.items()):
             _reap(proc)
             shutil.rmtree(raw_dir, ignore_errors=True)
 

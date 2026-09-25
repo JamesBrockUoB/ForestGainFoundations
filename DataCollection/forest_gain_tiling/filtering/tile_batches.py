@@ -10,9 +10,9 @@ from tiling.selection import STRATA_FIELDS, load_or_compute_strata_ratios
 
 
 def iter_pending_tile_batches(
-    status: str, batch_size: int, period: str | None = None
+    status: str,
+    batch_size: int,
 ) -> Iterator[list[dict[str, Any]]]:
-    period = period or settings.period
     db = _get_db()
 
     last_xi: int | None = None
@@ -31,14 +31,16 @@ def iter_pending_tile_batches(
                         y_min_m,
                         x_max_m,
                         y_max_m,
+                        min_lon,
                         min_lat,
+                        max_lon,
                         max_lat
                     FROM tiles
-                    WHERE status = ? AND period = ?
+                    WHERE status = ?
                     ORDER BY xi, yi
                     LIMIT ?
                     """,
-                    (status, period, batch_size),
+                    (status, batch_size),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -51,17 +53,18 @@ def iter_pending_tile_batches(
                         y_min_m,
                         x_max_m,
                         y_max_m,
+                        min_lon,
                         min_lat,
+                        max_lon,
                         max_lat
                     FROM tiles
-                    WHERE status = ? AND period = ?
+                    WHERE status = ?
                       AND (xi > ? OR (xi = ? AND yi > ?))
                     ORDER BY xi, yi
                     LIMIT ?
                     """,
                     (
                         status,
-                        period,
                         last_xi,
                         last_xi,
                         last_yi,
@@ -81,7 +84,9 @@ def iter_pending_tile_batches(
                     "y_min_m": r["y_min_m"],
                     "x_max_m": r["x_max_m"],
                     "y_max_m": r["y_max_m"],
+                    "min_lon": r["min_lon"],
                     "min_lat": r["min_lat"],
+                    "max_lon": r["max_lon"],
                     "max_lat": r["max_lat"],
                 }
                 for r in rows
@@ -93,37 +98,35 @@ def iter_pending_tile_batches(
             yield tiles
 
 
-def count_pending(status: str, period: str | None = None) -> int:
-    period = period or settings.period
-    return _get_db().count_tiles(status=status, period=period)
+def count_pending(status: str) -> int:
+    return _get_db().count_tiles(status=status)
 
 
 def count_pending_by_stratum(
-    status: str, stratify_field: str, period: str | None = None
+    status: str,
+    stratify_field: str,
 ) -> dict[str, int]:
     """
     Actual available-tile counts per stratum for `status` — delegates to
     RegistryDB's existing biome_counts/region_counts/country_counts
-    (status_filter=..., period=...), each a single GROUP BY query.
+    (status_filter=...), each a single GROUP BY query.
     """
     if stratify_field not in STRATA_FIELDS:
         raise ValueError(f"stratify_field must be one of {STRATA_FIELDS}")
 
-    period = period or settings.period
     db = _get_db()
 
     if stratify_field == "biome":
-        return db.biome_counts(status_filter=status, period=period)
+        return db.biome_counts(status_filter=status)
     elif stratify_field == "region":
-        return db.region_counts(status_filter=status, period=period)
+        return db.region_counts(status_filter=status)
     else:  # "country"
-        return db.country_counts(status_filter=status, period=period)
+        return db.country_counts(status_filter=status)
 
 
 def iter_stratified_pending_tile_batches(
     status: str,
     batch_size: int,
-    period: str,
     stratify_field: str,
     tile_limit: int,
     mode: str = "prop",
@@ -156,20 +159,17 @@ def iter_stratified_pending_tile_batches(
     if mode not in ("prop", "equal"):
         raise ValueError(f"mode must be 'prop' or 'equal', got {mode!r}")
 
-    available = count_pending_by_stratum(status, stratify_field, period)
+    available = count_pending_by_stratum(status, stratify_field)
 
     if mode == "equal":
         strata = list(available.keys())
         if not strata:
             if logger:
-                logger.warning(
-                    f"No tiles at status={status} for period={period} — "
-                    f"nothing to stratify."
-                )
+                logger.warning(f"No tiles at status={status} — nothing to stratify.")
             return
         quotas = {s: tile_limit // len(strata) for s in strata}
     else:
-        ratios = load_or_compute_strata_ratios(period, logger)[stratify_field]
+        ratios = load_or_compute_strata_ratios(logger)[stratify_field]
         quotas = {s: round(tile_limit * r) for s, r in ratios.items()}
 
     db = _get_db()
@@ -189,13 +189,13 @@ def iter_stratified_pending_tile_batches(
                 f"""
                 SELECT
                     tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
-                    min_lat, max_lat
+                    min_lon, min_lat, max_lon, max_lat
                 FROM tiles
-                WHERE status = ? AND period = ? AND {stratify_field} = ?
+                WHERE status = ? AND {stratify_field} = ?
                 ORDER BY RANDOM()
                 LIMIT ?
                 """,
-                (status, period, stratum, quota),
+                (status, stratum, quota),
             ).fetchall()
 
             selected.extend(
@@ -207,7 +207,9 @@ def iter_stratified_pending_tile_batches(
                     "y_min_m": r["y_min_m"],
                     "x_max_m": r["x_max_m"],
                     "y_max_m": r["y_max_m"],
+                    "min_lon": r["min_lon"],
                     "min_lat": r["min_lat"],
+                    "max_lon": r["max_lon"],
                     "max_lat": r["max_lat"],
                 }
                 for r in rows

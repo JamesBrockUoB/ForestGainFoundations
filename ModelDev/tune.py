@@ -35,13 +35,11 @@ def sweep_train():
     config = wandb.config
 
     tile_root = Path("../DataCollection/data/test_tiles")
-    tile_dirs = sorted(
-        [p for p in tile_root.iterdir() if p.is_dir() and p.name.endswith("_p1")]
-    )
+    tile_dirs = sorted([p for p in tile_root.iterdir() if p.is_dir()])
     split = int(0.8 * len(tile_dirs))
 
-    train_ds = MultiTemporalGainDataset(tile_dirs[:split], period="p1")
-    val_ds = MultiTemporalGainDataset(tile_dirs[split:], period="p1")
+    train_ds = MultiTemporalGainDataset(tile_dirs[:split])
+    val_ds = MultiTemporalGainDataset(tile_dirs[split:])
 
     train_loader = DataLoader(
         train_ds,
@@ -61,7 +59,7 @@ def sweep_train():
     task = GainDetectionTask(
         model_type=config.model_type,
         in_channels=NUM_INPUT_CHANNELS,
-        learning_rate=config.learning_rate,
+        lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
 

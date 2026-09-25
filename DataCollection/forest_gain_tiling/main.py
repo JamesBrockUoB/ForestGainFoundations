@@ -1,31 +1,27 @@
 """
 Forest-gain tile export pipeline.
 
-Period is controlled by the PERIOD environment variable:
-  PERIOD=p1 (default) — 2017 → 2020
-  PERIOD=p2           — 2020 → 2024
-
 Examples
 --------
-  PERIOD=p1 python main.py plan
-  PERIOD=p1 python main.py status
-  PERIOD=p1 python main.py filter --stage cheap
-  PERIOD=p1 python main.py filter --stage imagery
-  PERIOD=p1 python main.py filter --stage cheap --limit 5
-  PERIOD=p1 python main.py filter --stage cheap --stratify biome --tile-limit 2000
-  PERIOD=p1 python main.py filter --stage cheap --stratify biome --stratify-mode equal --tile-limit 2000
-  PERIOD=p1 python main.py run
-  PERIOD=p1 python main.py run --limit 500
-  PERIOD=p1 python main.py run --biome "Boreal Forests"
-  PERIOD=p1 python main.py run --region "Neotropic"
-  PERIOD=p1 python main.py run --aoi-id aoi_-73.25_-52.75
-  PERIOD=p1 python main.py run --tile-id tile_-363_2324_p1
-  PERIOD=p1 python main.py run --status failed
-  PERIOD=p1 python main.py run --local-output --limit 10
-  PERIOD=p1 python main.py reset --status failed
-  PERIOD=p1 python main.py reset --status failed --to-status valid
-  PERIOD=p1 python main.py reset --status rejected --yes
-  PERIOD=p1 python main.py reset --clear-history
+  python main.py plan
+  python main.py status
+  python main.py filter --stage cheap
+  python main.py filter --stage imagery
+  python main.py filter --stage cheap --limit 5
+  python main.py filter --stage cheap --stratify biome --tile-limit 2000
+  python main.py filter --stage cheap --stratify biome --stratify-mode equal --tile-limit 2000
+  python main.py run
+  python main.py run --limit 500
+  python main.py run --biome "Boreal Forests"
+  python main.py run --region "Neotropic"
+  python main.py run --aoi-id aoi_-73.25_-52.75
+  python main.py run --tile-id tile_-363_2324
+  python main.py run --status failed
+  python main.py run --local-output --limit 10
+  python main.py reset --status failed
+  python main.py reset --status failed --to-status valid
+  python main.py reset --status rejected --yes
+  python main.py reset --clear-history
 
 Run
 ---
@@ -56,8 +52,6 @@ Reset
   --clear-history
   --yes
 
-All commands are scoped to the active PERIOD. PERIOD can be overridden at
-runtime, e.g. PERIOD=p2 python main.py run.
 """
 
 from __future__ import annotations
@@ -88,7 +82,7 @@ from tiling.selection import (
 def setup_logging(command: str) -> logging.Logger:
     settings.log_dir.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logfile = settings.log_dir / f"gee_{command}_{settings.period}_{ts}.log"
+    logfile = settings.log_dir / f"gee_{command}_{ts}.log"
 
     logger = logging.getLogger("gee")
     logger.setLevel(logging.INFO)
@@ -102,7 +96,7 @@ def setup_logging(command: str) -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(sh)
     logger.info(f"Log: {logfile}")
-    logger.info(f"PERIOD={settings.period} ({settings.year_start}→{settings.year_end})")
+    logger.info(f"({settings.year_start}→{settings.year_end})")
     return logger
 
 
@@ -111,27 +105,26 @@ def init_ee() -> None:
 
 
 def cmd_plan(args: argparse.Namespace) -> None:
-    """Plan phase: generate tiles for the active period and add new ones to registry."""
+    """Plan phase: generate tiles and add new ones to registry."""
     logger = setup_logging("plan")
 
     logger.info(f"Loading valid AOIs from {settings.valid_aois_path}…")
     with open(settings.valid_aois_path) as f:
         valid_aois = json.load(f)
-    logger.info(f"  {len(valid_aois):,} valid AOIs (period={settings.period})")
+    logger.info(f"  {len(valid_aois):,} valid AOIs")
 
     # AOIs are expected to already include biome/region/country (set by generate_aois).
     # Do not attempt to assign countries here — that belongs in generate_aois.
     from registry.store import _get_db
 
-    db_tile_count = _get_db().count_tiles(period=settings.period)
+    db_tile_count = _get_db().count_tiles()
 
     if db_tile_count > 0:
         logger.info(
-            f"Database already has {db_tile_count:,} tiles for period="
-            f"{settings.period}. Skipping grid generation."
+            f"Database already has {db_tile_count:,} tiles. Skipping grid generation."
         )
     else:
-        logger.info("No tiles for this period yet. Generating tile grid…")
+        logger.info("No tiles yet. Generating tile grid…")
 
         logger.info("Streaming tiles to database in batches…")
         from collections import Counter
@@ -163,8 +156,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
 
         settings.registry_db_path.parent.mkdir(parents=True, exist_ok=True)
         logger.info(
-            f"Registry: {new_count:,} new tiles added (period={settings.period}) "
-            f"→ {settings.registry_db_path}"
+            f"Registry: {new_count:,} new tiles added → {settings.registry_db_path}"
         )
 
         # Population-level stratification ratios, computed once here from
@@ -172,26 +164,24 @@ def cmd_plan(args: argparse.Namespace) -> None:
         # `run` and `filter --stratify` sample toward, never the distribution
         # of whatever subset survives cheap/imagery filtering.
         save_strata_ratios(
-            settings.period,
             {"biome": biome_counts, "region": region_counts, "country": country_counts},
             total,
         )
         logger.info(
-            f"Cached strata ratios ({total:,} tiles) → "
-            f"data/aois/strata_ratios_{settings.period}.json"
+            f"Cached strata ratios ({total:,} tiles) → " f"data/aois/strata_ratios.json"
         )
 
         sz = settings.tile_size_m
         lines = [
             "",
             "═" * 60,
-            f"  TILE PLAN SUMMARY  (period={settings.period})",
+            "  TILE PLAN SUMMARY",
             "═" * 60,
             f"  Total tiles : {total:>10,}",
             f"  Grid size   : {sz:.0f} m x {sz:.0f} m  "
             f"({settings.tile_pixels}x{settings.tile_pixels} px @ {settings.scale} m/px)",
             f"  CRS         : {settings.crs}",
-            f"  Min overlap : "
+            "  Min overlap : "
             f"{settings.min_aoi_overlap_frac * 100:.0f}% of tile inside a single AOI",
         ]
 
@@ -219,10 +209,9 @@ def cmd_plan(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    """Print registry status summary for the active period."""
+    """Print registry status summary"""
     print(
         registry_summary(
-            period=settings.period,
             verbose=args.verbose,
         )
     )
@@ -239,7 +228,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
     if args.stratify and args.stratify_mode == "prop":
         # Fail fast on a missing/stale ratio cache before spending any
         # GEE calls.
-        load_or_compute_strata_ratios(settings.period, logger)
+        load_or_compute_strata_ratios(logger)
 
     batch_size = (
         args.batch_size_cheap if args.stage == "cheap" else args.batch_size_imagery
@@ -248,7 +237,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
     if settings.use_hpc:
         logger.info(
             f"Mode: HPC | stage={args.stage} "
-            f"| period={settings.period} | batch_size={batch_size}"
+            f"| batch_size={batch_size}"
             + (
                 f" | stratify={args.stratify} mode={args.stratify_mode} "
                 f"tile_limit={args.tile_limit}"
@@ -268,7 +257,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
         )
     else:
         logger.info(
-            f"Mode: local | stage={args.stage} | period={settings.period} "
+            f"Mode: local | stage={args.stage}"
             f"| batch_size={batch_size}"
             + (
                 f" | stratify={args.stratify} mode={args.stratify_mode} "
@@ -290,7 +279,6 @@ def cmd_filter(args: argparse.Namespace) -> None:
 
     print(
         registry_summary(
-            period=settings.period,
             verbose=args.verbose,
         )
     )
@@ -298,7 +286,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     """
-    Run phase: process valid tiles (pseudo-labels + export) for the active period.
+    Run phase: process valid tiles
     Resumes from saved state - only processes tiles not yet complete/rejected.
     """
     logger = setup_logging("run")
@@ -318,16 +306,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         aoi_id=args.aoi_id,
         biome=args.biome,
         region=args.region,
-        period=settings.period,
         logger=logger,
     )
 
     if args.stratify and args.limit:
         ratios = None
         if args.stratify_mode == "prop":
-            ratios = load_or_compute_strata_ratios(settings.period, logger)[
-                args.stratify
-            ]
+            ratios = load_or_compute_strata_ratios(logger)[args.stratify]
 
         candidates = stratified_sample(
             candidates, args.stratify, args.limit, args.stratify_mode, ratios=ratios
@@ -341,7 +326,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.info("No tiles match the given filters.")
         return
 
-    logger.info(f"Processing {len(candidates):,} tiles (period={settings.period})")
+    logger.info(f"Processing {len(candidates):,} tiles")
 
     init_ee()
     ds = Datasets()
@@ -355,14 +340,13 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     print(
         registry_summary(
-            period=settings.period,
             verbose=args.verbose,
         )
     )
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
-    """Reset tile statuses for the active period."""
+    """Reset tile statuses"""
     logger = setup_logging("reset")
 
     from registry.store import reset_tiles
@@ -379,7 +363,7 @@ def cmd_reset(args: argparse.Namespace) -> None:
 
     if not args.yes:
         confirm = input(
-            f"This will reset {label} tiles in period={settings.period} to "
+            f"This will reset {label} tiles to "
             f"'{args.to_status}'{history_note}. Type 'yes' to confirm: "
         )
         if confirm.strip().lower() != "yes":
@@ -388,14 +372,12 @@ def cmd_reset(args: argparse.Namespace) -> None:
 
     n = reset_tiles(
         status=args.status,
-        period=settings.period,
         clear_history=args.clear_history,
         to_status=args.to_status,
     )
-    logger.info(f"Reset {n:,} tiles (period={settings.period}) to '{args.to_status}'.")
+    logger.info(f"Reset {n:,} tiles to '{args.to_status}'.")
     print(
         registry_summary(
-            period=settings.period,
             verbose=args.verbose,
         )
     )
@@ -430,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["cheap", "imagery"],
         help="cheap: gain/NDVI thresholds (PENDING -> CHEAP_VALID); canopy_mean "
         "is reported but no longer gates. "
-        "imagery: per-year Sentinel-1/2 availability over the active period "
+        "imagery: per-year Sentinel-1/2 availability"
         "(CHEAP_VALID -> VALID).",
     )
     filter_p.add_argument(
@@ -525,9 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     ]
 
-    reset_p = sub.add_parser(
-        "reset", help="Reset tile statuses (scoped to active period)"
-    )
+    reset_p = sub.add_parser("reset", help="Reset tile statuses")
     reset_p.add_argument(
         "--status",
         default=None,

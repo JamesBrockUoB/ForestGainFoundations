@@ -18,7 +18,7 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Forest Gain tile inspector", layout="wide")
 
-EXTENT_PATH = settings.data_dir / "aois" / "aoi_footprint_europe" / "aoi_footprint.shp"
+EXTENT_PATH = settings.data_dir / "aois" / "aoi_extent.shp"
 
 
 @st.cache_resource
@@ -39,8 +39,8 @@ def load_product_extent() -> tuple[dict, object, tuple[float, float, float, floa
 
 
 @st.cache_data
-def load_aoi_checkpoint(period: str) -> tuple[list[dict], list[dict]]:
-    path = settings.data_dir / "aois" / f"aoi_filter_checkpoint_{period}.json"
+def load_aoi_checkpoint() -> tuple[list[dict], list[dict]]:
+    path = settings.data_dir / "aois" / "aoi_filter_checkpoint.json"
     if not path.exists():
         return [], []
 
@@ -54,8 +54,8 @@ def load_aoi_checkpoint(period: str) -> tuple[list[dict], list[dict]]:
 
 
 @st.cache_data
-def build_aoi_geojson(period: str):
-    valid_aois, rejected_aois = load_aoi_checkpoint(period)
+def build_aoi_geojson():
+    valid_aois, rejected_aois = load_aoi_checkpoint()
 
     def records_to_features(records):
         features = []
@@ -71,13 +71,15 @@ def build_aoi_geojson(period: str):
 
             geometry = {
                 "type": "Polygon",
-                "coordinates": [[
-                    [min_lon, min_lat],
-                    [max_lon, min_lat],
-                    [max_lon, max_lat],
-                    [min_lon, max_lat],
-                    [min_lon, min_lat],
-                ]],
+                "coordinates": [
+                    [
+                        [min_lon, min_lat],
+                        [max_lon, min_lat],
+                        [max_lon, max_lat],
+                        [min_lon, max_lat],
+                        [min_lon, min_lat],
+                    ]
+                ],
             }
 
             properties = {
@@ -89,7 +91,9 @@ def build_aoi_geojson(period: str):
                 "has_imagery": p.get("has_imagery"),
             }
 
-            features.append({"type": "Feature", "geometry": geometry, "properties": properties})
+            features.append(
+                {"type": "Feature", "geometry": geometry, "properties": properties}
+            )
 
         return {"type": "FeatureCollection", "features": features}
 
@@ -99,27 +103,27 @@ def build_aoi_geojson(period: str):
     }
 
 
-def run_worker(action: str, period: str, payload: dict) -> dict:
+def run_worker(action: str, payload: dict) -> dict:
     result = subprocess.run(
         [sys.executable, "-m", "inspector.worker", action],
         input=json.dumps(payload),
         text=True,
         capture_output=True,
-        env={**os.environ, "PERIOD": period},
+        env={**os.environ},
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Inspector worker failed")
     return json.loads(result.stdout)
 
 
-def find_aoi_at(period: str, lon: float, lat: float) -> dict | None:
+def find_aoi_at(lon: float, lat: float) -> dict | None:
     """Find the AOI cell (valid or rejected) containing a lon/lat point.
 
     biome_name/region/country are grid-level attributes assigned when the
     AOI grid was built, independent of whether the cell passed validity
     checks -- so both lists are searched, not just the valid ones.
     """
-    valid_aois, rejected_aois = load_aoi_checkpoint(period)
+    valid_aois, rejected_aois = load_aoi_checkpoint()
 
     for aoi in valid_aois + rejected_aois:
         min_lon, max_lon = aoi.get("minLon"), aoi.get("maxLon")
@@ -135,46 +139,29 @@ def find_aoi_at(period: str, lon: float, lat: float) -> dict | None:
 
 
 @st.cache_data
-def list_exported_tiles(period: str) -> list[str]:
-    root = settings.data_dir / "inspector_tiles" / period
+def list_exported_tiles() -> list[str]:
+    root = settings.data_dir / "inspector_tiles"
     if not root.exists():
         return []
 
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
+
 st.title("Forest Gain tile inspector")
 
-period = st.segmented_control("Period", options=("p1", "p2"), default="p1")
-
-if st.session_state.get("map_period") != period:
-    st.session_state.map_period = period
-    st.session_state.selected_point = None
-    st.session_state.pop("metrics", None)
-    st.session_state.pop("metrics_tile_id", None)
-
-period_years = "2017-2020" if period == "p1" else "2020-2024"
-is_p1 = period == "p1"
-
-st.caption(
-    f"{period}: {period_years} · "
-    f"{settings.tile_size_m / 1000:.2f} km "
-    f"point-centred EPSG:6933 tile"
-)
+st.caption(f"{settings.tile_size_m / 1000:.2f} km point-centred EPSG:6933 tile")
 
 with st.sidebar:
     st.header("Validity thresholds")
 
-    gain_min = st.number_input("Minimum gain (%)", 0.0, 100.0, float(settings.gain_pct_min), 0.1)
-    ndvi_min = st.number_input(
-        "Minimum NDVI trend", value=float(settings.ndvi_trend_min), step=0.001, format="%.4f"
+    gain_min = st.number_input(
+        "Minimum gain (%)", 0.0, 100.0, float(settings.gain_pct_min), 0.1
     )
-    forty_min = st.number_input(
-        "Minimum ForTy coverage over gain (%)",
-        0.0,
-        100.0,
-        float(settings.min_pseudo_gain_frac * 100),
-        0.1,
-        disabled=not is_p1,
+    ndvi_min = st.number_input(
+        "Minimum NDVI trend",
+        value=float(settings.ndvi_trend_min),
+        step=0.001,
+        format="%.4f",
     )
     imagery_min = st.number_input(
         "Minimum valid S1/S2 pixels per year (%)",
@@ -188,10 +175,10 @@ with st.sidebar:
 
     st.header("AOI validity overlay")
 
-    valid_aois, rejected_aois = load_aoi_checkpoint(period)
+    valid_aois, rejected_aois = load_aoi_checkpoint()
 
     if not valid_aois and not rejected_aois:
-        st.info(f"No AOI data is available for {period}.")
+        st.info("No AOI data is available.")
         show_valid_aois = False
         show_rejected_aois = False
         aoi_overlay_opacity = 0.6
@@ -212,7 +199,7 @@ point = st.session_state.get("selected_point", ((west + east) / 2, (south + nort
 if point is None:
     point = ((west + east) / 2, (south + north) / 2)
 
-tile = point_centred_tile(*point, period)
+tile = point_centred_tile(*point)
 corners = tile_corners_lonlat(tile)
 
 tile_box_6933 = box(tile["x_min_m"], tile["y_min_m"], tile["x_max_m"], tile["y_max_m"])
@@ -220,7 +207,7 @@ tile_is_in_extent = extent_6933.covers(tile_box_6933)
 
 tile_centre_lon = (tile["min_lon"] + tile["max_lon"]) / 2
 tile_centre_lat = (tile["min_lat"] + tile["max_lat"]) / 2
-aoi_at_tile = find_aoi_at(period, tile_centre_lon, tile_centre_lat)
+aoi_at_tile = find_aoi_at(tile_centre_lon, tile_centre_lat)
 
 tile["biome"] = aoi_at_tile.get("biome_name") if aoi_at_tile else None
 tile["region"] = aoi_at_tile.get("region") if aoi_at_tile else None
@@ -245,7 +232,7 @@ with tab_select:
     ).add_to(map_layers)
 
     if show_valid_aois or show_rejected_aois:
-        overlays = build_aoi_geojson(period)
+        overlays = build_aoi_geojson()
 
         if show_valid_aois:
             valid_features = overlays["valid"].get("features", [])
@@ -336,9 +323,11 @@ with tab_select:
     if not tile_is_in_extent:
         st.error("The complete 2.56 km tile must lie inside the Forest Gain footprint.")
 
-    if st.button("Fetch raw validity metrics", type="primary", disabled=not tile_is_in_extent):
-        with st.spinner("Fetching gain, ForTy, NDVI, and annual S1/S2 coverage…"):
-            st.session_state.metrics = run_worker("fetch", period, {"tile": tile})
+    if st.button(
+        "Fetch raw validity metrics", type="primary", disabled=not tile_is_in_extent
+    ):
+        with st.spinner("Fetching gain, NDVI, and annual S1/S2 coverage…"):
+            st.session_state.metrics = run_worker("fetch", {"tile": tile})
             st.session_state.metrics_tile_id = tile["tile_id"]
 
     metrics = st.session_state.get("metrics")
@@ -348,19 +337,22 @@ with tab_select:
             metrics,
             gain_pct_min=gain_min,
             ndvi_trend_min=ndvi_min,
-            pseudo_gain_pct_min=forty_min,
             imagery_min_valid_frac=imagery_min / 100,
-            pseudo_labels_available=is_p1,
         )
 
         valid = all(passed for _, passed, _ in checks)
 
         (st.success if valid else st.warning)(
-            "Valid with these thresholds" if valid else "Not valid with these thresholds"
+            "Valid with these thresholds"
+            if valid
+            else "Not valid with these thresholds"
         )
 
         st.dataframe(
-            [{"Check": name, "Pass": "✓" if passed else "✗", "Value": value} for name, passed, value in checks],
+            [
+                {"Check": name, "Pass": "✓" if passed else "✗", "Value": value}
+                for name, passed, value in checks
+            ],
             hide_index=True,
             use_container_width=True,
         )
@@ -368,18 +360,21 @@ with tab_select:
     st.divider()
     st.subheader("Export for investigation")
 
-    output_root = settings.data_dir / "inspector_tiles" / period
+    output_root = settings.data_dir / "inspector_tiles"
     output_dir_target = output_root / tile["tile_id"]
 
     st.caption(f"Writes to `{output_dir_target}` without updating registry data")
 
     confirmed = st.checkbox("I understand this submits Earth Engine export tasks.")
 
-    if st.button("Export this tile locally", disabled=not (confirmed and tile_is_in_extent)):
+    if st.button(
+        "Export this tile locally", disabled=not (confirmed and tile_is_in_extent)
+    ):
         try:
             with st.spinner("Submitting exports and downloading products…"):
                 output_dir = run_worker(
-                    "export", period, {"tile": tile, "output_dir": str(output_dir_target)}
+                    "export",
+                    {"tile": tile, "output_dir": str(output_dir_target)},
                 )["output_dir"]
 
             st.success(f"Export complete: {output_dir}")
@@ -389,24 +384,31 @@ with tab_select:
             st.exception(exc)
 
 with tab_viewer:
-    viewer_period = st.selectbox("Period", options=("p1", "p2"), key="viewer_period")
-
-    exported_tiles = list_exported_tiles(viewer_period)
+    exported_tiles = list_exported_tiles()
 
     if not exported_tiles:
-        st.info(f"No exported tiles found in {settings.data_dir / 'inspector_tiles' / viewer_period}.")
+        st.info(f"No exported tiles found in {settings.data_dir / 'inspector_tiles'}.")
 
     else:
-        selected_tile_id = st.selectbox("Tile", exported_tiles, key="selected_exported_tile")
+        selected_tile_id = st.selectbox(
+            "Tile", exported_tiles, key="selected_exported_tile"
+        )
 
-        tile_dir = settings.data_dir / "inspector_tiles" / viewer_period / selected_tile_id
+        tile_dir = settings.data_dir / "inspector_tiles" / selected_tile_id
 
         composites_dir = tile_dir / "composites"
         embeddings_dir = tile_dir / "embeddings"
 
-        s1s2_by_year = {display.raster_year(p): p for p in sorted(composites_dir.glob("s1s2_*.tif"))}
-        aee_by_year = {display.raster_year(p): p for p in sorted(embeddings_dir.glob("aee_*.tif"))}
-        tessera_by_year = {display.raster_year(p): p for p in sorted(embeddings_dir.glob("tessera_*.tif"))}
+        s1s2_by_year = {
+            display.raster_year(p): p for p in sorted(composites_dir.glob("s1s2_*.tif"))
+        }
+        aee_by_year = {
+            display.raster_year(p): p for p in sorted(embeddings_dir.glob("aee_*.tif"))
+        }
+        tessera_by_year = {
+            display.raster_year(p): p
+            for p in sorted(embeddings_dir.glob("tessera_*.tif"))
+        }
 
         aee_raw = {}
         for year, path in aee_by_year.items():
@@ -426,26 +428,36 @@ with tab_viewer:
         if aee_raw:
             years_sorted = sorted(aee_raw, key=int)
             aee_stretched = dict(
-                zip(years_sorted, display.shared_rgb_stretch([aee_raw[y] for y in years_sorted]))
+                zip(
+                    years_sorted,
+                    display.shared_rgb_stretch([aee_raw[y] for y in years_sorted]),
+                )
             )
 
         tessera_stretched = {}
         if tessera_raw:
             years_sorted = sorted(tessera_raw, key=int)
             tessera_stretched = dict(
-                zip(years_sorted, display.shared_rgb_stretch([tessera_raw[y] for y in years_sorted]))
+                zip(
+                    years_sorted,
+                    display.shared_rgb_stretch([tessera_raw[y] for y in years_sorted]),
+                )
             )
 
         s1_images = {}
         s2_images = {}
         for year, path in s1s2_by_year.items():
             try:
-                s1_images[year], s2_images[year] = display.read_composite_s1_s2(str(path))
+                s1_images[year], s2_images[year] = display.read_composite_s1_s2(
+                    str(path)
+                )
             except Exception as exc:
                 st.error(f"Could not read S1/S2 {year}: {exc}")
 
         with st.expander("Yearly products (S1 / S2 / AEE / TESSERA)", expanded=True):
-            display.render_yearly_products(s1_images, s2_images, aee_stretched, tessera_stretched)
+            display.render_yearly_products(
+                s1_images, s2_images, aee_stretched, tessera_stretched
+            )
 
         with st.expander("Static layers"):
             static_paths = {
@@ -453,7 +465,11 @@ with tab_viewer:
                 "Protected area": tile_dir / "static" / "protected_area.tif",
                 "FABDEM": tile_dir / "static" / "fabdem.tif",
             }
-            static_colours = {"Slope": "viridis", "Protected area": "Greens", "FABDEM": "terrain"}
+            static_colours = {
+                "Slope": "viridis",
+                "Protected area": "Greens",
+                "FABDEM": "terrain",
+            }
 
             static_display = st.radio(
                 "Static layer display",
@@ -476,10 +492,9 @@ with tab_viewer:
                 static_paths, static_colours, s2_images, static_display, static_opacity
             )
 
-        with st.expander("Gain & pseudo-label diagnostics"):
+        with st.expander("Gain diagnostics"):
             labels_dir = tile_dir / "labels"
             gain_confidence_path = labels_dir / "gain_confidence.tif"
-            pseudo_labels_path = labels_dir / "pseudo_labels.tif"
 
             base_options = {
                 name: images
@@ -501,7 +516,7 @@ with tab_viewer:
                     base_product = st.selectbox(
                         "Base imagery",
                         options=list(base_options.keys()),
-                        key="gain_pseudo_base_product",
+                        key="gain_base_product",
                     )
 
                 available_base_years = sorted(base_options[base_product], key=int)
@@ -511,7 +526,7 @@ with tab_viewer:
                         "Year",
                         options=available_base_years,
                         index=len(available_base_years) - 1,
-                        key="gain_pseudo_base_year",
+                        key="gain_base_year",
                     )
 
                 base_image = base_options[base_product][base_year]
@@ -519,19 +534,16 @@ with tab_viewer:
                 gain_confidence = None
                 if gain_confidence_path.exists():
                     try:
-                        gain_confidence = display.read_gain_confidence(str(gain_confidence_path))
+                        gain_confidence = display.read_gain_confidence(
+                            str(gain_confidence_path)
+                        )
                     except Exception as exc:
                         st.error(f"Could not read gain confidence: {exc}")
 
-                dominant = confidence = None
-                if pseudo_labels_path.exists():
-                    try:
-                        dominant, confidence = display.read_pseudo_labels(str(pseudo_labels_path))
-                    except Exception as exc:
-                        st.error(f"Could not read pseudo labels: {exc}")
-
-                display.render_gain_pseudo_diagnostics(
-                    base_image, f"{base_product} {base_year}", gain_confidence, dominant, confidence
+                display.render_gain_diagnostics(
+                    base_image,
+                    f"{base_product} {base_year}",
+                    gain_confidence,
                 )
 
         with st.expander("Tile metadata"):

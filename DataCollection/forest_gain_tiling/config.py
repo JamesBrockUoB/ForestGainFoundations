@@ -8,18 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent.parent / ".env")
 
-PERIOD_YEARS = {
-    "p1": (2017, 2020),
-    "p2": (2020, 2024),
-}
-
-# ForTy (forest typology) is likewise a fixed 2020 snapshot. For p2, using
-# it would mean labeling a gain event that happens after the snapshot was
-# taken — not just less precise, but describing the wrong point in time.
-# p2 exports omit pseudo-label bands entirely rather than including a
-# mislabeled or flagged approximation.
-_PSEUDO_LABELS_AVAILABLE_PERIODS = {"p1"}
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -54,13 +42,6 @@ class Settings:
         default_factory=lambda: os.getenv("EE_CREDENTIALS_PATH")
     )
 
-    # Which validity interval this whole process operates under:
-    # "p1" = 2017->2020, "p2" = 2020->2024. Read once from env at process
-    # startup (same pattern as generate_aois.py) and fixed for the process
-    # lifetime. Every command in main.py (plan/filter/run/status/audit/
-    # reset) is scoped to tiles tagged with this period.
-    period: str = field(default_factory=lambda: os.getenv("PERIOD", "p1"))
-
     registry_db_path: Path = field(default_factory=Path)
     log_dir: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent / "logs"
@@ -88,7 +69,6 @@ class Settings:
     gain_pct_min: float = 1.0
     ndvi_trend_min: float = 0.0
     gain_sustain_dropout_tolerance: int = 1
-    min_pseudo_gain_frac: float = 0.5
 
     non_tree_threshold_frac: int = 20
     min_tree_threshold_frac: int = 50
@@ -103,7 +83,7 @@ class Settings:
     min_s1_observations: int = 5
 
     # Per-year, per-sensor minimum valid-pixel fraction, checked for every
-    # calendar year in the active period
+    # calendar year
     imagery_min_valid_frac: float = 0.99
 
     # Cloud Score+ cs_cdf threshold for S2 availability/export masking.
@@ -154,11 +134,6 @@ class Settings:
     )
 
     def __post_init__(self) -> None:
-        if self.period not in PERIOD_YEARS:
-            raise ValueError(
-                f"PERIOD must be one of {list(PERIOD_YEARS)}, got {self.period!r}"
-            )
-
         object.__setattr__(
             self,
             "gee_credentials",
@@ -172,20 +147,19 @@ class Settings:
         object.__setattr__(
             self,
             "valid_aois_path",
-            self.data_dir / "aois" / f"valid_aois_{self.period}.json",
+            self.data_dir / "aois" / "valid_aois.json",
         )
 
     @property
     def year_start(self) -> int:
-        return PERIOD_YEARS[self.period][0]
+        return 2017
 
     @property
     def year_end(self) -> int:
-        return PERIOD_YEARS[self.period][1]
+        return 2024
 
     @property
-    def period_years(self) -> list[int]:
-        """e.g. p1 -> [2017,2018,2019,2020], p2 -> [2020,2021,2022,2023,2024]."""
+    def years(self) -> list[int]:
         return list(range(self.year_start, self.year_end + 1))
 
     @property
@@ -197,10 +171,6 @@ class Settings:
         if self.hpc_remote:
             return f"{self.hpc_remote}/{self.drive_folder}"
         return None
-
-    @property
-    def pseudo_labels_available(self) -> bool:
-        return self.period in _PSEUDO_LABELS_AVAILABLE_PERIODS
 
 
 settings = Settings()

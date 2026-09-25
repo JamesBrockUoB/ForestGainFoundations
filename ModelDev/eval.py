@@ -7,14 +7,12 @@ from lightning_module import GainDetectionTask
 from torch.utils.data import DataLoader
 
 
-def evaluate_checkpoint(
-    checkpoint_path: str, test_dirs: list[Path], period: str = "p1"
-):
+def evaluate_checkpoint(checkpoint_path: str, test_dirs: list[Path]):
     task = GainDetectionTask.load_from_checkpoint(checkpoint_path)
     task.eval()
     task.freeze()
 
-    test_ds = MultiTemporalGainDataset(test_dirs, period=period)
+    test_ds = MultiTemporalGainDataset(test_dirs)
     test_loader = DataLoader(test_ds, batch_size=4, shuffle=False, num_workers=2)
 
     total_correct = 0
@@ -40,14 +38,12 @@ def evaluate_checkpoint(
     return accuracy
 
 
-def generate_gain_map(
-    checkpoint_path: str, tile_dir: Path, output_tif: Path, period: str = "p1"
-):
+def generate_gain_map(checkpoint_path: str, tile_dir: Path, output_tif: Path):
     """Generates continuous gain probability GeoTIFF map for a given tile."""
     task = GainDetectionTask.load_from_checkpoint(checkpoint_path)
     task.eval()
 
-    ds = MultiTemporalGainDataset([tile_dir], period=period)
+    ds = MultiTemporalGainDataset([tile_dir])
     sample = ds[0]
     pixels = sample["pixels"].unsqueeze(0)  # (1, T, C, H, W)
 

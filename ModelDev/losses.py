@@ -56,7 +56,7 @@ class CombinedDiceBCELoss(nn.Module):
 
         # Determine effective pixel weight based on mode
         if self.loss_type == "soft":
-            # Scale loss on positive pixels by pseudo-label confidence weight
+            # Scale loss on positive pixels by confidence weight
             pixel_weights = torch.where(
                 targets_v == 1.0, weights_v, torch.ones_like(weights_v)
             )

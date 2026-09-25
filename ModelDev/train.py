@@ -41,13 +41,11 @@ def parse_args():
 
 def train(args):
     tile_root = Path(args.data_dir)
-    tile_dirs = sorted(
-        [p for p in tile_root.iterdir() if p.is_dir() and p.name.endswith("_p1")]
-    )
+    tile_dirs = sorted([p for p in tile_root.iterdir() if p.is_dir()])
     split = int(0.8 * len(tile_dirs))
 
-    train_ds = MultiTemporalGainDataset(tile_dirs[:split], period="p1")
-    val_ds = MultiTemporalGainDataset(tile_dirs[split:], period="p1")
+    train_ds = MultiTemporalGainDataset(tile_dirs[:split])
+    val_ds = MultiTemporalGainDataset(tile_dirs[split:])
 
     train_loader = DataLoader(
         train_ds,

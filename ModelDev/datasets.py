@@ -5,10 +5,10 @@ import rasterio
 import torch
 from config import (
     BACKBONE_BAND_INDICES,
-    PERIOD_YEARS,
     S1_BANDS,
     S2_BANDS,
     VALID_MASK_BAND_INDEX,
+    settings,
 )
 from torch.utils.data import Dataset
 
@@ -22,12 +22,10 @@ class MultiTemporalGainDataset(Dataset):
     def __init__(
         self,
         tile_dirs: list[Path],
-        period: str = "p1",
         sources: tuple[str, ...] = ("s1", "s2"),
     ):
         self.tile_dirs = sorted(tile_dirs)
-        self.period = period
-        self.years = PERIOD_YEARS[period]
+        self.years = settings.years
 
         invalid_sources = set(sources) - self.BAND_GROUPS.keys()
         if invalid_sources:

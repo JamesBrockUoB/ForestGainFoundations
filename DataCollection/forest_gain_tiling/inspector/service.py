@@ -13,7 +13,7 @@ _TO_GRID = Transformer.from_crs("EPSG:4326", settings.crs, always_xy=True)
 _FROM_GRID = Transformer.from_crs(settings.crs, "EPSG:4326", always_xy=True)
 
 
-def point_centred_tile(lon: float, lat: float, period: str) -> dict[str, Any]:
+def point_centred_tile(lon: float, lat: float) -> dict[str, Any]:
     """Create a 2560 m point-centred tile aligned to the 10 m pixel grid."""
     x_center, y_center = _TO_GRID.transform(lon, lat)
 
@@ -40,13 +40,10 @@ def point_centred_tile(lon: float, lat: float, period: str) -> dict[str, Any]:
 
     lons, lats = zip(*corners)
 
-    tile_id = f"inspect_{period}_{x_center:.3f}_{y_center:.3f}".replace(
-        ".", "d"
-    )
+    tile_id = f"inspect_{x_center:.3f}_{y_center:.3f}".replace(".", "d")
 
     return {
         "tile_id": tile_id,
-        "period": period,
         "x_min_m": x_min,
         "y_min_m": y_min,
         "x_max_m": x_max,
@@ -72,7 +69,9 @@ def tile_corners_lonlat(tile: dict[str, Any]) -> list[tuple[float, float]]:
     return corners + [corners[0]]
 
 
-def fetch_tile_metrics(tile: dict[str, Any], ds: Datasets) -> dict[str, dict[str, float]]:
+def fetch_tile_metrics(
+    tile: dict[str, Any], ds: Datasets
+) -> dict[str, dict[str, float]]:
     """Fetch raw metrics once; the UI can then vary thresholds without re-fetching."""
     tile_id = tile["tile_id"]
     return {
@@ -86,9 +85,7 @@ def assess_metrics(
     *,
     gain_pct_min: float,
     ndvi_trend_min: float,
-    pseudo_gain_pct_min: float,
     imagery_min_valid_frac: float,
-    pseudo_labels_available: bool,
 ) -> list[tuple[str, bool, str]]:
     """Apply adjustable UI thresholds without issuing an Earth Engine request."""
     cheap = metrics["cheap"]
@@ -108,15 +105,6 @@ def assess_metrics(
             f"{trend:.5f}" if trend is not None else "no valid gain pixels",
         )
     )
-    if pseudo_labels_available:
-        pseudo_pct = 100 * (cheap.get("pseudo_gain_frac") or 0.0)
-        rows.append(
-            (
-                "ForTy coverage over gain",
-                pseudo_pct >= pseudo_gain_pct_min,
-                f"{pseudo_pct:.2f}% (min {pseudo_gain_pct_min:.2f}%)",
-            )
-        )
     for band, value in metrics["imagery"].items():
         rows.append(
             (

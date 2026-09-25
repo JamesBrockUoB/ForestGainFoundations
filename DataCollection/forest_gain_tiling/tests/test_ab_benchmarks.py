@@ -31,7 +31,7 @@ DEFAULT_PROXY_BAND = getattr(settings, "s2_check_band", "B2")
 DEFAULT_SCALE = int(getattr(settings, "scale", 10))
 
 TEST_TILES = TILE_POINTS[:3]
-TEST_YEARS = list(settings.period_years)[:2]
+TEST_YEARS = list(settings.years)[:2]
 
 # Number of timed A/B trials per comparison. Order is shuffled on every
 # trial (see _run_ab_trials) so no variant systematically runs first
@@ -103,7 +103,7 @@ def _trial_summary(values: List[float]) -> Dict[str, Any]:
 
 def _aggregate_mean_s(per_year: Dict[str, Any]):
     """Sum each year's mean duration -- an estimate of total pipeline
-    time across the period, comparable fairly between variants because
+    time, comparable fairly between variants because
     every year's mean already comes from the same shuffled-order,
     cache-free trial set."""
     vals = [
@@ -203,8 +203,8 @@ def mask_mapmax_from_masked_ic(masked_ic):
     return masked_ic.map(_per).max().rename("valid").toByte()
 
 
-def point_tiles_from_list(points, period):
-    return [point_centred_tile(lon, lat, period) for (_id, lon, lat) in points]
+def point_tiles_from_list(points):
+    return [point_centred_tile(lon, lat) for (_id, lon, lat) in points]
 
 
 def _load_cache(path: Path) -> Dict[str, Any]:
@@ -344,14 +344,14 @@ def test_join_performance(bench_refresh, bench_cache_path):
     except Exception as e:
         pytest.skip(f"Earth Engine not initialized: {e}")
 
-    years = list(settings.period_years)
+    years = list(settings.years)
     cache_path = Path(bench_cache_path)
     cache = _load_cache(cache_path)
     cache.setdefault("generated", datetime.utcnow().isoformat() + "Z")
     cache.setdefault("years", years)
     cache.setdefault("tiles", {})
 
-    tiles = point_tiles_from_list(TILE_POINTS, settings.period)
+    tiles = point_tiles_from_list(TILE_POINTS)
     cs_thresh = float(getattr(settings, "cloud_score_thresh", 0.5))
 
     for tile in tiles:
@@ -485,14 +485,14 @@ def test_mask_performance(bench_refresh, bench_cache_path):
     except Exception as e:
         pytest.skip(f"Earth Engine not initialized: {e}")
 
-    years = list(settings.period_years)
+    years = list(settings.years)
     cache_path = Path(bench_cache_path)
     cache = _load_cache(cache_path)
     cache.setdefault("generated", datetime.utcnow().isoformat() + "Z")
     cache.setdefault("years", years)
     cache.setdefault("tiles", {})
 
-    tiles = point_tiles_from_list(TILE_POINTS, settings.period)
+    tiles = point_tiles_from_list(TILE_POINTS)
     cs_thresh = float(getattr(settings, "cloud_score_thresh", 0.5))
 
     for tile in tiles:
@@ -632,14 +632,14 @@ def test_combined_vs_separate(
     except Exception as e:
         pytest.skip(f"Earth Engine not initialized: {e}")
 
-    years = list(settings.period_years)
+    years = list(settings.years)
     cache_path = Path(bench_cache_path)
     cache = _load_cache(cache_path)
 
     cache.setdefault("generated", datetime.utcnow().isoformat() + "Z")
     cache.setdefault("years", years)
 
-    tiles = point_tiles_from_list(TILE_POINTS, settings.period)
+    tiles = point_tiles_from_list(TILE_POINTS)
 
     if bench_refresh or not cache.get("combined"):
         cache["combined"] = run_combined_vs_separate(
@@ -792,14 +792,14 @@ def test_batching_performance(
     except Exception as e:
         pytest.skip(f"Earth Engine not initialized: {e}")
 
-    years = list(settings.period_years)
+    years = list(settings.years)
     cache_path = Path(bench_cache_path)
     cache = _load_cache(cache_path)
     cache.setdefault("generated", datetime.utcnow().isoformat() + "Z")
     cache.setdefault("years", years)
     cache.setdefault("batching", {})
 
-    tiles = point_tiles_from_list(TILE_POINTS, settings.period)
+    tiles = point_tiles_from_list(TILE_POINTS)
 
     if bench_refresh or not cache["batching"]:
         print("[batching] Running batching benchmark for full tile set")
@@ -927,14 +927,14 @@ def test_composite_method_performance(
     except Exception as e:
         pytest.skip(f"Earth Engine not initialized: {e}")
 
-    years = list(settings.period_years)
+    years = list(settings.years)
     cache_path = Path(bench_cache_path)
     cache = _load_cache(cache_path)
     cache.setdefault("generated", datetime.utcnow().isoformat() + "Z")
     cache.setdefault("years", years)
     cache.setdefault("tiles", {})
 
-    tiles = point_tiles_from_list(TILE_POINTS, settings.period)
+    tiles = point_tiles_from_list(TILE_POINTS)
     cs_thresh = float(getattr(settings, "cloud_score_thresh", 0.5))
 
     for tile in tiles:
@@ -1021,10 +1021,7 @@ def test_composite_method_performance(
 def test_equivalence(name):
     ee.Initialize()
 
-    tiles = point_tiles_from_list(
-        TEST_TILES,
-        settings.period,
-    )
+    tiles = point_tiles_from_list(TEST_TILES)
 
     if name == "join":
         old, new = _join_outputs(

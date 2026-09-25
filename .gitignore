@@ -22,7 +22,7 @@ settings.json
 
 wandb/
 
-aoi_footprint*
+aoi_extent*
 
 build/*
 

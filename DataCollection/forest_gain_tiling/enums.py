@@ -17,10 +17,3 @@ class TileStatus(str, Enum):
 TERMINAL_STATUSES: frozenset["TileStatus"] = frozenset(
     {TileStatus.COMPLETE, TileStatus.REJECTED}
 )
-
-
-class PseudoLabel(int, Enum):
-    AGROCROP = 0
-    NAT_REGEN = 1
-    PLANTATION = 2
-    PLANTED = 3
