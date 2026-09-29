@@ -152,6 +152,7 @@ def _dw_label_confidence_image(geom: ee.Geometry, year: int) -> ee.Image:
         image's argmax) — the natural per-pixel confidence for the
         label DW actually assigned, not a fixed single-band proxy.
     """
+    datasets = Datasets()
     start = f"{year}-01-01"
     end = f"{year + 1}-01-01"
     dw = (

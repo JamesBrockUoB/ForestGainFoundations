@@ -102,7 +102,9 @@ class Settings:
 
     tessera_max_concurrent_years: int = 4
 
-    export_years_per_task: int = 8
+    # explicitly for s1/s2/aee data
+    # since we can only have 2 batch exports concurrently, 4 workers for half the years may be more efficient
+    export_years_per_task: int = 4
 
     rclone_transfers: int = 8
 
