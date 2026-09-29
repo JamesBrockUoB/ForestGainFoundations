@@ -2,22 +2,18 @@ from __future__ import annotations
 
 import ee
 from config import settings
-
-WDPA_SNAPSHOT = "201707"
+from gee_datasets.registry import Datasets
 
 
 def _protected_area_mask(geom: ee.Geometry) -> ee.Image:
-    fc = ee.FeatureCollection(f"WCMC/WDPA/{WDPA_SNAPSHOT}/polygons").filterBounds(geom)
+    datasets = Datasets()
+    fc = ee.FeatureCollection(datasets.wdpa).filterBounds(geom)
     return ee.Image().byte().paint(fc, 1).unmask(0).rename("protected_area")
 
 
 def build_static_layers(geom: ee.Geometry) -> dict[str, ee.Image]:
-    fabdem = (
-        ee.ImageCollection("projects/sat-io/open-datasets/FABDEM")
-        .filterBounds(geom)
-        .mosaic()
-        .clip(geom)
-    )
+    datasets = Datasets()
+    fabdem = ee.ImageCollection(datasets.fabdem).filterBounds(geom).mosaic().clip(geom)
 
     fabdem_native = fabdem.setDefaultProjection(crs="EPSG:4326", scale=30)
     slope_native = ee.Terrain.slope(fabdem_native)

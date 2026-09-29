@@ -5,10 +5,6 @@ import ee
 
 class Datasets:
     def __init__(self) -> None:
-        self.forty = ee.ImageCollection(
-            "projects/nature-trace/assets/forest_typology/forest_typology_2020_v1_0_collection"
-        ).mosaic()
-
         self.dt_cover: dict[int, ee.Image | None] = {
             year: (
                 ee.Image(
@@ -20,6 +16,25 @@ class Datasets:
             )
             for year in range(2017, 2025)
         }
+
+        self.dynamic_world = "GOOGLE/DYNAMICWORLD/V1"
+        self.esri_lulc = (
+            "projects/sat-io/open-datasets/landcover/" "ESRI_Global-LULC_10m_TS"
+        )
+
+        self.sentinel_2 = "COPERNICUS/S2_SR_HARMONIZED"
+        self.cloud_score_plus = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
+        self.sentinel_1 = "COPERNICUS/S1_GRD"
+        self.satellite_embedding = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+
+        self.soilgrids_soc = "projects/soilgrids-isric/soc_mean"
+        self.soilgrids_clay = "projects/soilgrids-isric/clay_mean"
+        self.soilgrids_ph = "projects/soilgrids-isric/phh2o_mean"
+
+        self.era5_land_monthly = "ECMWF/ERA5_LAND/MONTHLY_AGGR"
+
+        self.fabdem = "projects/sat-io/open-datasets/FABDEM"
+        self.wdpa = "WCMC/WDPA/201707/polygons"
 
     def get_dt_cover(self, year: int) -> ee.Image:
         image = self.dt_cover.get(year)

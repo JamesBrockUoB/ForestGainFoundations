@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import random
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -13,7 +13,6 @@ from typing import Any
 
 import ee
 from config import settings
-from embeddings.tasks import process_all_embeddings_with_retry
 from enums import TileStatus
 from export.aee import submit_aee_exports
 from export.composites import submit_composite_exports
@@ -26,11 +25,13 @@ from export.drive import (
 from export.labels import submit_label_exports
 from export.metadata import write_tile_metadata
 from export.static import submit_static_exports
+from export.year_chunks import expand_product_keys, is_chunked, split_chunk_file
 from gee.cleanup import _cleanup_failed_tile
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 from registry.store import update_tile
 from stack.stacks import build_full_valid
+from tessera.tasks import download_tessera_with_retry
 from tiling.grid import crs_transform, tile_geom
 
 
@@ -38,7 +39,7 @@ def get_local_output_dir(tile_id: str) -> Path:
     return settings.data_dir / "test_tiles" / tile_id
 
 
-def get_embeddings_scratch_dir() -> Path:
+def get_tessera_scratch_dir() -> Path:
     return settings.data_dir / "tessera_scratch"
 
 
@@ -139,7 +140,10 @@ def _verify_tile_outputs(
     tile_id: str,
     dest_root: str,
     gee_product_keys: list[str],
+    years: list[int] | None = None,
 ) -> list[str]:
+    """Return missing outputs. `years` restricts which TESSERA years are
+    required (default: all settings.years)."""
     missing: list[str] = []
 
     for key in gee_product_keys:
@@ -148,7 +152,7 @@ def _verify_tile_outputs(
         if not _dest_file_exists(dest_root, rel_path):
             missing.append(key)
 
-    for year in settings.years:
+    for year in settings.years if years is None else years:
         rel_path = f"{tile_id}/embeddings/tessera_{year}.tif"
         if not _dest_file_exists(dest_root, rel_path):
             missing.append(f"embeddings/tessera_{year}")
@@ -169,7 +173,7 @@ def process_tile(
     tasks: dict[str, ee.batch.Task] = {}
     output_dir: Path | None = None
     cancel_event = threading.Event()
-    t_embeddings: threading.Thread | None = None
+    t_tessera: threading.Thread | None = None
     rclone_completed = False
 
     try:
@@ -202,61 +206,65 @@ def process_tile(
             output_dir = get_local_output_dir(tile_id)
             dest_root = settings.hpc_path
 
-        embeddings_result: dict[str, bool] = {}
+        tessera_scratch = None if local_output else get_tessera_scratch_dir()
+        tessera_target_dir = output_dir if local_output else tessera_scratch
 
-        embeddings_scratch = None if local_output else get_embeddings_scratch_dir()
-        embeddings_target_dir = output_dir if local_output else embeddings_scratch
-
-        def _run_embeddings() -> None:
+        def _run_tessera() -> None:
             try:
-                if embeddings_scratch is not None:
-                    if embeddings_scratch.exists():
-                        shutil.rmtree(embeddings_scratch)
-                    embeddings_scratch.mkdir(parents=True, exist_ok=True)
+                if tessera_scratch is not None:
+                    if tessera_scratch.exists():
+                        shutil.rmtree(tessera_scratch)
 
-                ok = process_all_embeddings_with_retry(
-                    tile, embeddings_target_dir, logger, cancel_event
-                )
-                embeddings_result["ok"] = ok
+                    tessera_scratch.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
 
-                if not ok:
-                    cancel_event.set()
-                    return
+                # TESSERA is best-effort. A failure here must not cancel
+                # the GEE exports or trigger tile cleanup.
+                try:
+                    download_tessera_with_retry(
+                        tile,
+                        tessera_target_dir,
+                        logger,
+                        cancel_event,
+                    )
+                except Exception:
+                    logger.exception(f"{tile_id} | TESSERA fetch crashed")
 
-                if embeddings_scratch is not None:
-                    scratch_embeddings_dir = embeddings_scratch / "embeddings"
+                # Salvage every TESSERA year that was downloaded.
+                if tessera_scratch is not None:
+                    scratch_tessera_dir = tessera_scratch / "embeddings"
 
-                    if not scratch_embeddings_dir.exists():
-                        raise RuntimeError(
-                            f"{tile_id} | TESSERA embeddings directory missing: "
-                            f"{scratch_embeddings_dir}"
+                    if scratch_tessera_dir.exists():
+                        final_tessera_dir = output_dir / "embeddings"
+                        final_tessera_dir.mkdir(
+                            parents=True,
+                            exist_ok=True,
                         )
 
-                    final_embeddings_dir = output_dir / "embeddings"
-                    final_embeddings_dir.mkdir(parents=True, exist_ok=True)
-
-                    for tif in scratch_embeddings_dir.glob("*.tif"):
-                        destination = final_embeddings_dir / tif.name
-                        if destination.exists():
-                            destination.unlink()
-                        shutil.move(str(tif), str(destination))
+                        for tif in scratch_tessera_dir.glob("tessera_*.tif"):
+                            shutil.move(
+                                str(tif),
+                                str(final_tessera_dir / tif.name),
+                            )
 
             finally:
-                if embeddings_scratch is not None:
+                if tessera_scratch is not None:
                     try:
-                        if embeddings_scratch.exists():
-                            shutil.rmtree(embeddings_scratch, ignore_errors=False)
+                        if tessera_scratch.exists():
+                            shutil.rmtree(tessera_scratch)
                     except FileNotFoundError:
                         pass
                     except Exception:
                         logger.exception(
                             "%s | failed to remove TESSERA scratch: %s",
                             tile_id,
-                            embeddings_scratch,
+                            tessera_scratch,
                         )
 
-        t_embeddings = threading.Thread(target=_run_embeddings)
-        t_embeddings.start()
+        t_tessera = threading.Thread(target=_run_tessera)
+        t_tessera.start()
 
         if not _wait_for_all(
             tasks,
@@ -273,10 +281,19 @@ def process_tile(
 
         logger.info(f"{tile_id} | rcloning data")
         products = [tuple(key.split("/", 1)) for key in tasks.keys()]
-        rclone_ok = rclone_all_products(tile_id, products, dest_root, logger)
+        bundled = [p for p in products if is_chunked(p[1])]
+        direct = [p for p in products if not is_chunked(p[1])]
+
+        rclone_ok = rclone_all_products(tile_id, direct, dest_root, logger)
+        if rclone_ok:
+            # Bundles land in the local output_dir so they can be split. In
+            # local_output mode dest_root already is output_dir.parent.
+            rclone_ok = rclone_all_products(
+                tile_id, bundled, str(output_dir.parent), logger
+            )
         rclone_completed = rclone_ok
 
-        t_embeddings.join()
+        t_tessera.join()
 
         if not rclone_ok:
             logger.error(
@@ -289,18 +306,46 @@ def process_tile(
             )
             return str(TileStatus.FAILED)
 
-        if not embeddings_result.get("ok"):
-            raise RuntimeError("embedding acquisition failed")
+        # TESSERA is best-effort: work out which years actually exist locally.
+        missing_years = [
+            y
+            for y in settings.years
+            if not (output_dir / "embeddings" / f"tessera_{y}.tif").exists()
+        ]
+        present_years = [y for y in settings.years if y not in missing_years]
+        if missing_years:
+            logger.warning(
+                f"{tile_id} | TESSERA missing years {missing_years}; "
+                f"continuing so everything else is preserved"
+            )
+
+        for category, name in bundled:
+            split_chunk_file(output_dir / category / f"{name}.tif", logger)
 
         if not local_output:
-            if not rclone_push(
-                str(output_dir / "embeddings"),
-                f"{dest_root}/{tile_id}/embeddings",
-                logger,
-            ):
-                raise RuntimeError("failed to push TESSERA embeddings to destination")
+            for category in sorted({c for c, _ in bundled if c != "embeddings"}):
+                if not rclone_push(
+                    str(output_dir / category),
+                    f"{dest_root}/{tile_id}/{category}",
+                    logger,
+                ):
+                    raise RuntimeError(f"failed to push split {category} files")
 
-        missing = _verify_tile_outputs(tile_id, dest_root, list(tasks.keys()))
+            # Push the TESSERA years we do have.
+            for y in present_years:
+                if not rclone_push(
+                    str(output_dir / "embeddings" / f"tessera_{y}.tif"),
+                    f"{dest_root}/{tile_id}/embeddings/tessera_{y}.tif",
+                    logger,
+                ):
+                    raise RuntimeError(f"failed to push tessera_{y}.tif")
+
+        missing = _verify_tile_outputs(
+            tile_id,
+            dest_root,
+            expand_product_keys(list(tasks.keys())),
+            years=present_years,
+        )
         if missing:
             raise RuntimeError(f"missing outputs after processing: {missing}")
 
@@ -334,6 +379,15 @@ def process_tile(
                     f"{tile_id} | failed to remove local output dir {output_dir}: {exc}"
                 )
 
+        if missing_years:
+            update_tile(
+                tile_id,
+                status=TileStatus.TESSERA_MISSING,
+                error="tessera missing years: " + ",".join(map(str, missing_years)),
+            )
+            logger.warning(f"{tile_id} | done except TESSERA {missing_years}")
+            return str(TileStatus.TESSERA_MISSING)
+
         update_tile(
             tile_id,
             status=TileStatus.COMPLETE,
@@ -350,7 +404,7 @@ def process_tile(
             logger=logger,
             tasks=tasks,
             output_dir=output_dir,
-            embeddings_thread=t_embeddings,
+            embeddings_thread=t_tessera,
             cancel_event=cancel_event,
             drive_already_cleared=rclone_completed,
         )
@@ -421,8 +475,100 @@ def run_hpc(
             logger.info(
                 f"{i}/{total} "
                 f"complete={counts.get(str(TileStatus.COMPLETE),0)} "
+                f"tessera_missing={counts.get(str(TileStatus.TESSERA_MISSING),0)} "
                 f"failed={counts.get(str(TileStatus.FAILED),0)} "
                 f"{rate:.1f} tiles/min"
             )
+
+        time.sleep(0.2)
+
+
+def retry_tessera_missing(
+    logger: logging.Logger,
+    limit: int | None = None,
+    tile_id: str | None = None,
+    local_output: bool = False,
+) -> None:
+    """Fetch only the missing TESSERA years for tiles in TESSERA_MISSING.
+
+    The destination is the source of truth for what's missing. Tiles that
+    still lack years stay in TESSERA_MISSING and can be retried again.
+    """
+    from threading import Event
+
+    from registry.store import _get_db
+
+    if not local_output:
+        if not settings.hpc_path:
+            raise RuntimeError("HPC_PATH is not configured")
+        if not check_hpc_available(settings.hpc_path, logger):
+            logger.error(f"HPC destination unreachable: {settings.hpc_path}")
+            return
+
+    tiles = _get_db().list_tiles(status=str(TileStatus.TESSERA_MISSING))
+    if tile_id:
+        tiles = [t for t in tiles if t["tile_id"] == tile_id]
+    if limit:
+        tiles = tiles[:limit]
+    logger.info(f"Retrying TESSERA for {len(tiles):,} tiles")
+
+    for i, tile in enumerate(tiles, 1):
+        tid = tile["tile_id"]
+        dest_root = (
+            str(get_local_output_dir(tid).parent) if local_output else settings.hpc_path
+        )
+
+        def _missing() -> list[int]:
+            return [
+                y
+                for y in settings.years
+                if not _dest_file_exists(dest_root, f"{tid}/embeddings/tessera_{y}.tif")
+            ]
+
+        missing_years = _missing()
+        logger.info(f"Tile {i}/{len(tiles)}: {tid} missing {missing_years}")
+
+        if missing_years:
+            scratch = Path(tempfile.mkdtemp(prefix=f"tessera_retry_{tid}_"))
+            try:
+                # local mode writes straight into the tile dir;
+                # HPC mode fetches into scratch, then pushes.
+                target = get_local_output_dir(tid) if local_output else scratch
+                download_tessera_with_retry(
+                    tile,
+                    target,
+                    logger,
+                    Event(),
+                    years=missing_years,
+                )
+                if not local_output:
+                    emb = scratch / "embeddings"
+                    for y in missing_years:
+                        f = emb / f"tessera_{y}.tif"
+                        if f.exists() and not rclone_push(
+                            str(f), f"{dest_root}/{tid}/embeddings/{f.name}", logger
+                        ):
+                            logger.error(f"{tid} | push of tessera_{y} failed")
+            except Exception:
+                logger.exception(f"{tid} | TESSERA retry crashed")
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+
+            missing_years = _missing()
+
+        if missing_years:
+            update_tile(
+                tid,
+                error="tessera missing years: " + ",".join(map(str, missing_years)),
+            )
+            logger.warning(f"{tid} | still missing {missing_years}")
+        else:
+            update_tile(
+                tid,
+                status=TileStatus.COMPLETE,
+                error=None,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            logger.info(f"{tid} | complete")
 
         time.sleep(0.2)

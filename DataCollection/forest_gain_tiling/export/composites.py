@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import ee
 from config import settings
+from export.year_chunks import chunk_name, chunk_years, prefix_bands
+from gee_datasets.registry import Datasets
 
 NATIVE_10M_BANDS = ["B2", "B3", "B4", "B8"]
 NATIVE_20M_BANDS = ["B5", "B6", "B7", "B8A", "B11", "B12"]
 
-CLOUD_SCORE_PLUS_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
 CLOUD_SCORE_PLUS_BAND = "cs_cdf"
 
 
@@ -26,8 +27,9 @@ def _join_cloud_score_plus(
     this dataset. The linked band is attached directly as a band on
     each image, matched by system:index, rather than nested behind a
     property lookup (the older Join.saveFirst pattern this replaces)."""
+    DATASETS = Datasets()
     cs_col = (
-        ee.ImageCollection(CLOUD_SCORE_PLUS_COLLECTION)
+        ee.ImageCollection(DATASETS.cloud_score_plus)
         .filterDate(start, end)
         .filterBounds(geom)
     )
@@ -48,7 +50,7 @@ def _add_ndvi(img: ee.Image) -> ee.Image:
 
 
 def _date_range(year: int) -> tuple[str, str]:
-    return f"{year}-01-01", f"{year+1}-01-01"
+    return f"{year}-01-01", f"{year + 1}-01-01"
 
 
 def leaf_on_window(year: int, *, north: bool) -> tuple[str, str]:
@@ -63,9 +65,10 @@ def s2_availability(geom, year: int) -> ee.Image:
     """
     Full-year, Cloud Score+ masked coverage check
     """
+    datasets = Datasets()
     start, end = _date_range(year)
     ic = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        ee.ImageCollection(datasets.sentinel_2)
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
@@ -79,9 +82,10 @@ def s1_observation_count(tile: ee.Feature, year: int) -> ee.Number:
     """
     Acquisition-level S1 observation count for one tile.
     """
+    datasets = Datasets()
     start, end = _date_range(year)
     ic = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
+        ee.ImageCollection(datasets.sentinel_1)
         .filterDate(start, end)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
@@ -101,10 +105,11 @@ def s1_availability(tile: ee.Feature, year: int) -> ee.Number:
 
 def s2_composite(geom: ee.Geometry, year: int) -> ee.Image:
     """Full-year median composite, Cloud Score+ masked."""
+    datasets = Datasets()
     start, end = _date_range(year)
 
     ic = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        ee.ImageCollection(datasets.sentinel_2)
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
@@ -141,10 +146,11 @@ def _upsample_20m_bands_to_10m(img: ee.Image) -> ee.Image:
 def s2_peak_ndvi(geom: ee.Geometry, year: int, *, north: bool) -> ee.Image:
     """Leaf-on NDVI, Cloud Score+ masked — same masking as everything
     else in this module, just on the tighter leaf-on window."""
+    datasets = Datasets()
     start, end = leaf_on_window(year, north=north)
 
     ic = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        ee.ImageCollection(datasets.sentinel_2)
         .filterDate(start, end)
         .filterBounds(geom)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
@@ -165,12 +171,14 @@ def s2_ndvi_trend(geom: ee.Geometry, years: list[int], *, north: bool) -> ee.Ima
 
 
 def s1_composite(geom: ee.Geometry, year: int) -> ee.Image:
+    datasets = Datasets()
+
     def _mask_edge(img):
         edge = img.lt(-30.0)
         return img.updateMask(img.mask().And(edge.Not()))
 
     med = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
+        ee.ImageCollection(datasets.sentinel_1)
         .filterDate(f"{year}-01-01", f"{year + 1}-01-01")
         .filterBounds(geom)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
@@ -194,24 +202,30 @@ def submit_composite_exports(
     full_valid: ee.Image,
     tile_id: str,
 ) -> dict[str, ee.batch.Task]:
-    """Submit one export task per year"""
+    """One task per chunk of settings.export_years_per_task years. Size 1
+    is one task per year (previous behaviour). Larger chunks export one
+    multi-band GeoTIFF that export/year_chunks.split_chunk_file breaks back
+    into per-year files after transfer."""
     tasks: dict[str, ee.batch.Task] = {}
 
-    for year in settings.years:
-        image = build_year_composite(geom, year).updateMask(full_valid).toFloat()
+    for years in chunk_years(list(settings.years), settings.export_years_per_task):
+        year_images = []
+        for year in years:
+            image = build_year_composite(geom, year).updateMask(full_valid).toFloat()
+            mask_img = valid_mask_from_composite(
+                image, out_band_name=f"s2_valid_{year}"
+            ).toFloat()
+            image = image.addBands(mask_img)
+            year_images.append(prefix_bands(image, year) if len(years) > 1 else image)
 
-        mask_band_name = f"s2_valid_{year}"
-        mask_img = valid_mask_from_composite(
-            image, out_band_name=mask_band_name
-        ).toFloat()
-        image = image.addBands(mask_img)
+        combined = ee.Image.cat(year_images)
 
-        name = f"s1s2_{year}"
+        name = chunk_name("s1s2", years)
         key = f"composites/{name}"
         prefix = f"{tile_id}__composites__{name}"
 
         task = ee.batch.Export.image.toDrive(
-            image=image,
+            image=combined,
             description=prefix,
             folder=settings.drive_folder,
             fileNamePrefix=prefix,

@@ -18,6 +18,9 @@ Examples
   python main.py run --tile-id tile_-363_2324
   python main.py run --status failed
   python main.py run --local-output --limit 10
+  python main.py retry-tessera
+  python main.py retry-tessera --limit 50
+  python main.py retry-tessera --tile-id tile_-363_2324
   python main.py reset --status failed
   python main.py reset --status failed --to-status valid
   python main.py reset --status rejected --yes
@@ -45,6 +48,12 @@ Filter
   --stratify-mode prop | equal
   --tile-limit N   (required if --stratify is set; total tiles to draw)
 
+Retry-tessera
+-------------
+  --tile-id TILE_ID
+  --limit N
+  --local-output
+
 Reset
 -----
   --status STATUS
@@ -64,7 +73,7 @@ from datetime import datetime
 import ee
 from config import settings
 from enums import TileStatus
-from export.tasks import run_hpc, run_local
+from export.tasks import retry_tessera_missing, run_hpc, run_local
 from filtering.tasks import run_filter_hpc, run_filter_local
 from gee.auth import get_ee_credentials
 from gee_datasets.registry import Datasets
@@ -345,6 +354,26 @@ def cmd_run(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_retry_tessera(args: argparse.Namespace) -> None:
+    """Fetch missing TESSERA years for tiles in tessera_missing status.
+
+    No GEE calls: only TESSERA is fetched, and only for years that are not
+    already present at the destination.
+    """
+    logger = setup_logging("retry_tessera")
+    retry_tessera_missing(
+        logger,
+        limit=args.limit,
+        tile_id=args.tile_id,
+        local_output=args.local_output,
+    )
+    print(
+        registry_summary(
+            verbose=args.verbose,
+        )
+    )
+
+
 def cmd_reset(args: argparse.Namespace) -> None:
     """Reset tile statuses"""
     logger = setup_logging("reset")
@@ -494,6 +523,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write exports and embeddings to DataCollection/data/test_tiles instead of HPC.",
     )
 
+    rt_p = sub.add_parser(
+        "retry-tessera",
+        help="Fetch missing TESSERA years for tiles in tessera_missing status "
+        "(no GEE calls, keeps already-exported data)",
+    )
+    rt_p.add_argument(
+        "--tile-id",
+        default=None,
+        help="Only retry this tile (exact match).",
+    )
+    rt_p.add_argument(
+        "--limit",
+        default=None,
+        type=int,
+        help="Max number of tiles to retry.",
+    )
+    rt_p.add_argument(
+        "--local-output",
+        action="store_true",
+        help="Check/write embeddings under DataCollection/data/test_tiles instead of HPC.",
+    )
+
     _RESETTABLE_STATUSES = [
         str(s)
         for s in (
@@ -504,6 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
             TileStatus.REJECTED,
             TileStatus.SUBMITTED,
             TileStatus.COMPLETE,
+            TileStatus.TESSERA_MISSING,
         )
     ]
 
@@ -543,6 +595,7 @@ if __name__ == "__main__":
         "status": cmd_status,
         "filter": cmd_filter,
         "run": cmd_run,
+        "retry-tessera": cmd_retry_tessera,
         "reset": cmd_reset,
     }
     dispatch[args.command](args)

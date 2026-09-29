@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import ee
-from embeddings.tasks import process_all_embeddings_with_retry
 from export.aee import submit_aee_exports
 from export.composites import submit_composite_exports
 from export.drive import rclone_all_products
@@ -20,6 +19,7 @@ from export.tasks import _verify_tile_outputs, _wait_for_all
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 from stack.stacks import build_full_valid
+from tessera.tasks import process_all_embeddings_with_retry
 from tiling.grid import crs_transform, tile_geom
 
 

@@ -23,8 +23,6 @@ def _build_rclone_base_args() -> list[str]:
         f"--timeout={settings.rclone_timeout}",
         f"--low-level-retries={settings.rclone_low_level_retries}",
     ]
-    if settings.rclone_drive_chunk_size:
-        args.append(f"--drive-chunk-size={settings.rclone_drive_chunk_size}")
     return args
 
 

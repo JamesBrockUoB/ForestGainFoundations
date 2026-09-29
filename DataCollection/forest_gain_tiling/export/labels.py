@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ee
 from config import settings
-from gee_datasets.registry import Datasets
 
 
 def build_label_layers(
