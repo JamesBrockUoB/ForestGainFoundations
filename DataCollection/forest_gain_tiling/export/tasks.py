@@ -31,7 +31,11 @@ from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 from registry.store import _get_db, update_tile
 from stack.stacks import build_full_valid
-from tessera.tasks import TesseraNoDataError, download_tessera_with_retry
+from tessera.tessera import (
+    TesseraNoDataError,
+    download_tessera_until_acquired,
+    download_tessera_with_retry,
+)
 from tiling.grid import crs_transform, tile_geom
 
 
@@ -117,7 +121,7 @@ def _wait_for_all(
         first_submit = min(submitted_times.values())
         last_complete = max(completed_at.values())
         logger.info(
-            f"{tile_id} | all exports finished (wall {(last_complete-first_submit):.1f}s)"
+            f"{tile_id} | all exports finished (wall {(last_complete - first_submit):.1f}s)"
         )
 
     return True
@@ -523,7 +527,7 @@ def retry_tessera_missing(
             scratch = Path(tempfile.mkdtemp(prefix=f"tessera_retry_{tid}_"))
             try:
                 target = get_local_output_dir(tid) if local_output else scratch
-                download_embeddings_until_acquired(
+                download_tessera_until_acquired(
                     tile, target, logger, years=missing_years
                 )
                 if not local_output:

@@ -98,7 +98,7 @@ class Settings:
     filter_batch_size_cheap: int = 200
     filter_batch_size_imagery: int = 40
 
-    tessera_year_timeout_s: int = 90
+    tessera_year_timeout_s: int = 120
 
     tessera_max_concurrent_years: int = 4
 

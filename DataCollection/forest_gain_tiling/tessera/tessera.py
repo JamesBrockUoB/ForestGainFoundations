@@ -9,10 +9,12 @@ import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 import rasterio
 from config import settings
+from export.year_chunks import chunk_years
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tiling.grid import crs_transform as tile_crs_transform
@@ -25,9 +27,6 @@ class TesseraNoDataError(RuntimeError):
 _MP_CTX = mp.get_context("spawn")
 
 _GDAL_CACHEMAX_MB = 256
-
-# Maximum time allowed for an individual year subprocess.
-_YEAR_TIMEOUT_S = 60
 
 # Maximum number of years fetched concurrently.
 _DEFAULT_MAX_CONCURRENT_YEARS = 2
@@ -230,7 +229,7 @@ def download_tessera(
     Fetch every missing TESSERA year for this tile.
 
     At most _MAX_CONCURRENT_YEARS subprocesses run simultaneously.
-    A subprocess that exceeds _YEAR_TIMEOUT_S is terminated and its
+    A subprocess that exceeds the per-year timeout is terminated and its
     year is treated as failed.
 
     Existing .tif files are skipped.
@@ -333,8 +332,10 @@ def download_tessera(
             _dest,
             launched_at,
         ) in list(running.items()):
-            if now - launched_at > _YEAR_TIMEOUT_S:
-                errors.append(f"{year}: timeout after {_YEAR_TIMEOUT_S}s")
+            if now - launched_at > settings.tessera_year_timeout_s:
+                errors.append(
+                    f"{year}: timeout after {settings.tessera_year_timeout_s}s"
+                )
                 _reap(proc)
                 finish(year)
 
@@ -447,69 +448,99 @@ def download_tessera(
             pass
 
 
-def download_tessera_until_acquired(
+def download_tessera_with_retry(
     tile: dict,
-    embeddings_dir: Path,
+    output_dir: Path,
     logger: logging.Logger,
+    cancel_event: Event,
+    retries: int = 2,
     years: list[int] | None = None,
-) -> None:
-    """
-    Persistent, no-timeout, no-give-up fetch for the retry-tessera command.
-    Each missing year is fetched one at a time and waited on for as long as
-    it takes -- no _YEAR_TIMEOUT_S kill, no retry-count exhaustion. Only
-    TesseraNoDataError stops it (no coverage -- retrying won't help).
-    Everything else just loops again.
-    """
-    bbox = tile_bbox(tile)
-    target_years = list(settings.years if years is None else years)
+) -> bool:
+    tile_id = tile["tile_id"]
 
-    for year in target_years:
-        dest = embeddings_dir / f"tessera_{year}.tif"
-        if dest.exists():
-            continue
+    for attempt in range(retries):
+        if cancel_event.is_set():
+            logger.warning(f"{tile_id} | TESSERA cancelled")
+            return False
 
-        attempt = 0
-        while True:
-            attempt += 1
-            raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
-            result_queue = _MP_CTX.Queue()
-            proc = _MP_CTX.Process(
-                target=_fetch_and_align_year,
-                args=(raw_dir, bbox, year, str(dest), tile, result_queue),
+        try:
+            logger.info(f"{tile_id} | starting TESSERA")
+            download_tessera(tile, output_dir, logger, years)
+            logger.info(f"{tile_id} | TESSERA complete")
+            return True
+
+        except TesseraNoDataError as exc:
+            logger.error(
+                f"{tile_id} | TESSERA has no data for this tile; "
+                f"not retrying: {exc}"
             )
-            proc.start()
-            proc.join()  # no timeout -- block until it actually finishes
+            return False
 
-            try:
-                result = result_queue.get_nowait()
-            except queue.Empty:
-                result = {
-                    "success": False,
-                    "error_type": "crashed",
-                    "error": f"subprocess exited (code={proc.exitcode}) with no result",
-                }
+        except Exception as exc:
+            logger.error(f"{tile_id} | TESSERA failed: {exc}")
 
-            shutil.rmtree(raw_dir, ignore_errors=True)
-            try:
-                result_queue.close()
-                result_queue.join_thread()
-            except Exception:
-                pass
-
-            if result["success"]:
-                logger.info(f"TESSERA {year}: acquired (attempt {attempt})")
-                break
-
-            if result["error_type"] == "no_data":
-                raise TesseraNoDataError(result["error"])
+        if attempt < retries - 1:
+            wait = 2**attempt + 1
 
             logger.warning(
-                f"TESSERA {year}: attempt {attempt} failed "
-                f"({result['error_type']}: {result['error']}) -- retrying"
+                f"{tile_id} | TESSERA retry " f"{attempt + 1}/{retries} in {wait}s"
             )
 
+            if cancel_event.wait(wait):
+                logger.warning(f"{tile_id} | TESSERA cancelled during retry wait")
+                return False
 
-def download_embeddings_until_acquired(
+    logger.error(f"{tile_id} | TESSERA exhausted retries")
+    return False
+
+
+def fetch_tessera_in_chunks(
+    tile: dict,
+    output_dir: Path,
+    logger: logging.Logger,
+    cancel_event: Event,
+) -> bool:
+    """Fetch TESSERA in chunks, splitting failed chunks recursively."""
+
+    def fetch(years: list[int]) -> bool:
+        if cancel_event.is_set():
+            return False
+
+        retries = 2 if len(years) > 1 else 4
+
+        if download_tessera_with_retry(
+            tile,
+            output_dir,
+            logger,
+            cancel_event,
+            retries=retries,
+            years=years,
+        ):
+            return True
+
+        if len(years) == 1:
+            return False
+
+        logger.warning(
+            f"{tile['tile_id']} | TESSERA {years} failed; "
+            "retrying as smaller requests"
+        )
+
+        mid = len(years) // 2
+        return fetch(years[:mid]) and fetch(years[mid:])
+
+    for chunk in chunk_years(
+        list(settings.years),
+        settings.tessera_years_per_request,
+    ):
+        if not fetch(chunk):
+            cancel_event.set()
+            return False
+
+    return True
+
+
+def download_tessera_until_acquired(
     tile: dict,
     output_dir: Path,
     logger: logging.Logger,
@@ -517,4 +548,106 @@ def download_embeddings_until_acquired(
 ) -> None:
     embeddings_dir = output_dir / "embeddings"
     embeddings_dir.mkdir(parents=True, exist_ok=True)
-    download_tessera_until_acquired(tile, embeddings_dir, logger, years)
+
+    bbox = tile_bbox(tile)
+    target_years = list(settings.years if years is None else years)
+
+    pending: list[int] = [
+        year
+        for year in target_years
+        if not (embeddings_dir / f"tessera_{year}.tif").exists()
+    ]
+
+    if not pending:
+        return
+
+    max_concurrent = max(1, min(len(pending), _MAX_CONCURRENT_YEARS))
+
+    logger.info(f"TESSERA: fetching {len(pending)} year(s), {max_concurrent} at a time")
+
+    result_queue = _MP_CTX.Queue()
+
+    # year -> (process, raw_dir, dest)
+    running: dict[int, tuple[mp.Process, str, Path]] = {}
+
+    def launch(year: int) -> None:
+        dest = embeddings_dir / f"tessera_{year}.tif"
+        raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
+
+        proc = _MP_CTX.Process(
+            target=_fetch_and_align_year,
+            args=(raw_dir, bbox, year, str(dest), tile, result_queue),
+        )
+        proc.start()
+
+        running[year] = (proc, raw_dir, dest)
+
+    try:
+        while pending and len(running) < max_concurrent:
+            launch(pending.pop(0))
+
+        while running:
+            try:
+                result = result_queue.get(timeout=0.5)
+            except queue.Empty:
+                for year, (proc, raw_dir, dest) in list(running.items()):
+                    if not proc.is_alive():
+                        proc.join()
+                        shutil.rmtree(raw_dir, ignore_errors=True)
+                        del running[year]
+
+                        if proc.exitcode != 0:
+                            logger.warning(
+                                f"TESSERA {year}: subprocess died "
+                                f"(exitcode={proc.exitcode}) - retrying"
+                            )
+                        elif not dest.exists():
+                            logger.warning(
+                                f"TESSERA {year}: exited cleanly, "
+                                "no output written - retrying"
+                            )
+
+                        launch(year)
+
+                continue
+
+            year = result["year"]
+
+            if year not in running:
+                continue
+
+            proc, raw_dir, dest = running.pop(year)
+            proc.join(timeout=5)
+            if proc.is_alive():
+                _reap(proc)
+            shutil.rmtree(raw_dir, ignore_errors=True)
+
+            if result["success"]:
+                logger.info(f"TESSERA {year}: acquired")
+                if pending:
+                    launch(pending.pop(0))
+                continue
+
+            if result["error_type"] == "no_data":
+                for y, (p, rd, _d) in list(running.items()):
+                    _reap(p)
+                    shutil.rmtree(rd, ignore_errors=True)
+                running.clear()
+                raise TesseraNoDataError(result["error"])
+
+            logger.warning(
+                f"TESSERA {year}: failed "
+                f"({result['error_type']}: {result['error']}) - retrying"
+            )
+            launch(year)
+
+    finally:
+        for _year, (proc, raw_dir, _dest) in list(running.items()):
+            _reap(proc)
+            shutil.rmtree(raw_dir, ignore_errors=True)
+
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
