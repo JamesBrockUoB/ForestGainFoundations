@@ -29,9 +29,9 @@ from export.year_chunks import expand_product_keys, is_chunked, split_chunk_file
 from gee.cleanup import _cleanup_failed_tile
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
-from registry.store import update_tile
+from registry.store import _get_db, update_tile
 from stack.stacks import build_full_valid
-from tessera.tasks import download_tessera_with_retry
+from tessera.tasks import TesseraNoDataError, download_tessera_with_retry
 from tiling.grid import crs_transform, tile_geom
 
 
@@ -489,15 +489,6 @@ def retry_tessera_missing(
     tile_id: str | None = None,
     local_output: bool = False,
 ) -> None:
-    """Fetch only the missing TESSERA years for tiles in TESSERA_MISSING.
-
-    The destination is the source of truth for what's missing. Tiles that
-    still lack years stay in TESSERA_MISSING and can be retried again.
-    """
-    from threading import Event
-
-    from registry.store import _get_db
-
     if not local_output:
         if not settings.hpc_path:
             raise RuntimeError("HPC_PATH is not configured")
@@ -531,15 +522,9 @@ def retry_tessera_missing(
         if missing_years:
             scratch = Path(tempfile.mkdtemp(prefix=f"tessera_retry_{tid}_"))
             try:
-                # local mode writes straight into the tile dir;
-                # HPC mode fetches into scratch, then pushes.
                 target = get_local_output_dir(tid) if local_output else scratch
-                download_tessera_with_retry(
-                    tile,
-                    target,
-                    logger,
-                    Event(),
-                    years=missing_years,
+                download_embeddings_until_acquired(
+                    tile, target, logger, years=missing_years
                 )
                 if not local_output:
                     emb = scratch / "embeddings"
@@ -549,6 +534,8 @@ def retry_tessera_missing(
                             str(f), f"{dest_root}/{tid}/embeddings/{f.name}", logger
                         ):
                             logger.error(f"{tid} | push of tessera_{y} failed")
+            except TesseraNoDataError as exc:
+                logger.error(f"{tid} | no TESSERA coverage, not retrying: {exc}")
             except Exception:
                 logger.exception(f"{tid} | TESSERA retry crashed")
             finally:
@@ -558,8 +545,7 @@ def retry_tessera_missing(
 
         if missing_years:
             update_tile(
-                tid,
-                error="tessera missing years: " + ",".join(map(str, missing_years)),
+                tid, error="tessera missing years: " + ",".join(map(str, missing_years))
             )
             logger.warning(f"{tid} | still missing {missing_years}")
         else:

@@ -445,3 +445,76 @@ def download_tessera(
             result_queue.join_thread()
         except Exception:
             pass
+
+
+def download_tessera_until_acquired(
+    tile: dict,
+    embeddings_dir: Path,
+    logger: logging.Logger,
+    years: list[int] | None = None,
+) -> None:
+    """
+    Persistent, no-timeout, no-give-up fetch for the retry-tessera command.
+    Each missing year is fetched one at a time and waited on for as long as
+    it takes -- no _YEAR_TIMEOUT_S kill, no retry-count exhaustion. Only
+    TesseraNoDataError stops it (no coverage -- retrying won't help).
+    Everything else just loops again.
+    """
+    bbox = tile_bbox(tile)
+    target_years = list(settings.years if years is None else years)
+
+    for year in target_years:
+        dest = embeddings_dir / f"tessera_{year}.tif"
+        if dest.exists():
+            continue
+
+        attempt = 0
+        while True:
+            attempt += 1
+            raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
+            result_queue = _MP_CTX.Queue()
+            proc = _MP_CTX.Process(
+                target=_fetch_and_align_year,
+                args=(raw_dir, bbox, year, str(dest), tile, result_queue),
+            )
+            proc.start()
+            proc.join()  # no timeout -- block until it actually finishes
+
+            try:
+                result = result_queue.get_nowait()
+            except queue.Empty:
+                result = {
+                    "success": False,
+                    "error_type": "crashed",
+                    "error": f"subprocess exited (code={proc.exitcode}) with no result",
+                }
+
+            shutil.rmtree(raw_dir, ignore_errors=True)
+            try:
+                result_queue.close()
+                result_queue.join_thread()
+            except Exception:
+                pass
+
+            if result["success"]:
+                logger.info(f"TESSERA {year}: acquired (attempt {attempt})")
+                break
+
+            if result["error_type"] == "no_data":
+                raise TesseraNoDataError(result["error"])
+
+            logger.warning(
+                f"TESSERA {year}: attempt {attempt} failed "
+                f"({result['error_type']}: {result['error']}) -- retrying"
+            )
+
+
+def download_embeddings_until_acquired(
+    tile: dict,
+    output_dir: Path,
+    logger: logging.Logger,
+    years: list[int] | None = None,
+) -> None:
+    embeddings_dir = output_dir / "embeddings"
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
+    download_tessera_until_acquired(tile, embeddings_dir, logger, years)
