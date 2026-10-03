@@ -5,7 +5,7 @@ from pathlib import Path
 import pytorch_lightning as pl
 from config import DEFAULT_IMAGE_SIZE, NUM_INPUT_CHANNELS
 from datasets import MultiTemporalGainDataset, split_tile_dirs
-from evaluate import evaluate_checkpoint
+from eval import evaluate_checkpoint
 from lightning_module import GainDetectionTask
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from torch.utils.data import DataLoader
