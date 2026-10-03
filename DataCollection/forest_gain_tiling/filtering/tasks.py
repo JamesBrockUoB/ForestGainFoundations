@@ -12,6 +12,7 @@ from enums import TileStatus
 from filtering.tile_batches import (
     count_pending,
     iter_pending_tile_batches,
+    iter_spatial_pending_tile_batches,
     iter_stratified_pending_tile_batches,
 )
 from filtering.tile_filter import filter_batch_cheap, filter_batch_imagery
@@ -74,7 +75,7 @@ def _resolve_batch_iter(
     if limit_batches is not None:
         total_batches = min(total_batches, limit_batches)
 
-    batch_iter = iter_pending_tile_batches(cfg["input_status"], batch_size)
+    batch_iter = iter_spatial_pending_tile_batches(cfg["input_status"], batch_size)
     if limit_batches is not None:
         batch_iter = islice(batch_iter, limit_batches)
 

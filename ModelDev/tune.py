@@ -1,14 +1,14 @@
 import os
-from pathlib import Path
 
 import pytorch_lightning as pl
 import wandb
-from config import NUM_INPUT_CHANNELS
-from datasets import MultiTemporalGainDataset
+from config import DEFAULT_IMAGE_SIZE, NUM_INPUT_CHANNELS
+from datasets import MultiTemporalGainDataset, split_tile_dirs
 from lightning_module import GainDetectionTask
 from torch.utils.data import DataLoader
 
 WANDB_ENTITY = os.environ.get("WANDB_USERNAME")
+DATA_DIR = "../DataCollection/data/test_tiles"
 
 sweep_configuration = {
     "method": "bayes",
@@ -34,42 +34,41 @@ def sweep_train():
     wandb.init()
     config = wandb.config
 
-    tile_root = Path("../DataCollection/data/test_tiles")
-    tile_dirs = sorted([p for p in tile_root.iterdir() if p.is_dir()])
-    split = int(0.8 * len(tile_dirs))
+    # Test tiles are never used here, so sweeps can't leak into the held-out set
+    train_dirs, val_dirs, _ = split_tile_dirs(DATA_DIR, seed=0)
 
-    train_ds = MultiTemporalGainDataset(tile_dirs[:split])
-    val_ds = MultiTemporalGainDataset(tile_dirs[split:])
+    train_ds = MultiTemporalGainDataset(train_dirs, augment=True)
+    val_ds = MultiTemporalGainDataset(val_dirs)
 
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
         shuffle=True,
-        pin_memory=False,
+        num_workers=4,
         persistent_workers=True,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=config.batch_size,
         shuffle=False,
-        pin_memory=False,
+        num_workers=4,
         persistent_workers=True,
     )
 
     task = GainDetectionTask(
         model_type=config.model_type,
         in_channels=NUM_INPUT_CHANNELS,
+        img_size=DEFAULT_IMAGE_SIZE,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
 
-    # No project/entity args here on purpose: an agent-launched run is already
-    # active from wandb.init() above, so this just attaches the PL logger to it
-    # rather than starting a second, competing run.
+    # No project/entity args: the run from wandb.init() is already active
     trainer = pl.Trainer(
         max_epochs=25,
         accelerator="auto",
-        precision="16-mixed",
+        precision="32-true",
+        gradient_clip_val=1.0,
         logger=pl.loggers.WandbLogger(),
     )
 

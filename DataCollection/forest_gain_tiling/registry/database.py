@@ -35,7 +35,6 @@ class RegistryDB:
     def _init_schema(self) -> None:
         """Initialise database schema if not exists and run lightweight migrations."""
         with self._conn() as conn:
-            # Main tiles table with country column
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tiles (
                     tile_id TEXT PRIMARY KEY,
@@ -58,6 +57,7 @@ class RegistryDB:
                     completed_at TEXT,
                     rejection_reason TEXT,
                     error TEXT,
+                    gain_pct REAL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -80,6 +80,8 @@ class RegistryDB:
                 conn.execute(
                     "ALTER TABLE tiles ADD COLUMN country TEXT NOT NULL DEFAULT 'Unknown'"
                 )
+            if "gain_pct" not in existing_cols:
+                conn.execute("ALTER TABLE tiles ADD COLUMN gain_pct REAL")
 
             # Indexes on tiles table
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON tiles(status)")
@@ -116,8 +118,8 @@ class RegistryDB:
                     tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
                     min_lon, min_lat, max_lon, max_lat, biome, region, country,
                     status, gee_task_id, submitted_at, completed_at,
-                    rejection_reason, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rejection_reason, error, gain_pct, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tile["tile_id"],
@@ -140,6 +142,7 @@ class RegistryDB:
                     tile.get("completed_at"),
                     tile.get("rejection_reason"),
                     tile.get("error"),
+                    tile.get("gain_pct"),
                     now,
                     now,
                 ),
@@ -190,6 +193,7 @@ class RegistryDB:
                         tile.get("completed_at"),
                         tile.get("rejection_reason"),
                         tile.get("error"),
+                        tile.get("gain_pct"),
                         now,
                         now,
                     )
@@ -202,8 +206,8 @@ class RegistryDB:
                         tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m,
                         min_lon, min_lat, max_lon, max_lat, biome, region, country,
                         status, gee_task_id, submitted_at, completed_at,
-                        rejection_reason, error, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        rejection_reason, error, gain_pct, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     params_list,
                 )
@@ -392,6 +396,9 @@ class RegistryDB:
         params: list[Any] = [to_status, now]
         if clear_history:
             set_clause += ", gee_task_id = NULL, submitted_at = NULL, completed_at = NULL, rejection_reason = NULL, error = NULL"
+            # Only clear gain_pct if resetting back to pending
+            if to_status == str(TileStatus.PENDING):
+                set_clause += ", gain_pct = NULL"
         query = f"UPDATE tiles SET {set_clause}"
         clauses = []
         if status is not None:
@@ -442,4 +449,5 @@ class RegistryDB:
             "completed_at": row["completed_at"],
             "rejection_reason": row["rejection_reason"],
             "error": row["error"],
+            "gain_pct": row["gain_pct"] if "gain_pct" in row.keys() else None,
         }

@@ -40,7 +40,7 @@ from tiling.grid import crs_transform, tile_geom
 
 
 def get_local_output_dir(tile_id: str) -> Path:
-    return settings.data_dir / "test_tiles" / tile_id
+    return settings.data_dir / "test_tiles_2" / tile_id
 
 
 def get_tessera_scratch_dir() -> Path:

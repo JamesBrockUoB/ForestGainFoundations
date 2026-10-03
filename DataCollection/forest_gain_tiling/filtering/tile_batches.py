@@ -1,12 +1,103 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 from typing import Any, Iterator
 
-from config import settings
 from registry.store import _get_db
 from tiling.selection import STRATA_FIELDS, load_or_compute_strata_ratios
+
+_TILE_COLS = (
+    "tile_id, xi, yi, x_min_m, y_min_m, x_max_m, y_max_m, "
+    "min_lon, min_lat, max_lon, max_lat"
+)
+
+
+def _row_to_tile(r) -> dict[str, Any]:
+    return {
+        k: r[k]
+        for k in (
+            "tile_id",
+            "xi",
+            "yi",
+            "x_min_m",
+            "y_min_m",
+            "x_max_m",
+            "y_max_m",
+            "min_lon",
+            "min_lat",
+            "max_lon",
+            "max_lat",
+        )
+    }
+
+
+def iter_spatial_pending_tile_batches(
+    status: str,
+    batch_size: int,
+    block_size: int | None = None,
+) -> Iterator[list[dict[str, Any]]]:
+    """
+    Spatially compact batches for full (unstratified) runs.
+
+    Tiles are grouped into block_size x block_size grid-cell blocks
+    (default ~ sqrt(batch_size), so one block ~ one batch when dense),
+    blocks are visited in serpentine order, and batches are filled
+    across consecutive blocks. Each batch is therefore one compact
+    region instead of a long xi-column.
+    """
+    db = _get_db()
+    B = block_size or max(1, math.isqrt(batch_size - 1) + 1)
+
+    with db._conn() as conn:
+        origin = conn.execute(
+            "SELECT MIN(xi) AS x0, MIN(yi) AS y0 FROM tiles WHERE status = ?",
+            (status,),
+        ).fetchone()
+        if origin["x0"] is None:
+            return
+        x0, y0 = origin["x0"], origin["y0"]
+
+        # offset by the minimum so integer division is a true floor
+        blocks = conn.execute(
+            """
+            SELECT DISTINCT (xi - ?) / ? AS bx, (yi - ?) / ? AS by
+            FROM tiles WHERE status = ?
+            """,
+            (x0, B, y0, B, status),
+        ).fetchall()
+        order = sorted(
+            ((r["bx"], r["by"]) for r in blocks),
+            key=lambda b: (b[0], b[1] if b[0] % 2 == 0 else -b[1]),
+        )
+
+        buffer: list[dict[str, Any]] = []
+        for bx, by in order:
+            rows = conn.execute(
+                f"""
+                SELECT {_TILE_COLS} FROM tiles
+                WHERE status = ?
+                  AND xi >= ? AND xi < ?
+                  AND yi >= ? AND yi < ?
+                ORDER BY yi, xi
+                """,
+                (
+                    status,
+                    x0 + bx * B,
+                    x0 + (bx + 1) * B,
+                    y0 + by * B,
+                    y0 + (by + 1) * B,
+                ),
+            ).fetchall()
+            buffer.extend(_row_to_tile(r) for r in rows)
+
+            while len(buffer) >= batch_size:
+                yield buffer[:batch_size]
+                buffer = buffer[batch_size:]
+
+        if buffer:
+            yield buffer
 
 
 def iter_pending_tile_batches(

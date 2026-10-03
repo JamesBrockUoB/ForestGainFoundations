@@ -1,7 +1,7 @@
 .DS_Store
 .env
 
-*/data/test_tiles
+*/data/test_tiles*
 */data/inspector_tiles
 
 **/logs/
@@ -29,3 +29,5 @@ build/*
 *Forest-Gain-CD*
 
 *DataCollection/dt_plots*
+
+*/predictions/*

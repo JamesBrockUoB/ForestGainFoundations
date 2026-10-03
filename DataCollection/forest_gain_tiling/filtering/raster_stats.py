@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import ee
@@ -87,7 +88,9 @@ def build_cheap_stats_image(
         ndvi_trend,
     ]
 
-    return ee.Image.cat(bands).clip(geom)
+    # No final .clip(geom): reduceRegions already bounds each tile, and
+    # clipping against a union of scattered polygons is slow.
+    return ee.Image.cat(bands)
 
 
 def build_imagery_stats_image(geom: ee.Geometry) -> ee.Image:
@@ -133,66 +136,107 @@ def _reduce_tiles(
     return out
 
 
+def _with_retry(fn, *, attempts: int = 4, base_delay: float = 5.0):
+    """Retry transient transport/quota errors only; real EE errors raise at once."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            msg = str(exc)
+            transient = (
+                "Connection aborted" in msg
+                or "RemoteDisconnected" in msg
+                or "timed out" in msg.lower()
+                or "429" in msg
+                or "Too many concurrent" in msg
+            )
+            if not transient or i == attempts - 1:
+                raise
+            time.sleep(base_delay * 2**i)
+
+
 def fetch_cheap_stats(
     tiles: list[dict],
     ds: Datasets,
+    *,
+    chunk_size: int = 20,
+    max_workers: int = 5,
 ) -> dict[str, dict[str, float]]:
-    """Split by hemisphere — NDVI trend is leaf-on."""
+    """
+    Gain + NDVI trend in one reduceRegions per chunk. Chunked per hemisphere
+    (NDVI trend is leaf-on), fetched concurrently, transient errors retried.
+    """
     north_tiles, south_tiles = split_by_hemisphere(tiles)
-    out: dict[str, dict[str, float]] = {}
 
+    jobs = []
     for group, north in ((north_tiles, True), (south_tiles, False)):
-        if not group:
-            continue
-        geom = tiles_to_feature_collection(group).geometry()
-        stats = build_cheap_stats_image(geom, ds, north=north)
-        out.update(_reduce_tiles(stats, group, CHEAP_BAND_NAMES, tile_scale=2))
+        for i in range(0, len(group), chunk_size):
+            jobs.append((group[i : i + chunk_size], north))
+
+    def run(job):
+        chunk, north = job
+
+        def go():
+            geom = tiles_to_feature_collection(chunk).geometry()
+            stats = build_cheap_stats_image(geom, ds, north=north)
+            return _reduce_tiles(stats, chunk, CHEAP_BAND_NAMES, tile_scale=2)
+
+        return _with_retry(go)
+
+    out: dict[str, dict[str, float]] = {}
+    if not jobs:
+        return out
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for result in ex.map(run, jobs):
+            out.update(result)
 
     return out
 
 
 def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
     """
-    S2: full-year, Cloud Score+ masked pixel-level availability — one
-        reduceRegions call for all tiles.
+    S2: full-year, Cloud Score+ masked pixel-level availability, per-tile
+        images mosaicked, one reduceRegions call for all tiles.
     S1: acquisition-level availability via composites.s1_availability,
         mapped server-side over the tile FeatureCollection and fetched
-        with one getInfo() per year — instead of one getInfo() per
-        tile per year.
+        with one getInfo().
+    S2 and S1 run concurrently.
     """
     fc = tiles_to_feature_collection(tiles)
 
-    tile_images = []
+    def fetch_s2():
+        tile_images = []
 
-    for tile in tiles:
-        geom = ee.Geometry.Rectangle(
-            [
-                tile["x_min_m"],
-                tile["y_min_m"],
-                tile["x_max_m"],
-                tile["y_max_m"],
-            ],
-            proj=ee.Projection(settings.crs_wkt),
-            geodesic=False,
+        for tile in tiles:
+            geom = ee.Geometry.Rectangle(
+                [
+                    tile["x_min_m"],
+                    tile["y_min_m"],
+                    tile["x_max_m"],
+                    tile["y_max_m"],
+                ],
+                proj=ee.Projection(settings.crs_wkt),
+                geodesic=False,
+            )
+
+            tile_image = ee.Image.cat(
+                [
+                    s2_availability(geom, year).rename(f"s2_{year}")
+                    for year in settings.years
+                ]
+            ).clip(geom)
+
+            tile_images.append(tile_image)
+
+        stats = ee.ImageCollection(tile_images).mosaic()
+
+        return _reduce_tiles(
+            stats,
+            tiles,
+            S2_BAND_NAMES,
+            tile_scale=8,
         )
-
-        tile_image = ee.Image.cat(
-            [
-                s2_availability(geom, year).rename(f"s2_{year}")
-                for year in settings.years
-            ]
-        ).clip(geom)
-
-        tile_images.append(tile_image)
-
-    stats = ee.ImageCollection(tile_images).mosaic()
-
-    out = _reduce_tiles(
-        stats,
-        tiles,
-        S2_BAND_NAMES,
-        tile_scale=8,
-    )
 
     def add_s1_stats(feature):
         for year in settings.years:
@@ -202,7 +246,14 @@ def fetch_imagery_stats(tiles: list[dict]) -> dict[str, dict[str, float]]:
             )
         return feature
 
-    s1_info = fc.map(add_s1_stats).getInfo()
+    def fetch_s1():
+        return fc.map(add_s1_stats).getInfo()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_s2 = ex.submit(fetch_s2)
+        f_s1 = ex.submit(fetch_s1)
+        out = f_s2.result()
+        s1_info = f_s1.result()
 
     for feature in s1_info["features"]:
         props = feature["properties"]

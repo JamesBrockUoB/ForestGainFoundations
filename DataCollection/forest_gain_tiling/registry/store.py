@@ -1,6 +1,5 @@
 from typing import Any
 
-from config import settings
 from enums import TileStatus
 from registry.database import RegistryDB
 

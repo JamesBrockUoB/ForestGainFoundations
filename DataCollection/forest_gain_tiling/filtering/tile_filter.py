@@ -14,18 +14,24 @@ from registry.store import update_tile
 
 
 def evaluate_cheap_stats(
-    stats: dict[str, float],
+    stats: dict[str, float | None],
     logger: logging.Logger | None = None,
 ) -> tuple[str, str | None]:
+    gain_frac = stats.get("gain_frac")
+    ndvi_trend = stats.get("ndvi_trend")
 
-    gain_pct = stats["gain_frac"] * 100.0
-    ndvi_trend = stats["ndvi_trend"]
-
-    if gain_pct == 0.0:
+    if gain_frac is None or gain_frac == 0.0:
         return str(TileStatus.REJECTED), "no_gain"
 
-    if gain_pct < settings.gain_pct_min:
+    if gain_frac * 100.0 < settings.gain_pct_min:
         return str(TileStatus.REJECTED), "low_gain_pct"
+
+    if ndvi_trend is None:
+        # Gain exists but no valid NDVI in any year: give it its own reason
+        # so it can't be confused with a genuine low-viability rejection.
+        if logger:
+            logger.warning("ndvi_trend is None despite gain > 0")
+        return str(TileStatus.REJECTED), "no_ndvi_data"
 
     if ndvi_trend <= settings.ndvi_trend_min:
         return str(TileStatus.REJECTED), "low_viability"
@@ -34,20 +40,18 @@ def evaluate_cheap_stats(
 
 
 def evaluate_imagery_stats(
-    stats: dict[str, float], logger: logging.Logger | None = None
-) -> tuple[str, str | None]:
-    """
-    Requires every per-year S1 and S2 band to clear
-    settings.imagery_min_valid_frac.
-    """
-    low = {b: v for b, v in stats.items() if v < settings.imagery_min_valid_frac}
-
+    stats: dict[str, float | None], logger: logging.Logger | None = None
+) -> str | None:
+    low = {
+        b: v
+        for b, v in stats.items()
+        if v is None or v < settings.imagery_min_valid_frac
+    }
     if low:
         if logger:
             logger.debug(f"low_imagery_coverage: {low}")
-        return str(TileStatus.REJECTED), "low_imagery_coverage"
-
-    return str(TileStatus.VALID), None
+        return "low_imagery_coverage"
+    return None
 
 
 def filter_batch_cheap(
@@ -92,6 +96,7 @@ def filter_batch_cheap(
         "cheap_valid": 0,
         "rejected": 0,
         "tessera_no_coverage": 0,
+        "failed": 0,
     }
 
     for tile_id, missing_years in missing_tessera.items():
@@ -131,7 +136,9 @@ def filter_batch_cheap(
                 error=str(exc),
             )
 
-        return {"failed": len(covered_tiles)}
+        # Keep the TESSERA rejections already counted above
+        counts["failed"] = len(covered_tiles)
+        return counts
 
     for t in covered_tiles:
         tile_id = t["tile_id"]
@@ -144,7 +151,7 @@ def filter_batch_cheap(
                 status=TileStatus.FAILED,
                 error="missing stats result",
             )
-            counts["rejected"] += 1
+            counts["failed"] += 1
             continue
 
         status, reason = evaluate_cheap_stats(
@@ -171,6 +178,7 @@ def filter_batch_cheap(
         f"  {batch_label} cheap eval: "
         f"cheap_valid={counts['cheap_valid']} "
         f"rejected={counts['rejected']} "
+        f"failed={counts['failed']} "
         f"tessera_no_coverage={counts['tessera_no_coverage']}"
     )
 
@@ -188,9 +196,6 @@ def filter_batch_imagery(
 
     try:
         stats_by_tile = fetch_imagery_stats(tiles)
-
-        logger.debug(f"  {batch_label} imagery fetch: {time.time()-t0:.1f}s")
-
     except Exception as exc:
         logger.error(
             f"  {batch_label} imagery fetch failed after "
@@ -206,9 +211,12 @@ def filter_batch_imagery(
 
         return {"failed": len(tiles)}
 
+    logger.debug(f"  {batch_label} imagery {time.time()-t0:.1f}s")
+
     counts = {
         "valid": 0,
         "rejected": 0,
+        "failed": 0,
     }
 
     for t in tiles:
@@ -222,22 +230,18 @@ def filter_batch_imagery(
                 status=TileStatus.FAILED,
                 error="missing imagery stats result",
             )
-            counts["rejected"] += 1
+            counts["failed"] += 1
             continue
 
-        status, reason = evaluate_imagery_stats(
-            stats,
-            logger=logger,
-        )
+        reason = evaluate_imagery_stats(stats, logger)
 
-        if status == str(TileStatus.REJECTED):
+        if reason:
             update_tile(
                 tile_id,
                 status=TileStatus.REJECTED,
                 rejection_reason=reason,
             )
             counts["rejected"] += 1
-
         else:
             update_tile(
                 tile_id,
@@ -248,7 +252,8 @@ def filter_batch_imagery(
     logger.debug(
         f"  {batch_label} imagery eval: "
         f"valid={counts['valid']} "
-        f"rejected={counts['rejected']}"
+        f"rejected={counts['rejected']} "
+        f"failed={counts['failed']}"
     )
 
     return counts

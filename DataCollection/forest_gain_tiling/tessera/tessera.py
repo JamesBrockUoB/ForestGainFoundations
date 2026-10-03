@@ -234,6 +234,7 @@ def download_tessera(
 
     Existing .tif files are skipped.
     """
+    tile_id = tile["tile_id"]
 
     embeddings_dir = output_dir / "embeddings"
     embeddings_dir.mkdir(
@@ -264,7 +265,7 @@ def download_tessera(
     )
 
     logger.info(
-        f"TESSERA: fetching {len(years_to_fetch)} year(s), "
+        f"{tile_id} | TESSERA: fetching {len(years_to_fetch)} year(s), "
         f"{max_concurrent} at a time"
     )
 
@@ -479,7 +480,7 @@ def download_tessera_with_retry(
         except Exception as exc:
             logger.error(f"{tile_id} | TESSERA failed: {exc}")
 
-        if attempt < retries - 1:
+        if attempt < retries:
             wait = 2**attempt + 1
 
             logger.warning(
@@ -546,6 +547,8 @@ def download_tessera_until_acquired(
     logger: logging.Logger,
     years: list[int] | None = None,
 ) -> None:
+    tile_id = tile["tile_id"]
+
     embeddings_dir = output_dir / "embeddings"
     embeddings_dir.mkdir(parents=True, exist_ok=True)
 
@@ -563,7 +566,9 @@ def download_tessera_until_acquired(
 
     max_concurrent = max(1, min(len(pending), _MAX_CONCURRENT_YEARS))
 
-    logger.info(f"TESSERA: fetching {len(pending)} year(s), {max_concurrent} at a time")
+    logger.info(
+        f"{tile_id} | TESSERA: fetching {len(pending)} year(s), {max_concurrent} at a time"
+    )
 
     result_queue = _MP_CTX.Queue()
 

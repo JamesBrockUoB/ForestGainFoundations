@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from config import settings
-from filtering.raster_stats import fetch_cheap_stats, fetch_imagery_stats
+from filtering.raster_stats import (
+    fetch_gain_stats,
+    fetch_imagery_stats,
+    fetch_ndvi_stats,
+)
 from gee_datasets.registry import Datasets
 from pyproj import Transformer
 
@@ -75,7 +79,10 @@ def fetch_tile_metrics(
     """Fetch raw metrics once; the UI can then vary thresholds without re-fetching."""
     tile_id = tile["tile_id"]
     return {
-        "cheap": fetch_cheap_stats([tile], ds)[tile_id],
+        "cheap": {
+            **fetch_gain_stats([tile], ds)[tile_id],
+            **fetch_ndvi_stats([tile], ds)[tile_id],
+        },
         "imagery": fetch_imagery_stats([tile])[tile_id],
     }
 
