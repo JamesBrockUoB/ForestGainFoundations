@@ -7,6 +7,7 @@ import queue
 import shutil
 import tempfile
 import time
+import traceback
 from contextlib import ExitStack
 from pathlib import Path
 from threading import Event
@@ -24,6 +25,10 @@ class TesseraNoDataError(RuntimeError):
     pass
 
 
+class TesseraPermanentError(RuntimeError):
+    pass
+
+
 _MP_CTX = mp.get_context("spawn")
 
 _GDAL_CACHEMAX_MB = 256
@@ -36,6 +41,29 @@ _MAX_CONCURRENT_YEARS = getattr(
     "tessera_max_concurrent_years",
     _DEFAULT_MAX_CONCURRENT_YEARS,
 )
+
+# Errors that will not fix themselves on retry (e.g. a zero-byte / truncated
+# upstream file). Matched on message text as a fallback; the EOFError cause
+# check in _is_permanent is the sturdier signal.
+_PERMANENT_MARKERS = ("No data left in file",)
+
+# Transient errors (timeouts, dropped connections, subprocess death) are
+# capped so a deterministic failure can never loop forever.
+_MAX_ATTEMPTS = 3
+
+
+def _is_permanent(exc: BaseException) -> bool:
+    """True if the failure is deterministic (bad/empty upstream data)."""
+    seen = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, EOFError):
+            return True
+        if any(m in str(cur) for m in _PERMANENT_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def tile_bbox(tile: dict) -> tuple[float, float, float, float]:
@@ -183,6 +211,8 @@ def _fetch_and_align_year(
                 "success": True,
                 "error_type": None,
                 "error": None,
+                "permanent": False,
+                "tb": None,
             }
         )
 
@@ -193,6 +223,8 @@ def _fetch_and_align_year(
                 "success": False,
                 "error_type": "no_data",
                 "error": str(exc),
+                "permanent": True,
+                "tb": traceback.format_exc(),
             }
         )
 
@@ -203,6 +235,8 @@ def _fetch_and_align_year(
                 "success": False,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+                "permanent": _is_permanent(exc),
+                "tb": traceback.format_exc(),
             }
         )
 
@@ -383,6 +417,24 @@ def download_tessera(
                 continue
 
             if not result["success"]:
+                if result.get("permanent"):
+                    if result.get("tb"):
+                        logger.error(
+                            f"{tile_id} | TESSERA {year} permanent failure "
+                            f"(bbox={bbox}):\n{result['tb']}"
+                        )
+
+                    aborted = True
+                    pending.clear()
+
+                    finish(year)
+
+                    raise TesseraPermanentError(
+                        f"TESSERA {year}: "
+                        f"{result['error_type']}: "
+                        f"{result['error']}"
+                    )
+
                 if result["error_type"] == "no_data":
                     no_data_errors.append(result["error"])
                 else:
@@ -470,6 +522,12 @@ def download_tessera_with_retry(
             logger.info(f"{tile_id} | TESSERA complete")
             return True
 
+        except TesseraPermanentError as exc:
+            logger.error(
+                f"{tile_id} | TESSERA permanent failure; " f"not retrying: {exc}"
+            )
+            raise
+
         except TesseraNoDataError as exc:
             logger.error(
                 f"{tile_id} | TESSERA has no data for this tile; "
@@ -547,6 +605,20 @@ def download_tessera_until_acquired(
     logger: logging.Logger,
     years: list[int] | None = None,
 ) -> None:
+    """
+    Fetch every missing TESSERA year once and wait for completion.
+
+    This is used for TESSERA_MISSING recovery and is intentionally
+    not time-sensitive. Each year is allowed to run to completion
+    without retrying failed downloads.
+
+    Raises:
+        TesseraNoDataError: the year has no data, or is permanently
+            unreadable (bad upstream file). Callers should REJECT
+            the tile.
+        RuntimeError: a TESSERA subprocess fails or exits without
+            producing output.
+    """
     tile_id = tile["tile_id"]
 
     embeddings_dir = output_dir / "embeddings"
@@ -602,17 +674,17 @@ def download_tessera_until_acquired(
                         del running[year]
 
                         if proc.exitcode != 0:
-                            logger.warning(
-                                f"TESSERA {year}: subprocess died "
-                                f"(exitcode={proc.exitcode}) - retrying"
-                            )
-                        elif not dest.exists():
-                            logger.warning(
-                                f"TESSERA {year}: exited cleanly, "
-                                "no output written - retrying"
+                            reason = f"subprocess died (exitcode={proc.exitcode})"
+                            raise RuntimeError(f"{year}: {reason}")
+
+                        if not dest.exists():
+                            raise RuntimeError(
+                                f"{year}: exited cleanly, no output written"
                             )
 
-                        launch(year)
+                        # Finished and wrote output; the success result
+                        # is still in flight or was already consumed.
+                        continue
 
                 continue
 
@@ -633,6 +705,8 @@ def download_tessera_until_acquired(
                     launch(pending.pop(0))
                 continue
 
+            msg = f"{result['error_type']}: {result['error']}"
+
             if result["error_type"] == "no_data":
                 for y, (p, rd, _d) in list(running.items()):
                     _reap(p)
@@ -640,11 +714,15 @@ def download_tessera_until_acquired(
                 running.clear()
                 raise TesseraNoDataError(result["error"])
 
-            logger.warning(
-                f"TESSERA {year}: failed "
-                f"({result['error_type']}: {result['error']}) - retrying"
-            )
-            launch(year)
+            if result.get("permanent"):
+                logger.error(
+                    f"{tile_id} | TESSERA {year} permanent failure "
+                    f"(bbox={bbox}):\n"
+                    f"{result.get('tb') or msg}"
+                )
+                raise TesseraNoDataError(f"{year}: {msg} (bbox={bbox})")
+
+            raise RuntimeError(f"{year}: failed: {msg}")
 
     finally:
         for _year, (proc, raw_dir, _dest) in list(running.items()):

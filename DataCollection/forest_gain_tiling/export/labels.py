@@ -36,7 +36,6 @@ def submit_label_exports(
             folder=settings.drive_folder,
             fileNamePrefix=prefix,
             region=geom,
-            scale=settings.scale,
             crs=settings.crs_wkt,
             crsTransform=crs_transform,
             maxPixels=10_000_000_000_000,

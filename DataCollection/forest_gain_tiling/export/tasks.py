@@ -15,7 +15,7 @@ import ee
 from config import settings
 from enums import TileStatus
 from export.aee import submit_aee_exports
-from export.composites import submit_composite_exports
+from export.composites import s2_all_years_valid, submit_composite_exports
 from export.drive import (
     check_hpc_available,
     rclone_all_products,
@@ -30,9 +30,9 @@ from gee.cleanup import _cleanup_failed_tile
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
 from registry.store import _get_db, update_tile
-from stack.stacks import build_full_valid
 from tessera.tessera import (
     TesseraNoDataError,
+    TesseraPermanentError,
     download_tessera_until_acquired,
     download_tessera_with_retry,
 )
@@ -40,7 +40,7 @@ from tiling.grid import crs_transform, tile_geom
 
 
 def get_local_output_dir(tile_id: str) -> Path:
-    return settings.data_dir / "test_tiles_2" / tile_id
+    return settings.data_dir / "test_tiles" / tile_id
 
 
 def get_tessera_scratch_dir() -> Path:
@@ -182,7 +182,7 @@ def process_tile(
 
     try:
         _, _, gain_confidence = build_gain_layer(geom, ds)
-        full_valid = build_full_valid(geom)
+        full_valid = s2_all_years_valid(geom, settings.years).selfMask().rename("valid")
 
         tasks.update(submit_composite_exports(geom, ct, full_valid, tile_id))
         tasks.update(submit_static_exports(geom, ct, full_valid, tile_id))
@@ -213,6 +213,8 @@ def process_tile(
         tessera_scratch = None if local_output else get_tessera_scratch_dir()
         tessera_target_dir = output_dir if local_output else tessera_scratch
 
+        tessera_error: list[BaseException] = []
+
         def _run_tessera() -> None:
             try:
                 if tessera_scratch is not None:
@@ -224,19 +226,21 @@ def process_tile(
                         exist_ok=True,
                     )
 
-                # TESSERA is best-effort. A failure here must not cancel
-                # the GEE exports or trigger tile cleanup.
                 try:
                     download_tessera_with_retry(
                         tile,
                         tessera_target_dir,
                         logger,
                         cancel_event,
+                        years=settings.years,
                     )
-                except Exception:
-                    logger.exception(f"{tile_id} | TESSERA fetch crashed")
+                except TesseraPermanentError as exc:
+                    tessera_error.append(exc)
+                    logger.exception(f"{tile_id} | TESSERA permanent failure")
+                except Exception as exc:
+                    tessera_error.append(exc)
+                    logger.exception(f"{tile_id} | TESSERA fetch failed")
 
-                # Salvage every TESSERA year that was downloaded.
                 if tessera_scratch is not None:
                     scratch_tessera_dir = tessera_scratch / "embeddings"
 
@@ -298,6 +302,9 @@ def process_tile(
         rclone_completed = rclone_ok
 
         t_tessera.join()
+
+        if tessera_error:
+            raise tessera_error[0]
 
         if not rclone_ok:
             logger.error(

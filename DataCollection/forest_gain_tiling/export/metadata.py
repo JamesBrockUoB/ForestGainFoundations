@@ -396,6 +396,76 @@ def _fetch_esri_transition_stats(
     return {"n_gain_pixels": n_gain, "classes": classes}
 
 
+def _fetch_dt_gain_stats(
+    year_start: int,
+    year_end: int,
+    src,
+) -> dict[str, float | int | None]:
+    """
+    Mean Dynamic Tree Cover over pixels satisfying the DT tree-gain
+    definition:
+
+        DT cover at year_start < 20%
+        DT cover at year_end   > 50%
+
+    DT source values are converted from the 0-255 encoding to
+    fractional percentage (0-100).
+    """
+    datasets = Datasets()
+
+    dt_start = (
+        datasets.get_dt_cover(year_start)
+        .select([0])
+        .divide(2.55)
+        .rename("dt_cover_start")
+    )
+
+    dt_end = (
+        datasets.get_dt_cover(year_end).select([0]).divide(2.55).rename("dt_cover_end")
+    )
+
+    dt_img = dt_start.addBands(dt_end)
+    grid = _grid_from_raster(src)
+
+    arr = ee.data.computePixels(
+        {
+            "expression": dt_img,
+            "fileFormat": "NUMPY_NDARRAY",
+            "grid": grid,
+        }
+    )
+
+    dt_start_arr = arr["dt_cover_start"]
+    dt_end_arr = arr["dt_cover_end"]
+
+    valid = (
+        np.isfinite(dt_start_arr)
+        & np.isfinite(dt_end_arr)
+        & (dt_start_arr < 20.0)
+        & (dt_end_arr > 50.0)
+    )
+
+    n_gain = int(valid.sum())
+
+    if n_gain == 0:
+        return {
+            "n_dt_gain_pixels": 0,
+            "mean_dt_cover_start_pct": None,
+            "mean_dt_cover_end_pct": None,
+            "mean_dt_cover_gain_pct": None,
+        }
+
+    start_mean = float(dt_start_arr[valid].mean())
+    end_mean = float(dt_end_arr[valid].mean())
+
+    return {
+        "n_dt_gain_pixels": n_gain,
+        "mean_dt_cover_start_pct": start_mean,
+        "mean_dt_cover_end_pct": end_mean,
+        "mean_dt_cover_gain_pct": end_mean - start_mean,
+    }
+
+
 def _compute_tile_metadata(
     tile: dict,
     gain_confidence_bytes: bytes,
@@ -423,6 +493,16 @@ def _compute_tile_metadata(
             "gain_pct": float(gain_pixels.mean()) * 100,
             "exported_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        try:
+            metadata["dt_gain"] = _fetch_dt_gain_stats(
+                year_start=settings.year_start,
+                year_end=settings.year_end,
+                src=src,
+            )
+        except Exception as exc:
+            metadata["dt_gain"] = None
+            metadata["dt_gain_error"] = str(exc)
 
         try:
             metadata["soil"] = _fetch_soil(tile_geom(tile))

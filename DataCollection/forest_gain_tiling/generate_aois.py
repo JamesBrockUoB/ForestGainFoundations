@@ -11,7 +11,10 @@ Environment
   BATCH_SIZE=50       — AOIs per processing batch
   AOI_STEP=0.1       — AOI grid size in degrees
   SEARCH_MODE=asset    — derive search bounds from DT assets
-  CLOUD_SCORE_THRESH=0.6 — Cloud Score+ cs_cdf threshold for S2 masking
+
+Cloud/snow masking, scene prefilter and observation thresholds come from
+export.composites / settings (cloud_score_thresh, min_s1_observations),
+so the AOI stage and tile stage use identical definitions.
 
 Usage
 -----
@@ -26,9 +29,10 @@ Validity checks
 ---------------
   • Land coverage
   • ≥1% Dynamic World vegetation (at the END year, checking for sufficient vegetation by end of study period)
-  • S2: pixel coverage (Cloud Score+ masked, full year) ≥ MIN_IMAGERY_FRACTION
+  • S2: pixel coverage (cloud+snow masked, ≥ min_s1_observations clear
+    observations, full year) ≥ MIN_IMAGERY_FRACTION, every year
   • S1: ≥ settings.min_s1_observations qualifying acquisitions, every year
-  • ≥0.1% forest gain between the start and end year
+  • ≥1% forest gain between the start and end year
 
 Output fields include
 ---------------------
@@ -50,6 +54,7 @@ from pathlib import Path
 import ee
 from config import settings
 from dotenv import load_dotenv
+from export.composites import s1_observation_count, s2_availability
 from gee.auth import get_ee_credentials
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
@@ -80,18 +85,12 @@ MIN_VEG_FRACTION = 0.01
 MIN_LAND_FRACTION = 0.01
 MIN_GAIN_FRACTION = 0.01
 
+# Coarse AOI-level S2 coverage gate (scale=500 mean, worst year). The strict
+# 99% requirement is enforced per tile in the tile imagery stage.
 MIN_IMAGERY_FRACTION = 0.05
-
-S2_BANDS = [settings.s2_check_band]
 
 DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
 DW_VEGETATED_LABELS = [1, 2, 3, 4, 5]  # trees, grass, flooded_veg, crops, shrub/scrub
-
-# Cloud Score+ — cs_cdf is the calibrated variant Google recommends thresholding against;
-# 0.6 is a starting default
-CLOUD_SCORE_PLUS_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
-CLOUD_SCORE_PLUS_BAND = "cs_cdf"
-CLOUD_SCORE_THRESH = float(os.getenv("CLOUD_SCORE_THRESH", "0.6"))
 
 # Real coverage footprint of the dt_tree_cover assets, derived from
 # where the product actually has nonzero values -- not the asset's
@@ -211,13 +210,13 @@ def _build_gee_datasets():
     _cover_start = load_dt_mosaic(YEAR_START)
     _cover_end = load_dt_mosaic(YEAR_END)
 
-    _forest_start = _cover_start.gt(settings.non_tree_threshold_frac).unmask(0)
+    _non_forest_start = _cover_start.lt(settings.non_tree_threshold_frac).unmask(0)
     _forest_end = _cover_end.gt(settings.min_tree_threshold_frac).unmask(0)
 
-    _gain_mask = _forest_start.Not().And(_forest_end).rename("gain").unmask(0)
+    _gain_mask = _non_forest_start.And(_forest_end).rename("gain")
 
     _dw_label_start = _dw_label_mode(YEAR_START)
-    _dt_non_forest_start = _forest_start.Not().rename("dt_non_forest_start")
+    _dt_non_forest_start = _non_forest_start.rename("dt_non_forest_start")
     _dw_forest_like = _dw_label_start.eq(1).Or(
         _dw_label_start.eq(3)
     )  # trees OR flooded_vegetation
@@ -334,57 +333,14 @@ def atomic_json_write(path, obj, indent=None):
     tmp.replace(path)
 
 
-def _join_cloud_score_plus(ic, geom, start, end):
-    """Link Cloud Score+ QA band onto each S2 image via
-    ImageCollection.linkCollection — Google's recommended pattern for
-    this dataset. The linked band is attached directly as a band on
-    each image, matched by system:index, rather than nested behind a
-    property lookup (the older Join.saveFirst pattern this replaces)."""
-    cs_col = (
-        ee.ImageCollection(CLOUD_SCORE_PLUS_COLLECTION)
-        .filterDate(start, end)
-        .filterBounds(geom)
-    )
-    return ic.linkCollection(cs_col, [CLOUD_SCORE_PLUS_BAND])
-
-
-def mask_s2_cloud_score_plus(img):
-    """Mask using the linked Cloud Score+ cs_cdf band — a plain band on
-    img after linkCollection, no unwrapping needed."""
-    cs = img.select(CLOUD_SCORE_PLUS_BAND)
-    return img.updateMask(cs.gte(CLOUD_SCORE_THRESH))
-
-
-def _s2_year_valid_mask(geom, start, end, bands):
-    """
-    Per-pixel indicator of whether geom is covered by at least one
-    Cloud Score+ unmasked S2 image within [start, end), for the given
-    bands. Uses ImageCollection.count() (a native collection-level
-    reducer) rather than a per-image map+max reduction, and applies the
-    CLOUDY_PIXEL_PERCENTAGE scene-level prefilter before the Cloud
-    Score+ link so near-fully-cloudy scenes are dropped before the
-    per-pixel work runs at all.
-    """
-    col = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterDate(start, end)
-        .filterBounds(geom)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
-    )
-    col = _join_cloud_score_plus(col, geom, start, end)
-    col = col.map(mask_s2_cloud_score_plus).select(bands)
-
-    counts = col.select(bands[0]).count()
-    return counts.gt(0).unmask(0).rename("valid")
-
-
 def build_year_sensor_masks_combined(
     batch_geom, year_start=YEAR_START, year_end=YEAR_END
 ):
     """
     Combined multi-band S2 coverage image: one band per year
-    (s2_<year>), each built once against the batch-wide geometry. Bands
-    are reduced together in a single reduceRegions call downstream
+    (s2_<year>), each built once against the batch-wide geometry using the
+    shared composites.s2_availability (scene prefilter, Cloud Score+ and
+    snow masking). Bands are reduced together in a single reduceRegions call downstream
     instead of one call per year — trades N separate EE round-trips
     (each paying its own queueing/compute overhead) for one larger call,
     which wins when per-call overhead dominates rather than per-call
@@ -393,34 +349,23 @@ def build_year_sensor_masks_combined(
     pipeline for the opposite case, where pixel volume dominates and
     splitting by year is the correct call instead).
     """
-    bands = []
-    for year in range(year_start, year_end + 1):
-        start, end = f"{year}-01-01", f"{year + 1}-01-01"
-        mask = _s2_year_valid_mask(batch_geom, start, end, S2_BANDS)
-        bands.append(mask.rename(f"s2_{year}"))
+    bands = [
+        s2_availability(batch_geom, year).rename(f"s2_{year}")
+        for year in range(year_start, year_end + 1)
+    ]
     return ee.Image.cat(bands)
 
 
 def s1_scene_counts_for_batch(fc: ee.FeatureCollection, year: int) -> dict[str, int]:
     """
-    Acquisition-level S1 scene count per AOI feature, for one year. Same
-    qualifying filters as composites.s1_observation_count (IW mode, dual
-    VV/VH polarisation), batched across the whole FeatureCollection in a
-    single getInfo() call rather than one call per AOI.
+    Acquisition-level S1 scene count per AOI feature, for one year, using
+    the same qualifying filters as composites.s1_observation_count,
+    batched across the whole FeatureCollection in a single getInfo() call
+    rather than one call per AOI.
     """
-    start, end = f"{year}-01-01", f"{year + 1}-01-01"
-
-    col = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterDate(start, end)
-        .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
-    )
 
     def _count_for_feature(f):
-        n = col.filterBounds(f.geometry()).size()
-        return f.set("s1_count", n)
+        return f.set("s1_count", s1_observation_count(f, year))
 
     fc_counted = fc.map(_count_for_feature)
     info = _reduce_regions_getinfo_with_retry(fc_counted)
@@ -1024,7 +969,7 @@ def _worker(batch_queue, result_queue, worker_id):
                     wait = (2**attempt) + random.uniform(0, 2)
                     logger.warning(
                         f"Worker {worker_id} | Batch {batch_idx} | "
-                        f"Rate limited, retry {attempt+1}/5 in {wait:.1f}s"
+                        f"Rate limited, retry {attempt+1}/8 in {wait:.1f}s"
                     )
                     time.sleep(wait)
                 else:

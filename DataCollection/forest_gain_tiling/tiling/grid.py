@@ -49,6 +49,34 @@ def crs_transform(tile: dict) -> list[float]:
     return [s, 0, tile["x_min_m"], 0, -s, tile["y_max_m"]]
 
 
+def common_grid_transform(tiles: list[dict]) -> list[float]:
+    if not tiles:
+        raise ValueError("Cannot build a grid transform from an empty tile list")
+
+    s = settings.scale
+
+    x0 = tiles[0]["x_min_m"]
+    y0 = tiles[0]["y_max_m"]
+
+    for tile in tiles[1:]:
+        dx_pixels = (tile["x_min_m"] - x0) / s
+        dy_pixels = (tile["y_max_m"] - y0) / s
+
+        if not math.isclose(dx_pixels, round(dx_pixels), abs_tol=1e-8):
+            raise ValueError(
+                f"Tile x origin is not aligned to the {s} m pixel grid: "
+                f"{tile['x_min_m']}"
+            )
+
+        if not math.isclose(dy_pixels, round(dy_pixels), abs_tol=1e-8):
+            raise ValueError(
+                f"Tile y origin is not aligned to the {s} m pixel grid: "
+                f"{tile['y_max_m']}"
+            )
+
+    return [s, 0, x0, 0, -s, y0]
+
+
 def build_grid(
     valid_aois: list[dict], logger: logging.Logger
 ) -> Generator[dict[str, Any], None, None]:

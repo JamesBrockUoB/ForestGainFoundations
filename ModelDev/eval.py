@@ -6,47 +6,65 @@ import torchmetrics
 from datasets import MultiTemporalGainDataset
 from lightning_module import GainDetectionTask
 from torch.utils.data import DataLoader
-
-
-def _device():
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+from utils import get_device
 
 
 def evaluate_checkpoint(
     checkpoint_path: str,
-    test_dirs: list[Path],
+    test_dir: str | Path,
     threshold: float = 0.5,
     crop_size: int | None = None,
+    batch_size: int = 4,
+    num_workers: int = 2,
 ):
-    device = _device()
-    task = GainDetectionTask.load_from_checkpoint(checkpoint_path, map_location=device)
+    test_dir = Path(test_dir)
+    test_dirs = sorted(
+        p for p in test_dir.iterdir() if p.is_dir() and p.name.startswith("tile_")
+    )
+
+    if not test_dirs:
+        raise ValueError(f"No tile_* directories found in {test_dir}")
+
+    print(f"Evaluating {len(test_dirs)} tiles from {test_dir}")
+
+    device = get_device()
+
+    task = GainDetectionTask.load_from_checkpoint(
+        checkpoint_path,
+        map_location=device,
+    )
     task.eval()
     task.freeze()
     task.to(device)
 
     test_ds = MultiTemporalGainDataset(test_dirs, crop_size=crop_size)
-    test_loader = DataLoader(test_ds, batch_size=4, shuffle=False, num_workers=2)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
 
     kw = {"task": "binary", "threshold": threshold}
-    f1 = torchmetrics.F1Score(**kw)
-    iou = torchmetrics.JaccardIndex(**kw)
-    prec = torchmetrics.Precision(**kw)
-    rec = torchmetrics.Recall(**kw)
+    metrics = {
+        "f1": torchmetrics.F1Score(**kw).to(device),
+        "iou": torchmetrics.JaccardIndex(**kw).to(device),
+        "precision": torchmetrics.Precision(**kw).to(device),
+        "recall": torchmetrics.Recall(**kw).to(device),
+    }
 
     with torch.no_grad():
         for batch in test_loader:
-            logits = task(batch["pixels"].to(device))
-            probs = torch.sigmoid(logits).cpu()
+            x = batch["pixels"].to(device=device, dtype=torch.float32)
+            logits = task(x)
+            probs = torch.sigmoid(logits)
 
             if probs.ndim == 4 and probs.shape[1] == 1:
                 probs = probs.squeeze(1)
 
-            valid = batch["gain_valid"] > 0.5
-            targets = (batch["gain_mask"] > 0.5).int()
+            # Move valid mask and targets to device (mps)
+            valid = (batch["gain_valid"] > 0.5).to(device)
+            targets = (batch["gain_mask"] > 0.5).int().to(device)
 
             p = probs[valid]
             t = targets[valid]
@@ -54,17 +72,10 @@ def evaluate_checkpoint(
             if t.numel() == 0:
                 continue
 
-            # TorchMetrics applies the probability threshold itself.
-            for metric in (f1, iou, prec, rec):
+            for metric in metrics.values():
                 metric.update(p, t)
 
-    results = {
-        "f1": f1.compute().item(),
-        "iou": iou.compute().item(),
-        "precision": prec.compute().item(),
-        "recall": rec.compute().item(),
-    }
-
+    results = {name: metric.compute().item() for name, metric in metrics.items()}
     print(" | ".join(f"{k}: {v:.3f}" for k, v in results.items()))
     return results
 
@@ -76,13 +87,20 @@ def generate_gain_map(
     crop_size: int | None = None,
 ):
     """Gain probability GeoTIFF for one tile (center crop if crop_size is set)."""
-    device = _device()
+    device = get_device()
     task = GainDetectionTask.load_from_checkpoint(checkpoint_path, map_location=device)
     task.eval()
     task.to(device)
 
     ds = MultiTemporalGainDataset([tile_dir], crop_size=crop_size)
-    pixels = ds[0]["pixels"].unsqueeze(0).to(device)  # (1, T, C, H, W)
+    pixels = (
+        ds[0]["pixels"]
+        .unsqueeze(0)
+        .to(
+            device=device,
+            dtype=torch.float32,
+        )
+    )
 
     with torch.no_grad():
         probs = torch.sigmoid(task(pixels)).squeeze().cpu().numpy()  # (H, W)

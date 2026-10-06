@@ -163,7 +163,7 @@ class TSViT(nn.Module):
         patches = patches.flatten(2).transpose(1, 2)
 
         # 1. Temporal Attention across N sequence frames
-        temporal_tokens = patches.view(b, t, self.num_patches, -1)
+        temporal_tokens = patches.reshape(b, t, self.num_patches, -1)
         temporal_tokens = (
             temporal_tokens.permute(0, 2, 1, 3)
             .contiguous()

@@ -1,8 +1,7 @@
 .DS_Store
 .env
 
-*/data/test_tiles*
-*/data/inspector_tiles
+*/data/*tiles*
 
 **/logs/
 
@@ -31,3 +30,5 @@ build/*
 *DataCollection/dt_plots*
 
 */predictions/*
+
+*checkpoints*

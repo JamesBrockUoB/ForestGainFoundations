@@ -35,7 +35,7 @@ def sweep_train():
     config = wandb.config
 
     # Test tiles are never used here, so sweeps can't leak into the held-out set
-    train_dirs, val_dirs, _ = split_tile_dirs(DATA_DIR, seed=0)
+    train_dirs, val_dirs = split_tile_dirs(DATA_DIR, seed=0)
 
     train_ds = MultiTemporalGainDataset(train_dirs, augment=True)
     val_ds = MultiTemporalGainDataset(val_dirs)

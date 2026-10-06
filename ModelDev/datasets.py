@@ -19,25 +19,11 @@ from config import (
 from torch.utils.data import Dataset
 
 
-def _bucket(name: str) -> float:
-    """Stable value in [0, 1) from the folder name (md5, not Python's salted hash())."""
-    return int(hashlib.md5(name.encode()).hexdigest(), 16) % 10_000 / 10_000
-
-
-def split_tile_dirs(data_dir, val_frac=0.1, test_frac=0.1, seed=0):
-    """
-    Returns (train, val, test).
-    Test membership depends only on the tile's folder name, so it is fixed
-    across seeds and stays fixed as new tiles are added.
-    Train/val are split from the remainder with the seed.
-    """
+def split_tile_dirs(data_dir, val_frac=0.2, seed=0):
     tile_dirs = sorted(p for p in Path(data_dir).iterdir() if p.is_dir())
-    test = [d for d in tile_dirs if _bucket(d.name) < test_frac]
-    rest = [d for d in tile_dirs if _bucket(d.name) >= test_frac]
-
-    random.Random(seed).shuffle(rest)
-    n_val = int(round(val_frac * len(tile_dirs)))
-    return rest[n_val:], rest[:n_val], test
+    random.Random(seed).shuffle(tile_dirs)
+    n_val = max(1, round(val_frac * len(tile_dirs)))
+    return tile_dirs[n_val:], tile_dirs[:n_val]
 
 
 def read_physical(path: Path, band_names) -> np.ndarray:
@@ -79,7 +65,7 @@ class MultiTemporalGainDataset(Dataset):
         repeats: int = 1,
         gain_sigma: float = 0.03,
         frame_sigma: float = 0.01,
-        frame_drop_p: float = 0.1,
+        frame_drop_p: float = 0.0,
         label_sigma: float = 0.0,
     ):
         """

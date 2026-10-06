@@ -6,10 +6,14 @@ import time
 from config import settings
 from enums import TileStatus
 from filtering.raster_stats import (
+    GAIN_VALID_BAND,
+    S1_BAND_NAMES,
+    S2_BAND_NAMES,
     check_tessera_coverage,
     fetch_cheap_stats,
     fetch_imagery_stats,
 )
+from gee_datasets.registry import Datasets
 from registry.store import update_tile
 
 
@@ -42,15 +46,29 @@ def evaluate_cheap_stats(
 def evaluate_imagery_stats(
     stats: dict[str, float | None], logger: logging.Logger | None = None
 ) -> str | None:
+    # 1) Per-year S2 and S1 coverage only
     low = {
-        b: v
-        for b, v in stats.items()
-        if v is None or v < settings.imagery_min_valid_frac
+        b: stats.get(b)
+        for b in S2_BAND_NAMES + S1_BAND_NAMES
+        if stats.get(b) is None or stats[b] < settings.imagery_min_valid_frac
     }
+    logger.info(
+        "imagery stats: "
+        f"s2_min={min(stats[b] for b in S2_BAND_NAMES):.3f} "
+        f"gain_valid={stats.get(GAIN_VALID_BAND)}"
+    )
     if low:
         if logger:
             logger.debug(f"low_imagery_coverage: {low}")
         return "low_imagery_coverage"
+
+    # 2) Gain that survives the export mask (valid pixels only)
+    gain_valid = stats.get(GAIN_VALID_BAND)
+    if gain_valid is None or gain_valid * 100.0 < settings.gain_pct_min:
+        if logger:
+            logger.debug(f"low_valid_gain: {gain_valid}")
+        return "low_valid_gain"
+
     return None
 
 
@@ -70,7 +88,7 @@ def filter_batch_cheap(
             logger=logger,
         )
 
-        logger.debug(
+        logger.info(
             f"  {batch_label} TESSERA coverage check: "
             f"{time.time()-t0:.1f}s | "
             f"covered={len(covered_tiles)} | "
@@ -121,7 +139,7 @@ def filter_batch_cheap(
 
     try:
         stats_by_tile = fetch_cheap_stats(covered_tiles, ds)
-        logger.debug(f"  {batch_label} cheap fetch: {time.time()-t0:.1f}s")
+        logger.info(f"  {batch_label} cheap fetch: {time.time()-t0:.1f}s")
 
     except Exception as exc:
         logger.error(
@@ -189,13 +207,15 @@ def filter_batch_imagery(
     tiles: list[dict],
     logger: logging.Logger,
     batch_label: str = "",
+    ds: Datasets | None = None,
 ) -> dict[str, int]:
     logger.debug(f"{batch_label} imagery: {len(tiles)} tiles")
 
+    ds = ds or Datasets()
     t0 = time.time()
 
     try:
-        stats_by_tile = fetch_imagery_stats(tiles)
+        stats_by_tile = fetch_imagery_stats(tiles, ds)
     except Exception as exc:
         logger.error(
             f"  {batch_label} imagery fetch failed after "

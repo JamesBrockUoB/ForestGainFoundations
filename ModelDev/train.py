@@ -1,5 +1,6 @@
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytorch_lightning as pl
@@ -27,10 +28,12 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data_dir", type=str, default="../DataCollection/data/test_tiles")
+    p.add_argument(
+        "--holdout_dir", type=str, default="../DataCollection/data/holdout_tiles"
+    )
 
     # Split
-    p.add_argument("--val_frac", type=float, default=0.1)
-    p.add_argument("--test_frac", type=float, default=0.1)
+    p.add_argument("--val_frac", type=float, default=0.2)
 
     # Loss
     p.add_argument("--tversky_alpha", type=float, default=0.7)
@@ -55,32 +58,29 @@ def parse_args():
 def train(args):
     pl.seed_everything(args.seed, workers=True)
 
-    train_dirs, val_dirs, test_dirs = split_tile_dirs(
+    train_dirs, val_dirs = split_tile_dirs(
         args.data_dir,
         val_frac=args.val_frac,
-        test_frac=args.test_frac,
         seed=args.seed,
     )
-    print(
-        f"train tiles: {len(train_dirs)} | val tiles: {len(val_dirs)} "
-        f"| test tiles: {len(test_dirs)}"
-    )
+    print(f"train tiles: {len(train_dirs)} | val tiles: {len(val_dirs)} ")
 
-    run_name = f"{args.model_type}_{args.loss_type}_seed{args.seed}"
+    run_name = "_".join(
+        [
+            args.model_type,
+            args.loss_type,
+            f"crop{args.crop_size or 'full'}",
+            f"bs{args.batch_size}",
+            f"lr{args.learning_rate:g}",
+            f"wd{args.weight_decay:g}",
+            f"rep{args.repeats}",
+            f"seed{args.seed}",
+            datetime.now().strftime("%m%d-%H%M"),
+        ]
+    )
     ckpt_dir = Path("checkpoints") / run_name
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # Record the exact split next to the checkpoints (absolute paths)
-    (ckpt_dir / "splits.json").write_text(
-        json.dumps(
-            {
-                "train": [str(p.resolve()) for p in train_dirs],
-                "val": [str(p.resolve()) for p in val_dirs],
-                "test": [str(p.resolve()) for p in test_dirs],
-            },
-            indent=2,
-        )
-    )
+    ckpt_dir.mkdir(parents=True, exist_ok=False)
+    (ckpt_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
 
     crop = args.crop_size or None
     img_size = crop or DEFAULT_IMAGE_SIZE
@@ -153,9 +153,13 @@ def train(args):
     print(f"best checkpoint: {best} | val_iou: {float(cb.best_model_score):.3f}")
 
     # Test set is touched once, with the checkpoint chosen on val
-    if test_dirs and best:
+    if best:
         print("--- test set ---")
-        results = evaluate_checkpoint(best, test_dirs, crop_size=crop)
+        results = evaluate_checkpoint(
+            best,
+            test_dir=Path(args.holdout_dir),
+            crop_size=crop,
+        )
         logger.log_metrics({f"test_{k}": v for k, v in results.items()})
 
 

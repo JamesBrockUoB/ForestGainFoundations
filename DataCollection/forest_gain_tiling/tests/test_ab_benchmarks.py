@@ -154,7 +154,7 @@ def _build_base_ic(geom: ee.Geometry, year: int, apply_scene_prefilter: bool):
     end = f"{year + 1}-01-01"
     ic = ee.ImageCollection(S2_COLLECTION).filterDate(start, end).filterBounds(geom)
     if apply_scene_prefilter:
-        ic = ic.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
+        ic = ic.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
     return ic
 
 

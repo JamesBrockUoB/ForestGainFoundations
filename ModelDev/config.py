@@ -43,7 +43,7 @@ NORM_STATS: dict[str, tuple[float, float]] = {
 }
 
 NORM_CLIP = (-1.0, 2.0)
-NORM_NAN_FILL = 0.5  # normalised value used for NaN/inf pixels (mid-range)
+NORM_NAN_FILL = 0.5
 
 NUM_INPUT_CHANNELS = len(BACKBONE_BAND_INDICES)
 
