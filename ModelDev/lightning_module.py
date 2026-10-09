@@ -24,6 +24,7 @@ class GainDetectionTask(pl.LightningModule):
         tversky_gamma: float = 0.75,
         pos_weight: float | None = None,
         eval_threshold: float = 0.50,
+        sources: tuple[str, ...] = ("s1", "s2"),
         **model_kwargs,
     ):
         super().__init__()
@@ -33,6 +34,7 @@ class GainDetectionTask(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_frac = warmup_frac
         self.eval_threshold = eval_threshold
+        self.sources = tuple(sources)  # stored so eval can rebuild the right dataset
 
         self.model = build_model(
             model_type=model_type,

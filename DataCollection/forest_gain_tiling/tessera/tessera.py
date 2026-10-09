@@ -126,7 +126,7 @@ def _align_to_tile_grid(
                     src_crs=src.crs,
                     dst_transform=dst_transform,
                     dst_crs=settings.crs_wkt,
-                    resampling=Resampling.bilinear,
+                    resampling=Resampling.nearest,
                     dst_nodata=np.nan,
                 )
 
@@ -402,9 +402,7 @@ def download_tessera(
                                 f"(exitcode={proc.exitcode})"
                             )
                         elif not dest.exists():
-                            errors.append(
-                                f"{year}: exited cleanly, " "no output written"
-                            )
+                            errors.append(f"{year}: exited cleanly, no output written")
 
                         finish(year)
 
@@ -418,9 +416,11 @@ def download_tessera(
 
             if not result["success"]:
                 if result.get("permanent"):
+                    # One-line error is raised below and logged once by the
+                    # caller; the full traceback is DEBUG-only.
                     if result.get("tb"):
-                        logger.error(
-                            f"{tile_id} | TESSERA {year} permanent failure "
+                        logger.debug(
+                            f"{tile_id} | TESSERA {year} traceback "
                             f"(bbox={bbox}):\n{result['tb']}"
                         )
 
@@ -428,6 +428,15 @@ def download_tessera(
                     pending.clear()
 
                     finish(year)
+
+                    # Stop any other years still running; the tile is dead.
+                    for (
+                        _y,
+                        (proc, scratch_dir, _dest, _launched_at),
+                    ) in list(running.items()):
+                        _reap(proc)
+                        shutil.rmtree(scratch_dir, ignore_errors=True)
+                    running.clear()
 
                     raise TesseraPermanentError(
                         f"TESSERA {year}: "
@@ -523,9 +532,8 @@ def download_tessera_with_retry(
             return True
 
         except TesseraPermanentError as exc:
-            logger.error(
-                f"{tile_id} | TESSERA permanent failure; " f"not retrying: {exc}"
-            )
+            # Single line, no traceback. The caller rejects the tile.
+            logger.error(f"{tile_id} | TESSERA permanent failure, not retrying: {exc}")
             raise
 
         except TesseraNoDataError as exc:
@@ -538,7 +546,7 @@ def download_tessera_with_retry(
         except Exception as exc:
             logger.error(f"{tile_id} | TESSERA failed: {exc}")
 
-        if attempt < retries:
+        if attempt < retries + 1:
             wait = 2**attempt + 1
 
             logger.warning(
@@ -715,10 +723,10 @@ def download_tessera_until_acquired(
                 raise TesseraNoDataError(result["error"])
 
             if result.get("permanent"):
-                logger.error(
-                    f"{tile_id} | TESSERA {year} permanent failure "
-                    f"(bbox={bbox}):\n"
-                    f"{result.get('tb') or msg}"
+                # One-line error via the raised exception; traceback DEBUG-only.
+                logger.debug(
+                    f"{tile_id} | TESSERA {year} traceback "
+                    f"(bbox={bbox}):\n{result.get('tb') or msg}"
                 )
                 raise TesseraNoDataError(f"{year}: {msg} (bbox={bbox})")
 

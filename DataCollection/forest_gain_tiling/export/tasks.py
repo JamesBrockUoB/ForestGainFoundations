@@ -40,7 +40,7 @@ from tiling.grid import crs_transform, tile_geom
 
 
 def get_local_output_dir(tile_id: str) -> Path:
-    return settings.data_dir / "test_tiles" / tile_id
+    return settings.data_dir / "holdout_tiles" / tile_id
 
 
 def get_tessera_scratch_dir() -> Path:
@@ -221,10 +221,7 @@ def process_tile(
                     if tessera_scratch.exists():
                         shutil.rmtree(tessera_scratch)
 
-                    tessera_scratch.mkdir(
-                        parents=True,
-                        exist_ok=True,
-                    )
+                    tessera_scratch.mkdir(parents=True, exist_ok=True)
 
                 try:
                     download_tessera_with_retry(
@@ -235,21 +232,25 @@ def process_tile(
                         years=settings.years,
                     )
                 except TesseraPermanentError as exc:
+                    # Already logged (one line) by the TESSERA layer. The tile can
+                    # never complete, so stop the GEE wait immediately instead of
+                    # polling exports that will be thrown away.
                     tessera_error.append(exc)
-                    logger.exception(f"{tile_id} | TESSERA permanent failure")
+                    cancel_event.set()
                 except Exception as exc:
                     tessera_error.append(exc)
-                    logger.exception(f"{tile_id} | TESSERA fetch failed")
+                    logger.error(
+                        f"{tile_id} | TESSERA fetch failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.debug(f"{tile_id} | TESSERA traceback", exc_info=True)
 
                 if tessera_scratch is not None:
                     scratch_tessera_dir = tessera_scratch / "embeddings"
 
                     if scratch_tessera_dir.exists():
                         final_tessera_dir = output_dir / "embeddings"
-                        final_tessera_dir.mkdir(
-                            parents=True,
-                            exist_ok=True,
-                        )
+                        final_tessera_dir.mkdir(parents=True, exist_ok=True)
 
                         for tif in scratch_tessera_dir.glob("tessera_*.tif"):
                             shutil.move(
@@ -264,11 +265,10 @@ def process_tile(
                             shutil.rmtree(tessera_scratch)
                     except FileNotFoundError:
                         pass
-                    except Exception:
-                        logger.exception(
-                            "%s | failed to remove TESSERA scratch: %s",
-                            tile_id,
-                            tessera_scratch,
+                    except Exception as exc:
+                        logger.warning(
+                            f"{tile_id} | failed to remove TESSERA scratch "
+                            f"{tessera_scratch}: {exc}"
                         )
 
         t_tessera = threading.Thread(target=_run_tessera)
@@ -281,6 +281,10 @@ def process_tile(
             submitted_times=submitted_times,
             cancel_event=cancel_event,
         ):
+            # Surface the real reason if TESSERA is what killed the wait.
+            t_tessera.join()
+            if tessera_error:
+                raise tessera_error[0]
             raise RuntimeError(
                 "one or more GEE export tasks failed or processing was cancelled"
             )
@@ -407,11 +411,26 @@ def process_tile(
         logger.info(f"{tile_id} | complete")
         return str(TileStatus.COMPLETE)
 
-    except Exception as exc:
-        logger.exception(f"{tile_id} | processing failed")
+    except TesseraPermanentError as exc:
+        # Bad upstream data: retrying cannot help, so reject and move on.
         return _cleanup_failed_tile(
             tile_id=tile_id,
-            reason=str(exc),
+            reason=f"rejected, TESSERA unreadable: {exc}",
+            logger=logger,
+            tasks=tasks,
+            output_dir=output_dir,
+            embeddings_thread=t_tessera,
+            cancel_event=cancel_event,
+            drive_already_cleared=rclone_completed,
+            status=TileStatus.REJECTED,
+            rejection_reason="tessera_unreadable",
+        )
+
+    except Exception as exc:
+        logger.debug(f"{tile_id} | traceback", exc_info=True)
+        return _cleanup_failed_tile(
+            tile_id=tile_id,
+            reason=f"processing failed: {type(exc).__name__}: {exc}",
             logger=logger,
             tasks=tasks,
             output_dir=output_dir,
@@ -547,8 +566,11 @@ def retry_tessera_missing(
                             logger.error(f"{tid} | push of tessera_{y} failed")
             except TesseraNoDataError as exc:
                 logger.error(f"{tid} | no TESSERA coverage, not retrying: {exc}")
-            except Exception:
-                logger.exception(f"{tid} | TESSERA retry crashed")
+            except Exception as exc:
+                logger.error(
+                    f"{tid} | TESSERA retry crashed: {type(exc).__name__}: {exc}"
+                )
+                logger.debug(f"{tid} | traceback", exc_info=True)
             finally:
                 shutil.rmtree(scratch, ignore_errors=True)
 

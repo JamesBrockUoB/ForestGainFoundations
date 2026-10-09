@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytorch_lightning as pl
-from config import DEFAULT_IMAGE_SIZE, NUM_INPUT_CHANNELS
+from config import DEFAULT_IMAGE_SIZE, SOURCES
 from datasets import MultiTemporalGainDataset, split_tile_dirs
 from eval import evaluate_checkpoint
 from lightning_module import GainDetectionTask
@@ -20,6 +20,14 @@ def parse_args():
         type=str,
         default="tsvit",
         choices=["sits_scd", "unet_lstm", "tsvit"],
+    )
+    p.add_argument(
+        "--sources",
+        nargs="+",
+        default=["s1", "s2"],
+        choices=list(SOURCES),
+        help="Input products; channels are concatenated (e.g. alphaearth, "
+        "tessera, s1 s2, s1 s2 alphaearth)",
     )
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=3e-4)
@@ -57,6 +65,7 @@ def parse_args():
 
 def train(args):
     pl.seed_everything(args.seed, workers=True)
+    sources = tuple(args.sources)
 
     train_dirs, val_dirs = split_tile_dirs(
         args.data_dir,
@@ -64,10 +73,12 @@ def train(args):
         seed=args.seed,
     )
     print(f"train tiles: {len(train_dirs)} | val tiles: {len(val_dirs)} ")
+    print(f"sources: {sources}")
 
     run_name = "_".join(
         [
             args.model_type,
+            "+".join(sources),
             args.loss_type,
             f"crop{args.crop_size or 'full'}",
             f"bs{args.batch_size}",
@@ -87,12 +98,13 @@ def train(args):
 
     train_ds = MultiTemporalGainDataset(
         train_dirs,
+        sources=sources,
         augment=not args.no_augment,
         crop_size=crop,
         repeats=args.repeats,
         label_sigma=0.1 if args.loss_type == "soft" else 0.0,
     )
-    val_ds = MultiTemporalGainDataset(val_dirs, crop_size=crop)
+    val_ds = MultiTemporalGainDataset(val_dirs, sources=sources, crop_size=crop)
 
     train_loader = DataLoader(
         train_ds,
@@ -113,7 +125,7 @@ def train(args):
 
     task = GainDetectionTask(
         model_type=args.model_type,
-        in_channels=NUM_INPUT_CHANNELS,
+        in_channels=train_ds.num_channels,
         img_size=img_size,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -123,6 +135,7 @@ def train(args):
         tversky_beta=args.tversky_beta,
         tversky_gamma=args.tversky_gamma,
         pos_weight=args.pos_weight,
+        sources=sources,
     )
 
     logger = pl.loggers.WandbLogger(project="Forest-Gain-CD")

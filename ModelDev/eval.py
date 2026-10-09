@@ -9,6 +9,11 @@ from torch.utils.data import DataLoader
 from utils import get_device
 
 
+def _checkpoint_sources(task) -> tuple[str, ...]:
+    """Input sources the checkpoint was trained on (old checkpoints = s1+s2)."""
+    return tuple(task.hparams.get("sources", ("s1", "s2")))
+
+
 def evaluate_checkpoint(
     checkpoint_path: str,
     test_dir: str | Path,
@@ -37,7 +42,10 @@ def evaluate_checkpoint(
     task.freeze()
     task.to(device)
 
-    test_ds = MultiTemporalGainDataset(test_dirs, crop_size=crop_size)
+    sources = _checkpoint_sources(task)
+    print(f"sources: {sources}")
+
+    test_ds = MultiTemporalGainDataset(test_dirs, sources=sources, crop_size=crop_size)
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
@@ -92,7 +100,9 @@ def generate_gain_map(
     task.eval()
     task.to(device)
 
-    ds = MultiTemporalGainDataset([tile_dir], crop_size=crop_size)
+    ds = MultiTemporalGainDataset(
+        [tile_dir], sources=_checkpoint_sources(task), crop_size=crop_size
+    )
     pixels = (
         ds[0]["pixels"]
         .unsqueeze(0)

@@ -275,10 +275,8 @@ def fetch_imagery_stats(
     ds: Datasets | None = None,
     *,
     chunk_size: int = 10,
-    max_workers: int = 6,
+    max_workers: int = 4,
 ) -> dict[str, dict[str, float | None]]:
-    """One EE job per chunk returning S2 per-year availability, gain_valid_frac
-    and S1 availability together. Chunks run in parallel with retry."""
     ds = ds or Datasets()
     years = settings.years
     s2_names = S2_BAND_NAMES + [GAIN_VALID_BAND]
@@ -305,8 +303,9 @@ def fetch_imagery_stats(
             collection=fc,
             reducer=ee.Reducer.mean(),
             scale=settings.scale,
-            tileScale=8,
+            tileScale=4,
         )
+
         info = reduced.map(add_s1).getInfo()
 
         out = {}
@@ -316,15 +315,20 @@ def fetch_imagery_stats(
                 **{b: p.get(b) for b in s2_names},
                 **{f"s1_{y}": p.get(f"s1_{y}") for y in years},
             }
+
         return out
 
     chunks = [tiles[i : i + chunk_size] for i in range(0, len(tiles), chunk_size)]
+
     results: dict[str, dict[str, float | None]] = {}
     if not chunks:
         return results
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for r in ex.map(lambda c: _with_retry(lambda: one_chunk(c)), chunks):
+        for r in ex.map(
+            lambda c: _with_retry(lambda: one_chunk(c)),
+            chunks,
+        ):
             results.update(r)
 
     return results

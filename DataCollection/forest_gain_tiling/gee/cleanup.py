@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -53,8 +54,6 @@ def _delete_drive_exports(
         )
         return
 
-    import subprocess
-
     for key in tasks:
         try:
             category, name = key.split("/", 1)
@@ -63,36 +62,25 @@ def _delete_drive_exports(
             continue
 
         drive_name = f"{tile_id}__{category}__{name}.tif"
-
-        source = f"{settings.drive_remote}:" f"{settings.drive_folder}/" f"{drive_name}"
+        source = f"{settings.drive_remote}:{settings.drive_folder}/{drive_name}"
 
         result = subprocess.run(
-            [
-                "rclone",
-                "deletefile",
-                source,
-                "--drive-use-trash=false",
-            ],
+            ["rclone", "deletefile", source, "--drive-use-trash=false"],
             capture_output=True,
             text=True,
         )
 
-        if result.returncode == 0:
-            pass
-        else:
+        if result.returncode != 0:
             stderr = (result.stderr or "").strip()
-
-            if (
-                "not found" in stderr.lower()
-                or "object not found" in stderr.lower()
-                or "file not found" in stderr.lower()
+            if any(
+                m in stderr.lower()
+                for m in ("not found", "object not found", "file not found", "404")
             ):
-                pass
-            else:
-                logger.warning(
-                    f"{tile_id} | failed removing Drive export "
-                    f"{drive_name}: {stderr or '<empty>'}"
-                )
+                continue
+            logger.warning(
+                f"{tile_id} | failed removing Drive export "
+                f"{drive_name}: {stderr[:300] or '<empty>'}"
+            )
 
 
 def _cleanup_failed_tile(
@@ -105,7 +93,14 @@ def _cleanup_failed_tile(
     embeddings_thread: threading.Thread | None,
     cancel_event: threading.Event,
     drive_already_cleared: bool = False,
+    status: TileStatus = TileStatus.FAILED,
+    rejection_reason: str | None = None,
 ) -> str:
+    """Cancel/clean everything for a dead tile and record its final status.
+
+    status=FAILED (default) is for transient problems that may be retried.
+    status=REJECTED + rejection_reason is for tiles that can never succeed.
+    """
     logger.error(f"{tile_id} | {reason}")
 
     cancel_event.set()
@@ -121,41 +116,28 @@ def _cleanup_failed_tile(
         embeddings_thread.join()
 
     scratch_dir = settings.data_dir / "tessera_scratch" / tile_id
-
     if scratch_dir.exists():
         try:
-            shutil.rmtree(
-                scratch_dir,
-                ignore_errors=False,
-            )
-
+            shutil.rmtree(scratch_dir, ignore_errors=False)
         except FileNotFoundError:
             pass
-
-        except Exception:
-            logger.exception(
-                f"{tile_id} | failed removing TESSERA scratch: " f"{scratch_dir}"
+        except Exception as exc:
+            logger.warning(
+                f"{tile_id} | failed removing TESSERA scratch {scratch_dir}: {exc}"
             )
 
     if output_dir is not None and output_dir.exists():
         try:
-            shutil.rmtree(
-                output_dir,
-                ignore_errors=False,
-            )
-
+            shutil.rmtree(output_dir, ignore_errors=False)
             logger.info(f"{tile_id} | removed output: {output_dir}")
-
         except FileNotFoundError:
             pass
+        except Exception as exc:
+            logger.warning(f"{tile_id} | failed removing output {output_dir}: {exc}")
 
-        except Exception:
-            logger.exception(f"{tile_id} | failed removing output: " f"{output_dir}")
+    fields: dict = {"status": status, "error": reason}
+    if rejection_reason is not None:
+        fields["rejection_reason"] = rejection_reason
+    update_tile(tile_id, **fields)
 
-    update_tile(
-        tile_id,
-        status=TileStatus.FAILED,
-        error=reason,
-    )
-
-    return str(TileStatus.FAILED)
+    return str(status)

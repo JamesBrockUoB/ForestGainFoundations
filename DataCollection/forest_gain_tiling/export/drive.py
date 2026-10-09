@@ -9,9 +9,11 @@ from config import settings
 
 _drive_folder_lock = threading.Lock()
 
+_NOT_FOUND_MARKERS = ("404", "not found", "notfound", "object not found")
 
-def _build_rclone_base_args() -> list[str]:
-    args = ["rclone", "moveto", "--drive-use-trash=false"]
+
+def _build_rclone_base_args(verb: str = "moveto") -> list[str]:
+    args = ["rclone", verb, "--drive-use-trash=false"]
     if settings.rclone_fast_list:
         args.append("--fast-list")
     if not settings.rclone_verify_checksum:
@@ -26,13 +28,66 @@ def _build_rclone_base_args() -> list[str]:
     return args
 
 
-def _run_rclone_moveto(src: str, dest: str, logger: logging.Logger) -> bool:
-    cmd = _build_rclone_base_args() + [src, dest]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def _is_not_found(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    return any(m in s for m in _NOT_FOUND_MARKERS)
+
+
+def _dest_ok(path: str) -> bool:
+    """True if the destination file exists and is non-empty (local or rclone remote)."""
+    if ":" not in path:
+        p = Path(path)
+        return p.is_file() and p.stat().st_size > 0
+
+    result = subprocess.run(["rclone", "lsjson", path], capture_output=True, text=True)
     if result.returncode != 0:
-        logger.warning(f"rclone failed: {src} -> {dest}: {result.stderr}")
         return False
-    logger.debug(f"rclone complete: {src} -> {dest}")
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return any(not e.get("IsDir") and e.get("Size", 0) > 0 for e in entries)
+
+
+def _copy_then_delete_source(src: str, dest: str, logger: logging.Logger) -> bool:
+    """Transfer success depends on the copy only. Deleting the Drive source is
+    best-effort: a 404 there means it is already gone, and any other failure
+    is logged as a pending cleanup rather than failing the tile."""
+    cp = subprocess.run(
+        _build_rclone_base_args("copyto") + [src, dest],
+        capture_output=True,
+        text=True,
+    )
+
+    if cp.returncode != 0:
+        # Source vanished (e.g. an earlier attempt already moved it) but we
+        # already hold a good copy.
+        if _is_not_found(cp.stderr) and _dest_ok(dest):
+            logger.info(f"Drive source gone but destination present; accepting: {dest}")
+            return True
+        logger.warning(
+            f"rclone copy failed: {src} -> {dest}: {cp.stderr.strip()[:300]}"
+        )
+        return False
+
+    if not _dest_ok(dest):
+        logger.warning(f"rclone copy reported success but {dest} is missing/empty")
+        return False
+
+    rm = subprocess.run(
+        ["rclone", "deletefile", "--drive-use-trash=false", src],
+        capture_output=True,
+        text=True,
+    )
+    if rm.returncode == 0:
+        logger.debug(f"rclone complete: {src} -> {dest}")
+    elif _is_not_found(rm.stderr):
+        logger.info(f"Drive source already removed (copy ok): {src}")
+    else:
+        logger.warning(
+            f"DRIVE CLEANUP PENDING: copied {src} -> {dest} but delete failed: "
+            f"{rm.stderr.strip()[:300]}"
+        )
     return True
 
 
@@ -146,7 +201,8 @@ def rclone_read_bytes(src: str, logger: logging.Logger) -> bytes | None:
 
 
 def rclone_push(src: str, dest: str, logger: logging.Logger) -> bool:
-    cmd = _build_rclone_base_args() + [src, dest]
+    """Local -> destination. Local sources cannot 404, so moveto is fine."""
+    cmd = _build_rclone_base_args("moveto") + [src, dest]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.warning(f"rclone push failed: {src} -> {dest}: {result.stderr}")
@@ -168,7 +224,7 @@ def rclone_product(
     if folder_id is None:
         folder_id = ensure_drive_source_folder(logger)
     src = f"{settings.drive_remote},root_folder_id={folder_id}:{drive_name}"
-    return _run_rclone_moveto(src, dest_path, logger)
+    return _copy_then_delete_source(src, dest_path, logger)
 
 
 def rclone_all_products(

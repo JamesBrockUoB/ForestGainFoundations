@@ -1,4 +1,3 @@
-import hashlib
 import random
 from pathlib import Path
 
@@ -6,13 +5,14 @@ import numpy as np
 import rasterio
 import torch
 from config import (
-    BACKBONE_BAND_INDICES,
+    BAND_FILE_INDEX,
+    EMBEDDING_SOURCES,
     NORM_CLIP,
     NORM_NAN_FILL,
     NORM_STATS,
-    S1_BANDS,
     S2_BANDS,
     S2_SCALE,
+    SOURCES,
     VALID_MASK_BAND_INDEX,
     YEARS,
 )
@@ -26,11 +26,15 @@ def split_tile_dirs(data_dir, val_frac=0.2, seed=0):
     return tile_dirs[n_val:], tile_dirs[:n_val]
 
 
-def read_physical(path: Path, band_names) -> np.ndarray:
-    """Read bands as (C, H, W) float32 in physical units: S2 reflectance, S1 dB."""
-    idx = [BACKBONE_BAND_INDICES[b] for b in band_names]
+def read_physical(path: Path, band_names, mask_nodata: bool = False) -> np.ndarray:
+    """Read bands as (C, H, W) float32. S2 -> reflectance, S1 -> dB,
+    embeddings -> raw values (scaled later by NORM_STATS)."""
+    idx = [BAND_FILE_INDEX[b] for b in band_names]
     with rasterio.open(path) as src:
         x = src.read(idx).astype(np.float32)
+        nodata = src.nodata
+    if mask_nodata and nodata is not None and not np.isnan(nodata):
+        x[x == np.float32(nodata)] = np.nan
     for i, b in enumerate(band_names):
         if b in S2_BANDS:
             x[i] /= S2_SCALE
@@ -38,24 +42,22 @@ def read_physical(path: Path, band_names) -> np.ndarray:
 
 
 def normalize(x: np.ndarray, band_names) -> np.ndarray:
-    """Per-band linear scaling (x - p1) / (p99 - p1). x: (..., C, H, W)."""
-    out = np.empty(x.shape, dtype=np.float32)
+    """S1/S2: (x - p1) / (p99 - p1), clipped, NaN -> NORM_NAN_FILL.
+    Embeddings (no NORM_STATS entry): raw values, NaN -> 0."""
+    out = x.astype(np.float32, copy=True)
     for i, b in enumerate(band_names):
-        lo, hi = NORM_STATS[b]
-        out[..., i, :, :] = (x[..., i, :, :] - lo) / (hi - lo)
-    if NORM_CLIP is not None:
-        np.clip(out, NORM_CLIP[0], NORM_CLIP[1], out=out)
-    return np.nan_to_num(
-        out, nan=NORM_NAN_FILL, posinf=NORM_NAN_FILL, neginf=NORM_NAN_FILL
-    )
+        ch = out[..., i, :, :]
+        if b in NORM_STATS:
+            lo, hi = NORM_STATS[b]
+            ch = np.clip((ch - lo) / (hi - lo), *NORM_CLIP)
+            fill = NORM_NAN_FILL
+        else:
+            fill = 0.0
+        out[..., i, :, :] = np.nan_to_num(ch, nan=fill, posinf=fill, neginf=fill)
+    return out
 
 
 class MultiTemporalGainDataset(Dataset):
-    BAND_GROUPS = {
-        "s1": S1_BANDS,
-        "s2": S2_BANDS,
-    }
-
     def __init__(
         self,
         tile_dirs: list[Path],
@@ -69,13 +71,15 @@ class MultiTemporalGainDataset(Dataset):
         label_sigma: float = 0.0,
     ):
         """
+        sources: any of s1, s2, alphaearth, tessera (channels are concatenated).
         crop_size: random crop (train) / center crop (eval). None keeps full tile.
         repeats:   virtual dataset length multiplier (more steps per epoch).
         label_sigma: jitter on soft confidence weights (use only with soft loss).
         """
+        sources = tuple(sources)
         if not sources:
             raise ValueError("At least one source must be selected")
-        invalid_sources = set(sources) - self.BAND_GROUPS.keys()
+        invalid_sources = set(sources) - SOURCES.keys()
         if invalid_sources:
             raise ValueError(f"Unknown sources: {invalid_sources}")
 
@@ -90,18 +94,9 @@ class MultiTemporalGainDataset(Dataset):
         self.frame_drop_p = frame_drop_p
         self.label_sigma = label_sigma
 
-        self.band_names = tuple(
-            band for source in sources for band in self.BAND_GROUPS[source]
-        )
+        self.band_names = tuple(band for s in sources for band in SOURCES[s][1])
 
-        missing = [b for b in self.band_names if b not in NORM_STATS]
-        if missing:
-            raise RuntimeError(
-                f"No normalisation stats for {missing}. Run "
-                "`python compute_norm_stats.py` and paste the output into "
-                "NORM_STATS in config.py."
-            )
-
+        # Spectral augmentation only applies to S2 reflectance channels
         self.s2_channel_indices = [
             i for i, b in enumerate(self.band_names) if b in S2_BANDS
         ]
@@ -171,17 +166,25 @@ class MultiTemporalGainDataset(Dataset):
         frames, valid_masks = [], []
 
         for year in self.years:
-            img_path = tile_dir / "composites" / f"s1s2_{year}.tif"
-            if not img_path.exists():
-                raise FileNotFoundError(f"Missing composite geotiff: {img_path}")
+            parts = []
+            for source in self.sources:
+                template, bands = SOURCES[source]
+                path = tile_dir / template.format(year=year)
+                if not path.exists():
+                    raise FileNotFoundError(f"Missing {source} raster: {path}")
+                parts.append(
+                    read_physical(path, bands, mask_nodata=source in EMBEDDING_SOURCES)
+                )
+            frames.append(np.concatenate(parts, axis=0))
 
-            frames.append(read_physical(img_path, self.band_names))
-
-            with rasterio.open(img_path) as src:
+            # Valid mask always comes from the S1/S2 composite so every input
+            # type is trained and scored on identical pixels.
+            mask_path = tile_dir / "composites" / f"s1s2_{year}.tif"
+            with rasterio.open(mask_path) as src:
                 vm = src.read(VALID_MASK_BAND_INDEX).astype(np.float32)
             valid_masks.append(np.nan_to_num(vm, nan=0.0) > 0)
 
-        pixels = np.stack(frames, axis=0)  # (T, C, H, W), physical units, may hold NaN
+        pixels = np.stack(frames, axis=0)  # (T, C, H, W), may hold NaN
         combined_valid = np.all(np.stack(valid_masks, axis=0), axis=0).astype(
             np.float32
         )
