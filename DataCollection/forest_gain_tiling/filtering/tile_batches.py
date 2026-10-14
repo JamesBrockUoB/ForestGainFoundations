@@ -258,7 +258,35 @@ def iter_stratified_pending_tile_batches(
             if logger:
                 logger.warning(f"No tiles at status={status} — nothing to stratify.")
             return
-        quotas = {s: tile_limit // len(strata) for s in strata}
+        quotas = {s: 0 for s in strata}
+        remaining = tile_limit
+
+        # Round-robin allocation ensures unused capacity in one stratum
+        # can be allocated to other strata.
+        while remaining > 0:
+            eligible = [s for s in strata if quotas[s] < available[s]]
+            if not eligible:
+                break
+
+            share = max(1, remaining // len(eligible))
+            allocated = 0
+
+            for s in eligible:
+                take = min(
+                    share,
+                    available[s] - quotas[s],
+                    remaining - allocated,
+                )
+                quotas[s] += take
+                allocated += take
+
+                if allocated == remaining:
+                    break
+
+            if allocated == 0:
+                break
+
+            remaining -= allocated
     else:
         ratios = load_or_compute_strata_ratios(logger)[stratify_field]
         quotas = {s: round(tile_limit * r) for s, r in ratios.items()}

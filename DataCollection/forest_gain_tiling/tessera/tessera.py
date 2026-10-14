@@ -47,10 +47,6 @@ _MAX_CONCURRENT_YEARS = getattr(
 # check in _is_permanent is the sturdier signal.
 _PERMANENT_MARKERS = ("No data left in file",)
 
-# Transient errors (timeouts, dropped connections, subprocess death) are
-# capped so a deterministic failure can never loop forever.
-_MAX_ATTEMPTS = 3
-
 
 def _is_permanent(exc: BaseException) -> bool:
     """True if the failure is deterministic (bad/empty upstream data)."""
@@ -520,19 +516,25 @@ def download_tessera_with_retry(
 ) -> bool:
     tile_id = tile["tile_id"]
 
-    for attempt in range(retries):
+    # 1 initial attempt + `retries` retry attempts
+    total_attempts = 1 + retries
+
+    for attempt in range(total_attempts):
         if cancel_event.is_set():
             logger.warning(f"{tile_id} | TESSERA cancelled")
             return False
 
         try:
-            logger.info(f"{tile_id} | starting TESSERA")
+            if attempt == 0:
+                logger.info(f"{tile_id} | starting TESSERA")
+            else:
+                logger.info(f"{tile_id} | starting TESSERA retry {attempt}/{retries}")
+
             download_tessera(tile, output_dir, logger, years)
             logger.info(f"{tile_id} | TESSERA complete")
             return True
 
         except TesseraPermanentError as exc:
-            # Single line, no traceback. The caller rejects the tile.
             logger.error(f"{tile_id} | TESSERA permanent failure, not retrying: {exc}")
             raise
 
@@ -546,11 +548,13 @@ def download_tessera_with_retry(
         except Exception as exc:
             logger.error(f"{tile_id} | TESSERA failed: {exc}")
 
-        if attempt < retries + 1:
+        # Only wait and log if we actually have retries left
+        if attempt < total_attempts - 1:
             wait = 2**attempt + 1
 
             logger.warning(
-                f"{tile_id} | TESSERA retry " f"{attempt + 1}/{retries} in {wait}s"
+                f"{tile_id} | TESSERA scheduled retry "
+                f"{attempt + 1}/{retries} in {wait}s"
             )
 
             if cancel_event.wait(wait):

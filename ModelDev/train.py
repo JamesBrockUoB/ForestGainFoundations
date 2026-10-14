@@ -3,13 +3,44 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pytorch_lightning as pl
+import rasterio
 from config import DEFAULT_IMAGE_SIZE, SOURCES
 from datasets import MultiTemporalGainDataset, split_tile_dirs
 from eval import evaluate_checkpoint
 from lightning_module import GainDetectionTask
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from torch.utils.data import DataLoader
+
+
+def auto_pos_weight(tile_dirs) -> float:
+    """sqrt(negatives / positives) over the TRAINING tiles' gain labels.
+
+    Positives follow the dataset's definition (gain_confidence > 0). Pixels with
+    gain_valid == 0 are not excluded here (the loss ignores them), which is a
+    negligible difference when imagery retention is ~99%.
+    """
+    pos = neg = 0
+    for d in tile_dirs:
+        with rasterio.open(Path(d) / "labels" / "gain_confidence.tif") as src:
+            c = np.nan_to_num(src.read(1).astype(np.float32), nan=0.0)
+        n_pos = int((c > 0).sum())
+        pos += n_pos
+        neg += c.size - n_pos
+    if pos == 0:
+        raise ValueError("No positive gain pixels in the training tiles")
+    return float(np.sqrt(neg / pos))
+
+
+def _pos_weight_arg(value: str):
+    if value.lower() == "auto":
+        return "auto"
+    return float(value)
 
 
 def parse_args():
@@ -34,6 +65,12 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--warmup_frac", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=100)
+    p.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="Stop if val_ap hasn't improved for this many epochs (0 = never stop early).",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data_dir", type=str, default="../DataCollection/data/test_tiles")
     p.add_argument(
@@ -47,14 +84,21 @@ def parse_args():
     p.add_argument("--tversky_alpha", type=float, default=0.7)
     p.add_argument("--tversky_beta", type=float, default=0.3)
     p.add_argument("--tversky_gamma", type=float, default=0.75)
-    p.add_argument("--pos_weight", type=float, default=None)
+    p.add_argument(
+        "--pos_weight",
+        type=_pos_weight_arg,
+        default=None,
+        help="BCE positive weight: a number, 'auto' (sqrt(neg/pos) from the "
+        "training labels) or omitted for no weighting.",
+    )
 
     # Data
     p.add_argument(
         "--crop_size",
         type=int,
         default=0,
-        help="Random crop size for training (0 = full tile). Model img_size follows.",
+        help="Optional TRAINING-only random crop (0 = full tile, the default). "
+        "Validation and test always use full tiles.",
     )
     p.add_argument(
         "--repeats", type=int, default=1, help="Train samples per tile/epoch"
@@ -75,6 +119,10 @@ def train(args):
     print(f"train tiles: {len(train_dirs)} | val tiles: {len(val_dirs)} ")
     print(f"sources: {sources}")
 
+    if args.pos_weight == "auto":
+        args.pos_weight = auto_pos_weight(train_dirs)
+        print(f"pos_weight (auto, sqrt(neg/pos)): {args.pos_weight:.2f}")
+
     run_name = "_".join(
         [
             args.model_type,
@@ -85,6 +133,7 @@ def train(args):
             f"lr{args.learning_rate:g}",
             f"wd{args.weight_decay:g}",
             f"rep{args.repeats}",
+            *([f"pw{args.pos_weight:g}"] if args.pos_weight is not None else []),
             f"seed{args.seed}",
             datetime.now().strftime("%m%d-%H%M"),
         ]
@@ -104,7 +153,9 @@ def train(args):
         repeats=args.repeats,
         label_sigma=0.1 if args.loss_type == "soft" else 0.0,
     )
-    val_ds = MultiTemporalGainDataset(val_dirs, sources=sources, crop_size=crop)
+    # Validation always runs on full tiles (TSViT interpolates its position
+    # embedding, so a model trained on crops still accepts them).
+    val_ds = MultiTemporalGainDataset(val_dirs, sources=sources, crop_size=None)
 
     train_loader = DataLoader(
         train_ds,
@@ -150,11 +201,16 @@ def train(args):
             LearningRateMonitor(logging_interval="step"),
             ModelCheckpoint(
                 dirpath=ckpt_dir,
-                filename="{epoch}-{val_iou:.3f}",
-                monitor="val_iou",
+                filename="{epoch}-{val_ap:.3f}",
+                monitor="val_ap",
                 mode="max",
                 save_top_k=1,
                 save_last=True,
+            ),
+            *(
+                [EarlyStopping(monitor="val_ap", mode="max", patience=args.patience)]
+                if args.patience > 0
+                else []
             ),
         ],
     )
@@ -163,7 +219,7 @@ def train(args):
 
     cb = trainer.checkpoint_callback
     best = cb.best_model_path
-    print(f"best checkpoint: {best} | val_iou: {float(cb.best_model_score):.3f}")
+    print(f"best checkpoint: {best} | val_ap: {float(cb.best_model_score):.3f}")
 
     # Test set is touched once, with the checkpoint chosen on val
     if best:
@@ -171,7 +227,7 @@ def train(args):
         results = evaluate_checkpoint(
             best,
             test_dir=Path(args.holdout_dir),
-            crop_size=crop,
+            crop_size=None,  # full tiles
         )
         logger.log_metrics({f"test_{k}": v for k, v in results.items()})
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from typing import Any
 
 import ee
 from config import settings
+from dotenv import load_dotenv
 from enums import TileStatus
 from export.aee import submit_aee_exports
 from export.composites import s2_all_years_valid, submit_composite_exports
@@ -38,9 +40,11 @@ from tessera.tessera import (
 )
 from tiling.grid import crs_transform, tile_geom
 
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent.parent / ".env")
+
 
 def get_local_output_dir(tile_id: str) -> Path:
-    return settings.data_dir / "holdout_tiles" / tile_id
+    return settings.data_dir / os.getenv("LOCAL_OUTPUT_DIR", "test_tiles") / tile_id
 
 
 def get_tessera_scratch_dir() -> Path:

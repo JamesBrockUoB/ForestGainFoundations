@@ -18,6 +18,10 @@ Examples
   python main.py run --tile-id tile_-363_2324
   python main.py run --status failed
   python main.py run --local-output --limit 10
+  python main.py pipeline --limit 500
+  python main.py pipeline --limit 100 --local-output
+  python main.py pipeline --limit 500 --stratify biome
+  python main.py pipeline --limit 200 --stratify biome --stratify-mode equal --local-output
   python main.py retry-tessera
   python main.py retry-tessera --limit 50
   python main.py retry-tessera --tile-id tile_-363_2324
@@ -48,6 +52,18 @@ Filter
   --stratify-mode prop | equal
   --tile-limit N   (required if --stratify is set; total tiles to draw)
 
+Pipeline (cheap filter -> imagery filter -> export, until N tiles are exported)
+-------------------------------------------------------------------------------
+  --limit N        (required; EXPORTED tiles, i.e. status complete. Alias: --tile-limit)
+  --stratify biome | region | country
+  --stratify-mode prop | equal
+  --local-output
+  --batch-size-cheap N
+  --batch-size-imagery N
+  --initial-yield F   (first-wave guess of tiles surviving both filters; default 0.25)
+  --max-wave N        (cap on tiles drawn per filtering wave; default 20000)
+  --max-waves N       (safety cap on filtering waves; default 50)
+
 Retry-tessera
 -------------
   --tile-id TILE_ID
@@ -72,6 +88,7 @@ from datetime import datetime
 
 import ee
 from config import settings
+from end_to_end import run_pipeline
 from enums import TileStatus
 from export.tasks import retry_tessera_missing, run_hpc, run_local
 from filtering.tasks import run_filter_hpc, run_filter_local
@@ -263,6 +280,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
             stratify_field=args.stratify,
             stratify_mode=args.stratify_mode,
             tile_limit=args.tile_limit,
+            show_imagery_stats=args.show_imagery_stats,
         )
     else:
         logger.info(
@@ -284,6 +302,7 @@ def cmd_filter(args: argparse.Namespace) -> None:
             stratify_field=args.stratify,
             stratify_mode=args.stratify_mode,
             tile_limit=args.tile_limit,
+            show_imagery_stats=args.show_imagery_stats,
         )
 
     print(
@@ -346,6 +365,31 @@ def cmd_run(args: argparse.Namespace) -> None:
     else:
         logger.info("Mode: local")
         run_local(candidates, ds, logger, local_output=args.local_output)
+
+    print(
+        registry_summary(
+            verbose=args.verbose,
+        )
+    )
+
+
+def cmd_pipeline(args: argparse.Namespace) -> None:
+    """Cheap filter -> imagery filter -> export, until --limit tiles are exported."""
+    logger = setup_logging("pipeline")
+    init_ee()
+
+    run_pipeline(
+        logger,
+        limit=args.limit,
+        stratify_field=args.stratify,
+        stratify_mode=args.stratify_mode,
+        local_output=args.local_output,
+        batch_size_cheap=args.batch_size_cheap,
+        batch_size_imagery=args.batch_size_imagery,
+        initial_yield=args.initial_yield,
+        max_wave=args.max_wave,
+        max_waves=args.max_waves,
+    )
 
     print(
         registry_summary(
@@ -488,6 +532,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Total tiles to draw when --stratify is set. Required if "
         "--stratify is used.",
     )
+    filter_p.add_argument(
+        "--show-imagery-stats",
+        action="store_true",
+        default=False,
+        help="Show per-tile imagery statistics (hidden by default).",
+    )
 
     run_p = sub.add_parser("run", help="Submit and monitor export tasks")
     run_p.add_argument("--aoi-id", default=None)
@@ -521,6 +571,69 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-output",
         action="store_true",
         help="Write exports and embeddings to DataCollection/data/test_tiles instead of HPC.",
+    )
+
+    pipe_p = sub.add_parser(
+        "pipeline",
+        help="End to end: cheap filter -> imagery filter -> export, until the "
+        "requested number of tiles has been exported",
+    )
+    pipe_p.add_argument(
+        "--limit",
+        "--tile-limit",
+        dest="limit",
+        required=True,
+        type=int,
+        help="Number of tiles to EXPORT (status complete). Filtering continues "
+        "in waves until this many have been exported.",
+    )
+    pipe_p.add_argument(
+        "--stratify", default=None, choices=["biome", "region", "country"]
+    )
+    pipe_p.add_argument(
+        "--stratify-mode",
+        default="prop",
+        choices=["prop", "equal"],
+        dest="stratify_mode",
+    )
+    pipe_p.add_argument(
+        "--local-output",
+        action="store_true",
+        help="Write exports and embeddings to DataCollection/data/test_tiles instead of HPC.",
+    )
+    pipe_p.add_argument(
+        "--batch-size-cheap",
+        default=settings.filter_batch_size_cheap,
+        type=int,
+        help=f"Tiles per raster fetch, cheap stage (default: {settings.filter_batch_size_cheap})",
+    )
+    pipe_p.add_argument(
+        "--batch-size-imagery",
+        default=settings.filter_batch_size_imagery,
+        type=int,
+        help=f"Tiles per raster fetch, imagery stage (default: {settings.filter_batch_size_imagery})",
+    )
+    pipe_p.add_argument(
+        "--initial-yield",
+        default=0.25,
+        type=float,
+        dest="initial_yield",
+        help="Guess of the fraction of drawn tiles that survive both filter "
+        "stages, used to size the first wave; later waves use the observed yield.",
+    )
+    pipe_p.add_argument(
+        "--max-wave",
+        default=20000,
+        type=int,
+        dest="max_wave",
+        help="Maximum tiles drawn in one filtering wave.",
+    )
+    pipe_p.add_argument(
+        "--max-waves",
+        default=50,
+        type=int,
+        dest="max_waves",
+        help="Safety cap on filtering waves.",
     )
 
     rt_p = sub.add_parser(
@@ -595,6 +708,7 @@ if __name__ == "__main__":
         "status": cmd_status,
         "filter": cmd_filter,
         "run": cmd_run,
+        "pipeline": cmd_pipeline,
         "retry-tessera": cmd_retry_tessera,
         "reset": cmd_reset,
     }

@@ -8,7 +8,7 @@ class Datasets:
         self.dt_cover: dict[int, ee.Image | None] = {
             year: (
                 ee.Image(
-                    f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v2"
+                    f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v5"
                 )
                 .select(0)
                 .divide(2.55)

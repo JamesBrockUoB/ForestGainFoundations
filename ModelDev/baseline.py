@@ -95,16 +95,42 @@ def load_tile(tile_dir, sources):
     )
 
 
-def normalise(phys, band_names):
+def normalise(phys, sources):
     out = np.empty_like(phys)
-    for i, b in enumerate(band_names):
-        lo, hi = NORM_STATS[b]
-        out[:, i] = (phys[:, i] - lo) / (hi - lo)
+    c0 = 0
+
+    for s in sources:
+        bands = SOURCES[s][1]
+        c = len(bands)
+        if s in EMBEDDING_SOURCES:
+            out[:, c0 : c0 + c] = np.nan_to_num(
+                phys[:, c0 : c0 + c],
+                nan=NORM_NAN_FILL,
+                posinf=NORM_NAN_FILL,
+                neginf=NORM_NAN_FILL,
+            )
+        else:
+            for i, b in enumerate(bands, start=c0):
+                lo, hi = NORM_STATS[b]
+                out[:, i] = (phys[:, i] - lo) / (hi - lo)
+
+        c0 += c
+
     if NORM_CLIP is not None:
-        np.clip(out, NORM_CLIP[0], NORM_CLIP[1], out=out)
-    return np.nan_to_num(
-        out, nan=NORM_NAN_FILL, posinf=NORM_NAN_FILL, neginf=NORM_NAN_FILL
-    )
+        # Clip only non-embedding channels.
+        c0 = 0
+        for s in sources:
+            c = len(SOURCES[s][1])
+            if s not in EMBEDDING_SOURCES:
+                np.clip(
+                    out[:, c0 : c0 + c],
+                    NORM_CLIP[0],
+                    NORM_CLIP[1],
+                    out=out[:, c0 : c0 + c],
+                )
+            c0 += c
+
+    return out
 
 
 def center_crop(arrs, s):
@@ -133,7 +159,7 @@ def change_features(P, sources):
     return np.concatenate(feats, 0).T if feats else None  # (n, 2*(T-1)*n_emb)
 
 
-def sample_tile(tile_dir, sources, band_names, mode, rng, args, with_change):
+def sample_tile(tile_dir, sources, mode, rng, args, with_change):
     phys, valid, gain = load_tile(tile_dir, sources)
     if mode == "val":
         phys, valid, gain = center_crop([phys, valid, gain], args.val_crop)
@@ -150,7 +176,7 @@ def sample_tile(tile_dir, sources, band_names, mode, rng, args, with_change):
     if len(idx) == 0:
         return None
     flat_phys = phys.reshape(T, C, -1)[:, :, idx]  # (T, C, n)
-    X = normalise(flat_phys, band_names)  # (T, C, n), same scaling as the dataset
+    X = normalise(flat_phys, sources)
     X = X.reshape(T * C, -1).T  # (n, T*C)
     y = g[idx].astype(np.int8)
     ch = change_features(flat_phys, sources) if with_change else None
@@ -205,7 +231,7 @@ def make_models(names, seed):
 
 
 # ----------------------------------------------------------------- sanity info
-def sanity(sources, band_names, phys_sample, X_train, y_train, y_val):
+def sanity(sources, phys_sample, X_train, y_train, y_val):
     print("\n=== input sanity checks ===")
     T = phys_sample.shape[0]
     c0 = 0
@@ -268,12 +294,16 @@ def main():
     args = ap.parse_args()
 
     sources = tuple(args.sources)
-    band_names = tuple(b for s in sources for b in SOURCES[s][1])
-    missing = [b for b in band_names if b not in NORM_STATS]
+
+    missing = [
+        b
+        for s in sources
+        if s not in EMBEDDING_SOURCES
+        for b in SOURCES[s][1]
+        if b not in NORM_STATS
+    ]
     if missing:
-        raise SystemExit(
-            f"No NORM_STATS for {missing[:3]}... run compute_embedding_stats.py"
-        )
+        raise SystemExit(f"No NORM_STATS for {missing[:3]}...")
     has_emb = any(s in EMBEDDING_SOURCES for s in sources)
 
     train_dirs, val_dirs = split_tile_dirs(args.data_dir, args.val_frac, args.seed)
@@ -289,7 +319,7 @@ def main():
     for mode, dirs in (("train", train_dirs), ("val", val_dirs)):
         Xs, ys, chs, phs = [], [], [], []
         for d in dirs:
-            r = sample_tile(d, sources, band_names, mode, rng, args, has_emb)
+            r = sample_tile(d, sources, mode, rng, args, has_emb)
             if r is None:
                 continue
             Xs.append(r[0])
@@ -310,7 +340,7 @@ def main():
     Xva, yva, Cva, Pva = data["val"]
     if yva.sum() == 0 or ytr.sum() == 0:
         raise SystemExit("no positive pixels in train or val sample")
-    sanity(sources, band_names, Pva[:, :, : min(50000, Pva.shape[2])], Xtr, ytr, yva)
+    sanity(sources, Pva[:, :, : min(50000, Pva.shape[2])], Xtr, ytr, yva)
 
     rows = []
     # zero-shot cosine/L2 scores (no training at all)

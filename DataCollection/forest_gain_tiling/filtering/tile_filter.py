@@ -44,7 +44,9 @@ def evaluate_cheap_stats(
 
 
 def evaluate_imagery_stats(
-    stats: dict[str, float | None], logger: logging.Logger | None = None
+    stats: dict[str, float | None],
+    logger: logging.Logger | None = None,
+    show_imagery_stats: bool = False,
 ) -> str | None:
     # 1) Per-year S2 and S1 coverage only
     low = {
@@ -52,11 +54,12 @@ def evaluate_imagery_stats(
         for b in S2_BAND_NAMES + S1_BAND_NAMES
         if stats.get(b) is None or stats[b] < settings.imagery_min_valid_frac
     }
-    logger.info(
-        "imagery stats: "
-        f"s2_min={min(stats[b] for b in S2_BAND_NAMES):.3f} "
-        f"gain_valid={stats.get(GAIN_VALID_BAND)}"
-    )
+    if show_imagery_stats:
+        logger.info(
+            "imagery stats: "
+            f"s2_min={min(stats[b] for b in S2_BAND_NAMES):.3f} "
+            f"gain_valid={stats.get(GAIN_VALID_BAND)}"
+        )
     if low:
         if logger:
             logger.debug(f"low_imagery_coverage: {low}")
@@ -208,6 +211,7 @@ def filter_batch_imagery(
     logger: logging.Logger,
     batch_label: str = "",
     ds: Datasets | None = None,
+    show_imagery_stats: bool = False,
 ) -> dict[str, int]:
     logger.debug(f"{batch_label} imagery: {len(tiles)} tiles")
 
@@ -253,7 +257,9 @@ def filter_batch_imagery(
             counts["failed"] += 1
             continue
 
-        reason = evaluate_imagery_stats(stats, logger)
+        reason = evaluate_imagery_stats(
+            stats, logger, show_imagery_stats=show_imagery_stats
+        )
 
         if reason:
             update_tile(

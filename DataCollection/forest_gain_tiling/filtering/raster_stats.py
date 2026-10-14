@@ -226,6 +226,7 @@ def fetch_cheap_stats(
 
         def go():
             geom = tiles_to_feature_collection(chunk).geometry()
+            # The label layer (labels/gain.py), which follows GAIN_RULE.
             _, gain_binary, _ = build_gain_layer(geom, ds)
             gain = _reduce_tiles(
                 gain_binary.rename("gain_frac"), chunk, ["gain_frac"], tile_scale=2

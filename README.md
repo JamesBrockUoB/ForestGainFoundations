@@ -107,4 +107,6 @@
       - EE_CREDENTIALS_PATH - Your Earth Engine credentials for GDrive authorisations
       - SEARCH_MODE - `asset` for limiting search area to geographic extent of deadtrees.earth product, or `global` for the whole world
       WANDB_USERNAME - Weights and Biases username for model training
+      - GAIN_RULE - `threshold` for counting gain as any pixel that starts under the confident non-tree threshold (e.g. 20% DT canopy cover) to over the minimum tree confidence threshold (e.g. 50% DT canopy cover). `delta` counts gain as any pixel that starts under the confident non-tree treshold and it increases DT canopy cover percentage by a minimum delta (e.g. 50) by the end of the period. 
+      - LOCAL_OUTPUT_DIR - Default folder in DataCollection/data to store locally exported files - defaults to 'test_tiles'
     </details>

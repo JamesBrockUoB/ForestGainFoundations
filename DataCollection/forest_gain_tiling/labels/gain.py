@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ee
 from config import settings
+from filtering.gain_rule import gain_image, gain_rule
 from gee_datasets.registry import Datasets
 
 
@@ -20,13 +21,11 @@ def build_gain_layer(
     """
     Forest gain:
 
-    1. Start:
-        canopy <20%
+    1. Start/end: per GAIN_RULE (filtering/gain_rule.py)
+        threshold: start <20% and end >50%
+        delta:     start <20% and (end - start) >= GAIN_MIN_DELTA
 
-    2. End:
-        canopy >50%
-
-    3. Intermediate years:
+    2. Intermediate years:
         monotonic forest establishment,
         allowing configured dropout tolerance
 
@@ -40,11 +39,9 @@ def build_gain_layer(
 
     cover_end = _cover_image(ds, settings.year_end).clip(geom)
 
-    forest_start = cover_start.lt(settings.non_tree_threshold_frac)
-
     forest_end = cover_end.gt(settings.min_tree_threshold_frac)
 
-    gain_candidate = forest_start.And(forest_end)
+    gain_candidate = gain_image(cover_start, cover_end)
 
     intervening_years = sorted(
         y
@@ -73,9 +70,8 @@ def build_gain_layer(
 
         ever_forest = ever_forest.Or(forest)
 
-    sustained = forest_end.And(
-        dropout_count.lte(settings.gain_sustain_dropout_tolerance)
-    )
+    sustained = dropout_count.lte(settings.gain_sustain_dropout_tolerance)
+    sustained = forest_end.And(sustained)
 
     gain = gain_candidate.And(sustained)
 

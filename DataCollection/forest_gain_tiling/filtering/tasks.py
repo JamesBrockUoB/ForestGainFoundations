@@ -54,7 +54,6 @@ def _resolve_batch_iter(
         if tile_limit is None:
             raise ValueError("tile_limit is required when stratify_field is set")
 
-        total_batches = -(-tile_limit // batch_size)
         batch_iter = iter_stratified_pending_tile_batches(
             cfg["input_status"],
             batch_size,
@@ -63,12 +62,20 @@ def _resolve_batch_iter(
             mode=stratify_mode,
             logger=logger,
         )
+
+        # Materialise the stratified selection so tqdm uses the actual
+        # number of batches available after per-stratum shortfalls.
+        batches = list(batch_iter)
+        total_batches = len(batches)
+
         logger.info(
             f"starting | batch_size={batch_size} | "
             f"stratify={stratify_field} mode={stratify_mode} | "
-            f"tile_limit={tile_limit:,} | total_batches(est)={total_batches:,}"
+            f"tile_limit={tile_limit:,} | "
+            f"selected_tiles={sum(map(len, batches)):,} | "
+            f"total_batches={total_batches:,}"
         )
-        return batch_iter, total_batches
+        return iter(batches), total_batches
 
     total_pending = count_pending(cfg["input_status"])
     total_batches = -(-total_pending // batch_size)
@@ -94,6 +101,7 @@ def run_filter_local(
     stratify_field: str | None = None,
     stratify_mode: str = "prop",
     tile_limit: int | None = None,
+    show_imagery_stats: bool = False,
 ) -> None:
     cfg = STAGES[stage]
     ds = Datasets() if stage == "cheap" else None
@@ -123,7 +131,12 @@ def run_filter_local(
             if stage == "cheap":
                 counts = cfg["fn"](tiles, ds, logger, batch_label=f"batch {n_batches}")
             else:
-                counts = cfg["fn"](tiles, logger, batch_label=f"batch {n_batches}")
+                counts = cfg["fn"](
+                    tiles,
+                    logger,
+                    batch_label=f"batch {n_batches}",
+                    show_imagery_stats=show_imagery_stats,
+                )
 
             for k, v in counts.items():
                 totals[k] = totals.get(k, 0) + v
@@ -143,7 +156,12 @@ def run_filter_local(
 
 
 def _mp_worker(
-    stage: str, logfile, batch_queue: mp.Queue, result_queue: mp.Queue, worker_id: int
+    stage: str,
+    logfile,
+    batch_queue: mp.Queue,
+    result_queue: mp.Queue,
+    worker_id: int,
+    show_imagery_stats: bool = False,
 ) -> None:
     time.sleep(worker_id * 5)
     ee.Initialize(get_ee_credentials(), project=settings.gee_project)
@@ -165,7 +183,12 @@ def _mp_worker(
         if stage == "cheap":
             counts = fn(tiles, ds, logger, batch_label=f"batch {batch_idx}")
         else:
-            counts = fn(tiles, logger, batch_label=f"batch {batch_idx}")
+            counts = fn(
+                tiles,
+                logger,
+                batch_label=f"batch {batch_idx}",
+                show_imagery_stats=show_imagery_stats,
+            )
         logger.debug(f"batch {batch_idx}: done in {time.time()-t0:.1f}s")
         result_queue.put((batch_idx, len(tiles), counts))
 
@@ -210,6 +233,7 @@ def run_filter_hpc(
     stratify_field: str | None = None,
     stratify_mode: str = "prop",
     tile_limit: int | None = None,
+    show_imagery_stats: bool = False,
 ) -> None:
     cfg = STAGES[stage]
     batch_queue: mp.Queue = mp.Queue()
@@ -253,7 +277,8 @@ def run_filter_hpc(
 
     workers = [
         mp.Process(
-            target=_mp_worker, args=(stage, logfile, batch_queue, result_queue, i)
+            target=_mp_worker,
+            args=(stage, logfile, batch_queue, result_queue, i, show_imagery_stats),
         )
         for i in range(settings.num_workers)
     ]

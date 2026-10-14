@@ -5,6 +5,7 @@ from config import DEFAULT_IMAGE_SIZE, DEFAULT_LR, NUM_INPUT_CHANNELS
 from losses import FocalTverskyBCELoss
 from models import build_model
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torchmetrics.functional.classification import binary_average_precision
 
 
 class GainDetectionTask(pl.LightningModule):
@@ -60,6 +61,12 @@ class GainDetectionTask(pl.LightningModule):
         self.val_precision = torchmetrics.Precision(**metrics_kwargs)
         self.val_recall = torchmetrics.Recall(**metrics_kwargs)
 
+        # Threshold-free metrics. Scores are collected on the CPU (exact AP needs
+        # every prediction, and this keeps it independent of MPS op coverage).
+        self._val_probs: list[torch.Tensor] = []
+        self._val_targets: list[torch.Tensor] = []
+        self._val_tile_ap: list[torch.Tensor] = []
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
@@ -105,6 +112,18 @@ class GainDetectionTask(pl.LightningModule):
             self.val_precision.update(v_probs, v_targets)
             self.val_recall.update(v_probs, v_targets)
 
+            # Per-sample (= per-tile crop) scores for pooled AP and per-tile AP
+            for b in range(probs.shape[0]):
+                vb = valid[b]
+                if not vb.any():
+                    continue
+                pb = probs[b][vb].detach().float().cpu()
+                tb = (batch["gain_mask"][b][vb] > 0.5).int().cpu()
+                self._val_probs.append(pb)
+                self._val_targets.append(tb)
+                if tb.any():
+                    self._val_tile_ap.append(binary_average_precision(pb, tb))
+
         self.log(
             "val_loss",
             loss,
@@ -118,6 +137,28 @@ class GainDetectionTask(pl.LightningModule):
         self.log("val_iou", self.val_iou.compute(), prog_bar=True)
         self.log("val_precision", self.val_precision.compute())
         self.log("val_recall", self.val_recall.compute())
+
+        if self._val_probs:
+            p = torch.cat(self._val_probs)
+            t = torch.cat(self._val_targets)
+            prevalence = t.float().mean().item()
+            ap = binary_average_precision(p, t).item() if t.any() else 0.0
+        else:
+            prevalence, ap = 0.0, 0.0
+        tile_ap = (
+            torch.stack(self._val_tile_ap).mean().item() if self._val_tile_ap else 0.0
+        )
+
+        # val_ap: AP over all valid val pixels (compare with baseline.py's AP).
+        # val_map: mean of per-tile AP over tiles that contain gain.
+        # A random scorer has val_ap == val_prevalence.
+        self.log("val_ap", ap, prog_bar=True)
+        self.log("val_map", tile_ap, prog_bar=True)
+        self.log("val_prevalence", prevalence)
+
+        self._val_probs.clear()
+        self._val_targets.clear()
+        self._val_tile_ap.clear()
 
         for metric in (
             self.val_f1,

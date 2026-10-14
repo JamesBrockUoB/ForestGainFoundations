@@ -32,3 +32,7 @@ build/*
 */predictions/*
 
 *checkpoints*
+
+*experimental_sites_shapes
+
+*external_validation

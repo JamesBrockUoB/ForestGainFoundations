@@ -63,7 +63,11 @@ class ProgressiveDecoder(nn.Module):
     """
 
     def __init__(
-        self, embed_dim: int = 128, patch_size: int = 16, out_channels: int = 1
+        self,
+        embed_dim: int = 128,
+        patch_size: int = 16,
+        out_channels: int = 1,
+        skip_channels: int = 0,
     ):
         super().__init__()
         num_up_stages = int(math.log2(patch_size))
@@ -76,10 +80,24 @@ class ProgressiveDecoder(nn.Module):
             curr_dim = next_dim
 
         self.up_blocks = nn.Sequential(*layers)
+
+        # Full-resolution skip: fuses pixel-level change features with the
+        # upsampled transformer features before the 1x1 head.
+        self.fuse = None
+        if skip_channels > 0:
+            self.fuse = nn.Sequential(
+                nn.Conv2d(curr_dim + skip_channels, curr_dim, 3, padding=1, bias=False),
+                nn.BatchNorm2d(curr_dim),
+                nn.GELU(),
+            )
         self.final_head = nn.Conv2d(curr_dim, out_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, skip: torch.Tensor | None = None
+    ) -> torch.Tensor:
         feat = self.up_blocks(x)
+        if self.fuse is not None:
+            feat = self.fuse(torch.cat([feat, skip], dim=1))
         return self.final_head(feat)
 
 
@@ -100,6 +118,8 @@ class TSViT(nn.Module):
         depth_spatial: int = 4,
         num_heads: int = 4,
         max_frames: int = 8,
+        dropout: float = 0.1,
+        skip_channels: int = 32,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -113,6 +133,21 @@ class TSViT(nn.Module):
             in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
         )
 
+        self.embed_norm = nn.LayerNorm(embed_dim)
+
+        # Full-resolution change branch (first / last frame and their difference)
+        self.skip_channels = skip_channels
+        self.skip_branch = None
+        if skip_channels > 0:
+            self.skip_branch = nn.Sequential(
+                nn.Conv2d(3 * in_channels, skip_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(skip_channels),
+                nn.GELU(),
+                nn.Conv2d(skip_channels, skip_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(skip_channels),
+                nn.GELU(),
+            )
+
         # Positional Embeddings
         self.temporal_pos_embed = nn.Parameter(torch.zeros(1, max_frames, embed_dim))
         self.spatial_pos_embed = nn.Parameter(
@@ -124,11 +159,16 @@ class TSViT(nn.Module):
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=embed_dim * 2,
+            dropout=dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,
         )
         self.temporal_transformer = nn.TransformerEncoder(
-            temporal_layer, num_layers=depth_temporal
+            temporal_layer,
+            num_layers=depth_temporal,
+            norm=nn.LayerNorm(embed_dim),
+            enable_nested_tensor=False,
         )
         self.temporal_pool = TemporalAttentionPooling(embed_dim)
 
@@ -136,16 +176,24 @@ class TSViT(nn.Module):
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=embed_dim * 2,
+            dropout=dropout,
             activation="gelu",
             batch_first=True,
+            norm_first=True,
         )
         self.spatial_transformer = nn.TransformerEncoder(
-            spatial_layer, num_layers=depth_spatial
+            spatial_layer,
+            num_layers=depth_spatial,
+            norm=nn.LayerNorm(embed_dim),
+            enable_nested_tensor=False,
         )
 
         # Progressive Decoder Head
         self.decoder = ProgressiveDecoder(
-            embed_dim=embed_dim, patch_size=patch_size, out_channels=1
+            embed_dim=embed_dim,
+            patch_size=patch_size,
+            out_channels=1,
+            skip_channels=skip_channels,
         )
 
         self._init_weights()
@@ -154,31 +202,52 @@ class TSViT(nn.Module):
         nn.init.normal_(self.temporal_pos_embed, std=0.02)
         nn.init.normal_(self.spatial_pos_embed, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, T, C, H, W)
-        b, t, c, h, w = x.shape
+    def _spatial_pos(self, hp: int, wp: int) -> torch.Tensor:
+        """Spatial position embedding for an (hp, wp) patch grid, bicubically
+        interpolated from the trained (h_p, w_p) grid when the input size differs
+        (e.g. trained on 64x64 crops, evaluated on full 256x256 tiles)."""
+        pos = self.spatial_pos_embed
+        if (hp, wp) == (self.h_p, self.w_p):
+            return pos
+        d = pos.shape[-1]
+        grid = pos.transpose(1, 2).reshape(1, d, self.h_p, self.w_p)
+        grid = F.interpolate(grid, size=(hp, wp), mode="bicubic", align_corners=False)
+        return grid.flatten(2).transpose(1, 2)
 
-        x_flat = x.view(b * t, c, h, w)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, T, C, H, W); H and W must be multiples of patch_size
+        b, t, c, h, w = x.shape
+        if h % self.patch_size or w % self.patch_size:
+            raise ValueError(
+                f"H, W ({h}, {w}) must be multiples of patch_size {self.patch_size}"
+            )
+        hp, wp = h // self.patch_size, w // self.patch_size
+        n = hp * wp
+
+        x_flat = x.reshape(b * t, c, h, w)
         patches = self.patch_embed(x_flat)
         patches = patches.flatten(2).transpose(1, 2)
+        patches = self.embed_norm(patches)
 
         # 1. Temporal Attention across N sequence frames
-        temporal_tokens = patches.reshape(b, t, self.num_patches, -1)
+        temporal_tokens = patches.reshape(b, t, n, -1)
         temporal_tokens = (
-            temporal_tokens.permute(0, 2, 1, 3)
-            .contiguous()
-            .view(b * self.num_patches, t, -1)
+            temporal_tokens.permute(0, 2, 1, 3).contiguous().view(b * n, t, -1)
         )
         temporal_tokens = temporal_tokens + self.temporal_pos_embed[:, :t, :]
         temporal_features = self.temporal_transformer(temporal_tokens)
         pooled_temporal = self.temporal_pool(temporal_features)
 
         # 2. Spatial Attention across Patch Grid
-        spatial_tokens = pooled_temporal.view(b, self.num_patches, -1)
-        spatial_tokens = spatial_tokens + self.spatial_pos_embed
+        spatial_tokens = pooled_temporal.view(b, n, -1)
+        spatial_tokens = spatial_tokens + self._spatial_pos(hp, wp)
         spatial_features = self.spatial_transformer(spatial_tokens)
 
         # 3. Progressive Decoder Head
-        spatial_grid = spatial_features.transpose(1, 2).view(b, -1, self.h_p, self.w_p)
-        logits = self.decoder(spatial_grid)
+        spatial_grid = spatial_features.transpose(1, 2).reshape(b, -1, hp, wp)
+        skip = None
+        if self.skip_branch is not None:
+            first, last = x[:, 0], x[:, -1]
+            skip = self.skip_branch(torch.cat([first, last, last - first], dim=1))
+        logits = self.decoder(spatial_grid, skip)
         return logits.squeeze(1)

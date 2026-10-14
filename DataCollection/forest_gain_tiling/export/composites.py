@@ -209,11 +209,6 @@ def build_year_s2_s1(geom: ee.Geometry, year: int) -> tuple[ee.Image, ee.Image]:
     return s2, s2.addBands(s1_composite(geom, year))
 
 
-def build_year_composite(geom: ee.Geometry, year: int) -> ee.Image:
-    """Combined S1+S2 composite for a single year."""
-    return build_year_s2_s1(geom, year)[1]
-
-
 def submit_composite_exports(
     geom: ee.Geometry,
     crs_transform: list[float],

@@ -10,6 +10,7 @@ import ee
 import numpy as np
 from config import settings
 from enums import ESRI_RAW_VALUES, ESRI_REMAPPED_VALUES, DWClass, ESRIClass
+from filtering.gain_rule import gain_rule, min_delta
 from gee_datasets.registry import Datasets
 from rasterio.io import MemoryFile
 from tiling.grid import tile_geom
@@ -206,10 +207,7 @@ def _fetch_dt_dw_agreement(
     """
     datasets = Datasets()
     dt_cover_start = (
-        datasets.get_dt_cover(year_start)
-        .select([0])
-        .divide(2.55)
-        .rename("tree_cover_pct")
+        datasets.get_dt_cover(year_start).select([0]).rename("tree_cover_pct")
     )
     forest_start = dt_cover_start.gt(settings.non_tree_threshold_frac).unmask(0)
     dt_non_forest_start = forest_start.Not().rename("dt_non_forest_start")
@@ -255,10 +253,7 @@ def _fetch_dt_esri_agreement(
     """
     datasets = Datasets()
     dt_cover_start = (
-        datasets.get_dt_cover(year_start)
-        .select([0])
-        .divide(2.55)
-        .rename("tree_cover_pct")
+        datasets.get_dt_cover(year_start).select([0]).rename("tree_cover_pct")
     )
     forest_start = dt_cover_start.gt(settings.non_tree_threshold_frac).unmask(0)
     dt_non_forest_start = forest_start.Not().rename("dt_non_forest_start")
@@ -403,26 +398,19 @@ def _fetch_dt_gain_stats(
 ) -> dict[str, float | int | None]:
     """
     Mean Dynamic Tree Cover over pixels satisfying the DT tree-gain
-    definition:
+    definition for the active GAIN_RULE (filtering/gain_rule.py):
 
-        DT cover at year_start < 20%
-        DT cover at year_end   > 50%
+        DT cover at year_start < settings.non_tree_threshold_frac
+        threshold: DT cover at year_end > settings.min_tree_threshold_frac
+        delta:     DT cover at year_end - year_start >= GAIN_MIN_DELTA
 
-    DT source values are converted from the 0-255 encoding to
-    fractional percentage (0-100).
+    Datasets.get_dt_cover already returns percent (0-100).
     """
     datasets = Datasets()
 
-    dt_start = (
-        datasets.get_dt_cover(year_start)
-        .select([0])
-        .divide(2.55)
-        .rename("dt_cover_start")
-    )
+    dt_start = datasets.get_dt_cover(year_start).select([0]).rename("dt_cover_start")
 
-    dt_end = (
-        datasets.get_dt_cover(year_end).select([0]).divide(2.55).rename("dt_cover_end")
-    )
+    dt_end = datasets.get_dt_cover(year_end).select([0]).rename("dt_cover_end")
 
     dt_img = dt_start.addBands(dt_end)
     grid = _grid_from_raster(src)
@@ -438,17 +426,24 @@ def _fetch_dt_gain_stats(
     dt_start_arr = arr["dt_cover_start"]
     dt_end_arr = arr["dt_cover_end"]
 
+    rule = gain_rule()
+    if rule == "threshold":
+        reached = dt_end_arr > settings.min_tree_threshold_frac
+    else:
+        reached = (dt_end_arr - dt_start_arr) >= min_delta()
+
     valid = (
         np.isfinite(dt_start_arr)
         & np.isfinite(dt_end_arr)
-        & (dt_start_arr < 20.0)
-        & (dt_end_arr > 50.0)
+        & (dt_start_arr < settings.non_tree_threshold_frac)
+        & reached
     )
 
     n_gain = int(valid.sum())
 
     if n_gain == 0:
         return {
+            "gain_rule": rule,
             "n_dt_gain_pixels": 0,
             "mean_dt_cover_start_pct": None,
             "mean_dt_cover_end_pct": None,
@@ -459,6 +454,7 @@ def _fetch_dt_gain_stats(
     end_mean = float(dt_end_arr[valid].mean())
 
     return {
+        "gain_rule": rule,
         "n_dt_gain_pixels": n_gain,
         "mean_dt_cover_start_pct": start_mean,
         "mean_dt_cover_end_pct": end_mean,

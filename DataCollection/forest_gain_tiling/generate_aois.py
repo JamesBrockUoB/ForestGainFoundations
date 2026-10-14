@@ -11,6 +11,8 @@ Environment
   BATCH_SIZE=50       — AOIs per processing batch
   AOI_STEP=0.1       — AOI grid size in degrees
   SEARCH_MODE=asset    — derive search bounds from DT assets
+  GAIN_RULE=threshold  — "threshold" (default) or "delta", see filtering/gain_rule.py
+  GAIN_MIN_DELTA=50    — delta rule: minimum cover rise (points) for a gain pixel
 
 Cloud/snow masking, scene prefilter and observation thresholds come from
 export.composites / settings (cloud_score_thresh, min_s1_observations),
@@ -32,7 +34,9 @@ Validity checks
   • S2: pixel coverage (cloud+snow masked, ≥ min_s1_observations clear
     observations, full year) ≥ MIN_IMAGERY_FRACTION, every year
   • S1: ≥ settings.min_s1_observations qualifying acquisitions, every year
-  • ≥1% forest gain between the start and end year
+  • ≥0.1% forest gain pixels between the start and end year. A gain pixel has
+    start cover < non_tree_threshold_frac and, per GAIN_RULE, either end cover
+    > min_tree_threshold_frac (threshold) or a rise ≥ GAIN_MIN_DELTA (delta)
 
 Output fields include
 ---------------------
@@ -55,6 +59,8 @@ import ee
 from config import settings
 from dotenv import load_dotenv
 from export.composites import s1_observation_count, s2_availability
+from filtering.gain_rule import describe as describe_gain_rule
+from filtering.gain_rule import gain_image, gain_rule
 from gee.auth import get_ee_credentials
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
@@ -124,6 +130,7 @@ logger = logging.getLogger(__name__)
 ee.Initialize(get_ee_credentials(), project=settings.gee_project)
 
 logger.info(f"GEE initialised | project={settings.gee_project} | HPC={USE_HPC}")
+logger.info(describe_gain_rule())
 
 
 def get_dt_domain_geometry(
@@ -140,7 +147,7 @@ def get_dt_domain_geometry(
     mask = ee.Image.constant(0)
     for year in years:
         img = (
-            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v2")
+            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v5")
             .select(band_index)
             .reproject(crs="EPSG:3035", scale=working_scale)
         )
@@ -201,7 +208,7 @@ def _build_gee_datasets():
 
     def load_dt_mosaic(year):
         return (
-            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v2")
+            ee.Image(f"projects/symbolic-base-346316/assets/dt_tree_cover_{year}_v5")
             .select([0])
             .divide(2.55)
             .rename("tree_cover_pct")
@@ -211,9 +218,9 @@ def _build_gee_datasets():
     _cover_end = load_dt_mosaic(YEAR_END)
 
     _non_forest_start = _cover_start.lt(settings.non_tree_threshold_frac).unmask(0)
-    _forest_end = _cover_end.gt(settings.min_tree_threshold_frac).unmask(0)
 
-    _gain_mask = _non_forest_start.And(_forest_end).rename("gain")
+    # 0/1 gain pixels; the definition follows GAIN_RULE (filtering/gain_rule.py)
+    _gain_mask = gain_image(_cover_start, _cover_end)
 
     _dw_label_start = _dw_label_mode(YEAR_START)
     _dt_non_forest_start = _non_forest_start.rename("dt_non_forest_start")
@@ -835,6 +842,7 @@ def process_batch(
             "veg_fraction": float(veg_frac),
             "has_veg": int(has_veg),
             "forest_gain_frac": float(fg),
+            "gain_rule": gain_rule(),
             "has_gain": int(has_gain),
             "dt_dw_agreement_frac": qa["dt_dw_agreement_frac"],
             "has_imagery": int(has_img),

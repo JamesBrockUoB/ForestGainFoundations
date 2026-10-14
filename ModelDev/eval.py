@@ -6,6 +6,7 @@ import torchmetrics
 from datasets import MultiTemporalGainDataset
 from lightning_module import GainDetectionTask
 from torch.utils.data import DataLoader
+from torchmetrics.functional.classification import binary_average_precision
 from utils import get_device
 
 
@@ -61,6 +62,8 @@ def evaluate_checkpoint(
         "recall": torchmetrics.Recall(**kw).to(device),
     }
 
+    all_p, all_t, tile_ap = [], [], []
+
     with torch.no_grad():
         for batch in test_loader:
             x = batch["pixels"].to(device=device, dtype=torch.float32)
@@ -83,7 +86,30 @@ def evaluate_checkpoint(
             for metric in metrics.values():
                 metric.update(p, t)
 
+            # Threshold-free metrics, computed on CPU per tile and pooled
+            for b in range(probs.shape[0]):
+                vb = valid[b]
+                if not vb.any():
+                    continue
+                pb = probs[b][vb].float().cpu()
+                tb = targets[b][vb].cpu()
+                all_p.append(pb)
+                all_t.append(tb)
+                if tb.any():
+                    tile_ap.append(binary_average_precision(pb, tb))
+
     results = {name: metric.compute().item() for name, metric in metrics.items()}
+
+    if all_p:
+        p_all, t_all = torch.cat(all_p), torch.cat(all_t)
+        results["ap"] = (
+            binary_average_precision(p_all, t_all).item() if t_all.any() else 0.0
+        )
+        results["prevalence"] = t_all.float().mean().item()
+    else:
+        results["ap"], results["prevalence"] = 0.0, 0.0
+    results["map"] = torch.stack(tile_ap).mean().item() if tile_ap else 0.0
+
     print(" | ".join(f"{k}: {v:.3f}" for k, v in results.items()))
     return results
 
