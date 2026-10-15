@@ -22,7 +22,11 @@ def evaluate_checkpoint(
     crop_size: int | None = None,
     batch_size: int = 4,
     num_workers: int = 2,
+    min_gain_px: int = 0,
+    fill_holes_px: int = 0,
 ):
+    """min_gain_px / fill_holes_px clean the test LABELS the same way as in training
+    (0 = raw labels). Keep them fixed across runs if you want comparable numbers."""
     test_dir = Path(test_dir)
     test_dirs = sorted(
         p for p in test_dir.iterdir() if p.is_dir() and p.name.startswith("tile_")
@@ -46,7 +50,14 @@ def evaluate_checkpoint(
     sources = _checkpoint_sources(task)
     print(f"sources: {sources}")
 
-    test_ds = MultiTemporalGainDataset(test_dirs, sources=sources, crop_size=crop_size)
+    print(f"label cleaning: min_gain_px={min_gain_px} fill_holes_px={fill_holes_px}")
+    test_ds = MultiTemporalGainDataset(
+        test_dirs,
+        sources=sources,
+        crop_size=crop_size,
+        min_gain_px=min_gain_px,
+        fill_holes_px=fill_holes_px,
+    )
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
@@ -158,3 +169,22 @@ def generate_gain_map(
         dst.write(probs, 1)
 
     print(f"Saved probability gain map to {output_tif}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser(description="Evaluate a checkpoint on a tile folder")
+    p.add_argument("checkpoint")
+    p.add_argument("--test_dir", default="../DataCollection/data/holdout_tiles")
+    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--min_gain_px", type=int, default=0)
+    p.add_argument("--fill_holes_px", type=int, default=0)
+    a = p.parse_args()
+    evaluate_checkpoint(
+        a.checkpoint,
+        a.test_dir,
+        threshold=a.threshold,
+        min_gain_px=a.min_gain_px,
+        fill_holes_px=a.fill_holes_px,
+    )

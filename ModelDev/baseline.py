@@ -7,10 +7,13 @@ extracting it". It needs config.py (the updated one with SOURCES) but not torch.
     pip install scikit-learn lightgbm rasterio
     python baseline.py --sources alphaearth
     python baseline.py --sources tessera
-    python baseline.py --sources s1 s2          # reference: should clearly learn
+    python baseline.py --sources s1 s2
 
-Every run prints input sanity checks first (value ranges, int8 leftovers, embedding
-norms, NaN and clip fractions, label prevalence), then a results table.
+Memory-lean version: tiles are never loaded in full. Labels and valid masks (single
+band) are read first, the pixels to sample are chosen, then each (year, source) is
+read once, only the sampled pixels are kept, and the full array is freed
+immediately. Val tiles are read through a centre-crop window. Zero-shot scores are
+computed per tile, so raw val pixels are not kept around.
 """
 
 import argparse
@@ -33,6 +36,7 @@ from config import (
     VALID_MASK_BAND_INDEX,
     YEARS,
 )
+from rasterio.windows import Window
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, precision_recall_curve
 from sklearn.neural_network import MLPClassifier
@@ -50,10 +54,18 @@ def split_tile_dirs(data_dir, val_frac=0.2, seed=0):
     return tile_dirs[n_val:], tile_dirs[:n_val]
 
 
-def read_bands(path, band_names, mask_nodata):
+def crop_window(h, w, s):
+    """Centre-crop window (None = full tile)."""
+    if not s or (h <= s and w <= s):
+        return None
+    t, l = max(0, (h - s) // 2), max(0, (w - s) // 2)
+    return Window(l, t, min(s, w), min(s, h))
+
+
+def read_bands(path, band_names, mask_nodata, window=None):
     idx = [BAND_FILE_INDEX[b] for b in band_names]
     with rasterio.open(path) as src:
-        x = src.read(idx).astype(np.float32)
+        x = src.read(idx, window=window, out_dtype="float32")  # no extra copy
         nodata, transform, shape = src.nodata, src.transform, (src.height, src.width)
     if mask_nodata and nodata is not None and not np.isnan(nodata):
         x[x == np.float32(nodata)] = np.nan
@@ -63,36 +75,17 @@ def read_bands(path, band_names, mask_nodata):
     return x, transform, shape
 
 
-def load_tile(tile_dir, sources):
-    """-> phys (T,C,H,W) physical units (NaN kept), valid (H,W), gain (H,W) bool."""
-    frames, valid_masks, warned = [], [], False
+def load_masks(tile_dir, window):
+    """Single-band reads only: -> valid (H,W) bool, gain (H,W) bool, label transform, full shape."""
     with rasterio.open(tile_dir / "labels" / "gain_confidence.tif") as src:
-        conf = np.nan_to_num(src.read(1).astype(np.float32), nan=0.0)
-        label_tf = src.transform
+        conf = np.nan_to_num(src.read(1, window=window, out_dtype="float32"), nan=0.0)
+        label_tf, full_shape = src.transform, (src.height, src.width)
+    valid = np.ones(conf.shape, dtype=bool)
     for year in YEARS:
-        parts = []
-        for s in sources:
-            template, bands = SOURCES[s]
-            x, tf, shape = read_bands(
-                tile_dir / template.format(year=year), bands, s in EMBEDDING_SOURCES
-            )
-            if (
-                s in EMBEDDING_SOURCES
-                and not warned
-                and (tf != label_tf or shape != conf.shape)
-            ):
-                print(f"  !! grid mismatch vs label in {tile_dir.name}/{s}/{year}")
-                warned = True
-            parts.append(x)
-        frames.append(np.concatenate(parts, axis=0))
         with rasterio.open(tile_dir / "composites" / f"s1s2_{year}.tif") as src:
-            vm = src.read(VALID_MASK_BAND_INDEX).astype(np.float32)
-        valid_masks.append(np.nan_to_num(vm, nan=0.0) > 0)
-    return (
-        np.stack(frames),
-        np.all(valid_masks, axis=0),
-        conf > 0,
-    )
+            vm = src.read(VALID_MASK_BAND_INDEX, window=window, out_dtype="float32")
+        valid &= np.nan_to_num(vm, nan=0.0) > 0
+    return valid, conf > 0, label_tf, full_shape
 
 
 def normalise(phys, sources):
@@ -133,14 +126,6 @@ def normalise(phys, sources):
     return out
 
 
-def center_crop(arrs, s):
-    h, w = arrs[0].shape[-2:]
-    if not s or (h <= s and w <= s):
-        return arrs
-    t, l = (h - s) // 2, (w - s) // 2
-    return [a[..., t : t + s, l : l + s] for a in arrs]
-
-
 # ------------------------------------------------------------------- features
 def change_features(P, sources):
     """P: (T, C, n) physical values of the sampled pixels.
@@ -159,11 +144,36 @@ def change_features(P, sources):
     return np.concatenate(feats, 0).T if feats else None  # (n, 2*(T-1)*n_emb)
 
 
-def sample_tile(tile_dir, sources, mode, rng, args, with_change):
-    phys, valid, gain = load_tile(tile_dir, sources)
-    if mode == "val":
-        phys, valid, gain = center_crop([phys, valid, gain], args.val_crop)
-    T, C, H, W = phys.shape
+def zero_shot_scores(P, sources):
+    """Training-free change scores per embedding source. -> {name: (n,) array}"""
+    out, c0 = {}, 0
+    for s in sources:
+        c = len(SOURCES[s][1])
+        if s in EMBEDDING_SOURCES:
+            E = np.nan_to_num(P[:, c0 : c0 + c])
+            a, b = E[1:], E[:-1]
+            cd = 1 - (a * b).sum(1) / (
+                np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-8
+            )
+            fl = 1 - (E[-1] * E[0]).sum(0) / (
+                np.linalg.norm(E[-1], axis=0) * np.linalg.norm(E[0], axis=0) + 1e-8
+            )
+            out[f"{s}: zero-shot max consecutive cosine dist"] = cd.max(0)
+            out[f"{s}: zero-shot first-vs-last cosine dist"] = fl
+            out[f"{s}: zero-shot max consecutive L2 dist"] = np.linalg.norm(
+                a - b, axis=1
+            ).max(0)
+        c0 += c
+    return out
+
+
+def sample_tile(tile_dir, sources, mode, rng, args, with_change, want_phys):
+    window = None
+    if mode == "val" and args.val_crop:
+        with rasterio.open(tile_dir / "labels" / "gain_confidence.tif") as src:
+            window = crop_window(src.height, src.width, args.val_crop)
+
+    valid, gain, label_tf, full_shape = load_masks(tile_dir, window)
     v, g = valid.reshape(-1), gain.reshape(-1)
     pos, neg = np.flatnonzero(v & g), np.flatnonzero(v & ~g)
     if mode == "train":
@@ -171,16 +181,45 @@ def sample_tile(tile_dir, sources, mode, rng, args, with_change):
         n_neg = min(len(neg), max(args.neg_ratio * len(pos), args.min_neg))
         idx = np.concatenate([pos, rng.permutation(neg)[:n_neg]])
     else:
-        allv = np.flatnonzero(v)
-        idx = rng.permutation(allv)[: args.val_px_per_tile]
+        idx = rng.permutation(np.flatnonzero(v))[: args.val_px_per_tile]
     if len(idx) == 0:
         return None
-    flat_phys = phys.reshape(T, C, -1)[:, :, idx]  # (T, C, n)
-    X = normalise(flat_phys, sources)
-    X = X.reshape(T * C, -1).T  # (n, T*C)
+    idx = np.sort(idx)
+
+    C = sum(len(SOURCES[s][1]) for s in sources)
+    flat_phys = np.empty((len(YEARS), C, len(idx)), dtype=np.float32)
+    warned = False
+    for ti, year in enumerate(YEARS):
+        c0 = 0
+        for s in sources:
+            template, bands = SOURCES[s]
+            x, tf, shape = read_bands(
+                tile_dir / template.format(year=year),
+                bands,
+                s in EMBEDDING_SOURCES,
+                window,
+            )
+            if (
+                s in EMBEDDING_SOURCES
+                and not warned
+                and (tf != label_tf or shape != full_shape)
+            ):
+                print(f"  !! grid mismatch vs label in {tile_dir.name}/{s}/{year}")
+                warned = True
+            flat_phys[ti, c0 : c0 + len(bands)] = x.reshape(len(bands), -1)[:, idx]
+            c0 += len(bands)
+            del x  # free the full band stack right away
+
+    T = flat_phys.shape[0]
+    X = normalise(flat_phys, sources).reshape(T * C, -1).T.astype(np.float32)
     y = g[idx].astype(np.int8)
     ch = change_features(flat_phys, sources) if with_change else None
-    return X, y, ch, flat_phys
+    zs = (
+        zero_shot_scores(flat_phys, sources)
+        if (mode == "val" and with_change)
+        else None
+    )
+    return X, y, ch, zs, (flat_phys if want_phys else None)
 
 
 # -------------------------------------------------------------------- metrics
@@ -291,6 +330,9 @@ def main():
         default=128,
         help="center crop like train.py val (0=full)",
     )
+    ap.add_argument(
+        "--sanity_px", type=int, default=50000, help="pixels kept for sanity stats"
+    )
     args = ap.parse_args()
 
     sources = tuple(args.sources)
@@ -316,63 +358,50 @@ def main():
 
     t0 = time.time()
     data = {}
+    zs_all, phys_keep, phys_n = {}, [], 0
     for mode, dirs in (("train", train_dirs), ("val", val_dirs)):
-        Xs, ys, chs, phs = [], [], [], []
+        Xs, ys, chs = [], [], []
         for d in dirs:
-            r = sample_tile(d, sources, mode, rng, args, has_emb)
+            want_phys = mode == "val" and phys_n < args.sanity_px
+            r = sample_tile(d, sources, mode, rng, args, has_emb, want_phys)
             if r is None:
                 continue
             Xs.append(r[0])
             ys.append(r[1])
             if r[2] is not None:
-                chs.append(r[2])
-            if mode == "val":
-                phs.append(r[3])
+                chs.append(r[2].astype(np.float32))
+            if r[3] is not None:
+                for k, vals in r[3].items():
+                    zs_all.setdefault(k, []).append(vals.astype(np.float32))
+            if r[4] is not None:
+                phys_keep.append(r[4])
+                phys_n += r[4].shape[2]
         data[mode] = (
             np.concatenate(Xs),
             np.concatenate(ys),
             np.concatenate(chs) if chs else None,
-            np.concatenate(phs, axis=2) if phs else None,
         )
+        del Xs, ys, chs
         print(f"{mode}: {len(data[mode][1]):,} pixels loaded ({time.time() - t0:.0f}s)")
 
-    Xtr, ytr, Ctr, _ = data["train"]
-    Xva, yva, Cva, Pva = data["val"]
+    Xtr, ytr, Ctr = data["train"]
+    Xva, yva, Cva = data["val"]
     if yva.sum() == 0 or ytr.sum() == 0:
         raise SystemExit("no positive pixels in train or val sample")
-    sanity(sources, Pva[:, :, : min(50000, Pva.shape[2])], Xtr, ytr, yva)
+    sanity(sources, np.concatenate(phys_keep, axis=2), Xtr, ytr, yva)
+    del phys_keep
 
     rows = []
     # zero-shot cosine/L2 scores (no training at all)
-    if has_emb:
-        T = Pva.shape[0]
-        c0 = 0
-        for s in sources:
-            c = len(SOURCES[s][1])
-            if s in EMBEDDING_SOURCES:
-                E = np.nan_to_num(Pva[:, c0 : c0 + c])
-                a, b = E[1:], E[:-1]
-                cd = 1 - (a * b).sum(1) / (
-                    np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-8
-                )
-                fl = 1 - (E[-1] * E[0]).sum(0) / (
-                    np.linalg.norm(E[-1], axis=0) * np.linalg.norm(E[0], axis=0) + 1e-8
-                )
-                for name, sc in (
-                    ("zero-shot max consecutive cosine dist", cd.max(0)),
-                    ("zero-shot first-vs-last cosine dist", fl),
-                    (
-                        "zero-shot max consecutive L2 dist",
-                        np.linalg.norm(a - b, axis=1).max(0),
-                    ),
-                ):
-                    sc = (sc - sc.min()) / (np.ptp(sc) + 1e-12)
-                    rows.append((f"{s}: {name}", evaluate(yva, sc)))
-            c0 += c
+    for name, parts in zs_all.items():
+        sc = np.concatenate(parts)
+        sc = (sc - sc.min()) / (np.ptp(sc) + 1e-12)
+        rows.append((name, evaluate(yva, sc)))
 
     feature_sets = {"raw": (Xtr, Xva)}
     if has_emb:
         feature_sets["raw+change"] = (np.hstack([Xtr, Ctr]), np.hstack([Xva, Cva]))
+    del Ctr, Cva
     for fname, (A, B) in feature_sets.items():
         sc = StandardScaler().fit(A)
         A, B = sc.transform(A), sc.transform(B)

@@ -20,9 +20,9 @@ class GainDetectionTask(pl.LightningModule):
         weight_decay: float = 1e-2,
         warmup_frac: float = 0.05,
         loss_type: str = "hard",
-        tversky_alpha: float = 0.7,
-        tversky_beta: float = 0.3,
-        tversky_gamma: float = 0.75,
+        tversky_alpha: float = 0.5,  # 0.5 / 0.5 / 1.0 = plain soft Dice (nothing to tune)
+        tversky_beta: float = 0.5,
+        tversky_gamma: float = 1.0,
         pos_weight: float | None = None,
         eval_threshold: float = 0.50,
         sources: tuple[str, ...] = ("s1", "s2"),

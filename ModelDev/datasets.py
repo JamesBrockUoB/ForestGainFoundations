@@ -16,6 +16,7 @@ from config import (
     VALID_MASK_BAND_INDEX,
     YEARS,
 )
+from scipy import ndimage
 from torch.utils.data import Dataset
 
 
@@ -24,6 +25,39 @@ def split_tile_dirs(data_dir, val_frac=0.2, seed=0):
     random.Random(seed).shuffle(tile_dirs)
     n_val = max(1, round(val_frac * len(tile_dirs)))
     return tile_dirs[n_val:], tile_dirs[:n_val]
+
+
+def clean_gain_mask(gain_mask, gain_weight, min_px=0, fill_px=0):
+    """Tidy a binary gain label.
+
+    1. Remove gain patches smaller than min_px pixels (salt). Patches are
+       8-connected, so diagonal neighbours count as one patch.
+    2. Fill background holes smaller than fill_px pixels (pepper). Holes are
+       4-connected, so a diagonal gap does not count as a hole.
+    Removing runs first, so a hole is never filled between patches that were
+    about to be dropped. Filled pixels get the mean confidence of the tile's
+    kept gain pixels (only matters for the soft loss). 0 disables a step.
+    Returns new (gain_mask, gain_weight); inputs are not modified."""
+    mask = gain_mask > 0.5
+    weight = gain_weight.copy()
+
+    if min_px > 1 and mask.any():
+        lab, _ = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
+        small = np.bincount(lab.ravel()) < min_px
+        small[0] = False
+        mask = mask & ~small[lab]
+
+    if fill_px > 1 and mask.any():
+        lab, _ = ndimage.label(~mask)  # default 4-connectivity
+        small = np.bincount(lab.ravel()) < fill_px
+        small[0] = False  # label 0 is the gain itself
+        holes = small[lab]
+        if holes.any():
+            weight[holes] = float(weight[mask].mean())
+            mask = mask | holes
+
+    weight = np.where(mask, weight, 0.0).astype(np.float32)
+    return mask.astype(np.float32), weight
 
 
 def read_physical(path: Path, band_names, mask_nodata: bool = False) -> np.ndarray:
@@ -69,12 +103,17 @@ class MultiTemporalGainDataset(Dataset):
         frame_sigma: float = 0.01,
         frame_drop_p: float = 0.0,
         label_sigma: float = 0.0,
+        min_gain_px: int = 0,
+        fill_holes_px: int = 0,
     ):
         """
         sources: any of s1, s2, alphaearth, tessera (channels are concatenated).
         crop_size: random crop (train) / center crop (eval). None keeps full tile.
         repeats:   virtual dataset length multiplier (more steps per epoch).
         label_sigma: jitter on soft confidence weights (use only with soft loss).
+        min_gain_px: drop gain patches smaller than this many pixels (0 = off).
+        fill_holes_px: fill holes smaller than this many pixels inside gain (0 = off).
+        Both run on the full tile before any crop or augmentation.
         """
         sources = tuple(sources)
         if not sources:
@@ -93,6 +132,8 @@ class MultiTemporalGainDataset(Dataset):
         self.frame_sigma = frame_sigma
         self.frame_drop_p = frame_drop_p
         self.label_sigma = label_sigma
+        self.min_gain_px = min_gain_px
+        self.fill_holes_px = fill_holes_px
 
         self.band_names = tuple(band for s in sources for band in SOURCES[s][1])
 
@@ -195,6 +236,10 @@ class MultiTemporalGainDataset(Dataset):
 
         gain_mask = (confidence > 0).astype(np.float32)
         gain_weight = np.clip(confidence / 100.0, 0.0, 1.0).astype(np.float32)
+        if self.min_gain_px > 1 or self.fill_holes_px > 1:
+            gain_mask, gain_weight = clean_gain_mask(
+                gain_mask, gain_weight, self.min_gain_px, self.fill_holes_px
+            )
 
         pixels, gain_mask, gain_weight, combined_valid = self._crop(
             [pixels, gain_mask, gain_weight, combined_valid], train=self.augment

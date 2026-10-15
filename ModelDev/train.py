@@ -3,11 +3,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pytorch_lightning as pl
-import rasterio
 from config import DEFAULT_IMAGE_SIZE, SOURCES
-from datasets import MultiTemporalGainDataset, split_tile_dirs
+from datasets import MultiTemporalGainDataset
 from eval import evaluate_checkpoint
 from lightning_module import GainDetectionTask
 from pytorch_lightning.callbacks import (
@@ -16,25 +14,7 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
 )
 from torch.utils.data import DataLoader
-
-
-def auto_pos_weight(tile_dirs) -> float:
-    """sqrt(negatives / positives) over the TRAINING tiles' gain labels.
-
-    Positives follow the dataset's definition (gain_confidence > 0). Pixels with
-    gain_valid == 0 are not excluded here (the loss ignores them), which is a
-    negligible difference when imagery retention is ~99%.
-    """
-    pos = neg = 0
-    for d in tile_dirs:
-        with rasterio.open(Path(d) / "labels" / "gain_confidence.tif") as src:
-            c = np.nan_to_num(src.read(1).astype(np.float32), nan=0.0)
-        n_pos = int((c > 0).sum())
-        pos += n_pos
-        neg += c.size - n_pos
-    if pos == 0:
-        raise ValueError("No positive gain pixels in the training tiles")
-    return float(np.sqrt(neg / pos))
+from utils import auto_pos_weight, split_tiles
 
 
 def _pos_weight_arg(value: str):
@@ -79,11 +59,20 @@ def parse_args():
 
     # Split
     p.add_argument("--val_frac", type=float, default=0.2)
+    p.add_argument(
+        "--split_seed",
+        type=int,
+        default=0,
+        help="Seed for the train/val split only; --seed (model init, data order) does not change it.",
+    )
 
     # Loss
-    p.add_argument("--tversky_alpha", type=float, default=0.7)
-    p.add_argument("--tversky_beta", type=float, default=0.3)
-    p.add_argument("--tversky_gamma", type=float, default=0.75)
+    # Defaults 0.5 / 0.5 / 1.0 make the Tversky term plain soft Dice (balanced
+    # FP/FN, no focal exponent), i.e. nothing to tune. The precision/recall
+    # trade-off is chosen afterwards via the decision threshold on validation.
+    p.add_argument("--tversky_alpha", type=float, default=0.5)
+    p.add_argument("--tversky_beta", type=float, default=0.5)
+    p.add_argument("--tversky_gamma", type=float, default=1.0)
     p.add_argument(
         "--pos_weight",
         type=_pos_weight_arg,
@@ -103,6 +92,20 @@ def parse_args():
     p.add_argument(
         "--repeats", type=int, default=1, help="Train samples per tile/epoch"
     )
+    p.add_argument(
+        "--min_gain_px",
+        type=int,
+        default=0,
+        help="Label cleaning: drop gain patches smaller than this many pixels "
+        "(10 m pixels: 100 px = 1 ha). Applied to train AND val labels. The holdout "
+        "test is reported on raw labels (test_*) and on cleaned labels (test_clean_*).",
+    )
+    p.add_argument(
+        "--fill_holes_px",
+        type=int,
+        default=0,
+        help="Label cleaning: fill holes smaller than this many pixels inside gain.",
+    )
     p.add_argument("--no_augment", action="store_true")
     return p.parse_args()
 
@@ -111,10 +114,8 @@ def train(args):
     pl.seed_everything(args.seed, workers=True)
     sources = tuple(args.sources)
 
-    train_dirs, val_dirs = split_tile_dirs(
-        args.data_dir,
-        val_frac=args.val_frac,
-        seed=args.seed,
+    train_dirs, val_dirs = split_tiles(
+        args.data_dir, val_frac=args.val_frac, seed=args.split_seed
     )
     print(f"train tiles: {len(train_dirs)} | val tiles: {len(val_dirs)} ")
     print(f"sources: {sources}")
@@ -133,6 +134,8 @@ def train(args):
             f"lr{args.learning_rate:g}",
             f"wd{args.weight_decay:g}",
             f"rep{args.repeats}",
+            *([f"mmu{args.min_gain_px}"] if args.min_gain_px else []),
+            *([f"fill{args.fill_holes_px}"] if args.fill_holes_px else []),
             *([f"pw{args.pos_weight:g}"] if args.pos_weight is not None else []),
             f"seed{args.seed}",
             datetime.now().strftime("%m%d-%H%M"),
@@ -152,10 +155,18 @@ def train(args):
         crop_size=crop,
         repeats=args.repeats,
         label_sigma=0.1 if args.loss_type == "soft" else 0.0,
+        min_gain_px=args.min_gain_px,
+        fill_holes_px=args.fill_holes_px,
     )
     # Validation always runs on full tiles (TSViT interpolates its position
     # embedding, so a model trained on crops still accepts them).
-    val_ds = MultiTemporalGainDataset(val_dirs, sources=sources, crop_size=None)
+    val_ds = MultiTemporalGainDataset(
+        val_dirs,
+        sources=sources,
+        crop_size=None,
+        min_gain_px=args.min_gain_px,
+        fill_holes_px=args.fill_holes_px,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -230,6 +241,18 @@ def train(args):
             crop_size=None,  # full tiles
         )
         logger.log_metrics({f"test_{k}": v for k, v in results.items()})
+
+        # Same checkpoint against labels cleaned like the training labels
+        if args.min_gain_px or args.fill_holes_px:
+            print("--- test set, cleaned labels ---")
+            clean = evaluate_checkpoint(
+                best,
+                test_dir=Path(args.holdout_dir),
+                crop_size=None,
+                min_gain_px=args.min_gain_px,
+                fill_holes_px=args.fill_holes_px,
+            )
+            logger.log_metrics({f"test_clean_{k}": v for k, v in clean.items()})
 
 
 if __name__ == "__main__":

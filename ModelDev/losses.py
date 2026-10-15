@@ -7,7 +7,11 @@ class FocalTverskyBCELoss(nn.Module):
     """
     BCE + Focal Tversky for rare positives. Ignores pixels where gain_valid == 0.
 
-    alpha > beta penalises false negatives more than false positives.
+    Defaults alpha=beta=0.5, gamma=1.0 make the Tversky term plain soft Dice:
+    balanced false positives / false negatives and no focal exponent, so there is
+    nothing to tune. The precision/recall trade-off is then chosen with the decision
+    threshold on validation. alpha > beta penalises false negatives more than false
+    positives; gamma < 1 focuses on hard examples.
     loss_type='soft' scales positive pixels by their confidence weight.
     pos_weight (optional float) up-weights positives in the BCE term.
     """
@@ -15,9 +19,9 @@ class FocalTverskyBCELoss(nn.Module):
     def __init__(
         self,
         loss_type: str = "hard",
-        alpha: float = 0.7,
-        beta: float = 0.3,
-        gamma: float = 0.75,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+        gamma: float = 1.0,
         pos_weight: float | None = None,
         smooth: float = 1e-6,
     ):

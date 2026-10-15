@@ -15,7 +15,7 @@ DATA_DIR = "../DataCollection/data/test_tiles"
 def build_sweep_configuration(sources):
     return {
         "method": "bayes",
-        "metric": {"goal": "maximize", "name": "val_iou"},
+        "metric": {"goal": "maximize", "name": "val_ap"},
         "parameters": {
             "learning_rate": {
                 "distribution": "log_uniform_values",

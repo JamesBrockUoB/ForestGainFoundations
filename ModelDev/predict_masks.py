@@ -5,14 +5,89 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
+import torch
+from config import EMBEDDING_SOURCES, SOURCES
 from datasets import MultiTemporalGainDataset
 from eval import evaluate_checkpoint, generate_gain_map
 
 
-def main(ckpt, test_root, out_dir, threshold=0.5, max_plots=20, crop_size=None):
+def checkpoint_sources(ckpt) -> tuple[str, ...]:
+    """Input sources the checkpoint was trained on (old checkpoints = s1 + s2)."""
+    hp = torch.load(ckpt, map_location="cpu", weights_only=False).get(
+        "hyper_parameters", {}
+    )
+    return tuple(hp.get("sources", ("s1", "s2")))
+
+
+def source_slice(sources, name):
+    """Channel slice of one source inside the concatenated input."""
+    start = 0
+    for s in sources:
+        n = len(SOURCES[s][1])
+        if s == name:
+            return slice(start, start + n)
+        start += n
+    raise KeyError(name)
+
+
+def _stretch(a, lo_hi=None):
+    lo, hi = lo_hi if lo_hi is not None else np.percentile(a, [2, 98])
+    return np.clip((a - lo) / (hi - lo + 1e-6), 0, 1)
+
+
+def make_renderer(px, sources, name):
+    """Return (render(t) -> HxWx3 image, description) for one trained-on source.
+    px: (T, C, H, W) normalised model input."""
+    sl = source_slice(sources, name)
+    bands = list(SOURCES[name][1])
+    x = px[:, sl]  # (T, c, H, W)
+
+    if name == "s2":  # true colour
+        idx = [bands.index(b) for b in ("B4", "B3", "B2")]
+        return (lambda t: _stretch(x[t][idx].transpose(1, 2, 0))), "RGB"
+
+    if name in EMBEDDING_SOURCES:  # PCA of the embedding, fitted on first+last frame
+        T, c, H, W = x.shape
+        flat = np.concatenate(
+            [x[0].reshape(c, -1), x[-1].reshape(c, -1)], axis=1
+        ).T  # (2HW, c)
+        mu = flat.mean(0)
+        _, _, vt = np.linalg.svd(
+            flat[:: max(1, len(flat) // 20000)] - mu, full_matrices=False
+        )
+        comp = vt[:3]
+        proj = {
+            t: ((x[t].reshape(c, -1).T - mu) @ comp.T).reshape(H, W, 3)
+            for t in (0, T - 1)
+        }
+        both = np.concatenate([proj[0], proj[T - 1]])
+        lo_hi = np.percentile(
+            both, [2, 98]
+        )  # same stretch both years so colours compare
+        return (lambda t: _stretch(proj[0 if t == 0 else T - 1], lo_hi)), "PCA(3)"
+
+    # SAR / anything else: false colour from the first two bands (R=b0, G=b1, B=b0-b1)
+    b0, b1 = x[:, 0], x[:, min(1, x.shape[1] - 1)]
+    stack = np.stack([b0, b1, b0 - b1], axis=-1)  # (T, H, W, 3)
+    lo_hi = np.percentile(stack, [2, 98])
+    return (
+        lambda t: _stretch(stack[t], lo_hi)
+    ), f"{bands[0]}/{bands[min(1, len(bands) - 1)]}"
+
+
+def main(
+    ckpt, test_root, out_dir, threshold=0.5, max_plots=20, crop_size=None, show=None
+):
     out = Path(out_dir)
     (out / "tifs").mkdir(parents=True, exist_ok=True)
     (out / "plots").mkdir(parents=True, exist_ok=True)
+
+    sources = checkpoint_sources(ckpt)
+    show = list(show) if show else ["s2" if "s2" in sources else sources[0]]
+    bad = [s for s in show if s not in sources]
+    if bad:
+        raise ValueError(f"--show {bad}: model was trained on {list(sources)}")
+    print(f"model sources: {sources} | showing: {show}")
 
     print("=== Step 1: Running Evaluation Metrics ===")
     evaluate_checkpoint(
@@ -32,8 +107,7 @@ def main(ckpt, test_root, out_dir, threshold=0.5, max_plots=20, crop_size=None):
         raise ValueError(f"No tile_* directories found in {test_root}")
 
     print(f"\n=== Step 2: Generating Gain Maps and Plots ({len(tile_dirs)} tiles) ===")
-    ds = MultiTemporalGainDataset(tile_dirs, crop_size=crop_size)
-    rgb_idx = [ds.band_names.index(b) for b in ("B4", "B3", "B2")]
+    ds = MultiTemporalGainDataset(tile_dirs, sources=sources, crop_size=crop_size)
 
     for i, tile_dir in enumerate(tile_dirs):
         tid = tile_dir.name
@@ -74,31 +148,27 @@ def main(ckpt, test_root, out_dir, threshold=0.5, max_plots=20, crop_size=None):
         with rasterio.open(mask_path, "w", **prof) as dst:
             dst.write((pred & valid).astype(np.uint8), 1)
 
-        # 4. Diagnostic Plots
+        # 4. Diagnostic plots: start/end imagery for each chosen source, then label/prob/pred
         if i < max_plots:
             px = s["pixels"].numpy()
+            ncols = 2 * len(show) + 3
+            fig, ax = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
 
-            def rgb(t):
-                a = px[t][rgb_idx].transpose(1, 2, 0)
-                lo, hi = np.percentile(a, [2, 98])
-                return np.clip((a - lo) / (hi - lo + 1e-6), 0, 1)
+            k = 0
+            for name in show:
+                render, desc = make_renderer(px, sources, name)
+                ax[k].imshow(render(0))
+                ax[k].set_title(f"{ds.years[0]} {name} {desc}")
+                ax[k + 1].imshow(render(-1))
+                ax[k + 1].set_title(f"{ds.years[-1]} {name} {desc}")
+                k += 2
 
-            fig, ax = plt.subplots(1, 5, figsize=(20, 4))
-
-            ax[0].imshow(rgb(0))
-            ax[0].set_title(f"{ds.years[0]} RGB")
-
-            ax[1].imshow(rgb(-1))
-            ax[1].set_title(f"{ds.years[-1]} RGB")
-
-            ax[2].imshow(gt & valid, cmap="gray")
-            ax[2].set_title("label")
-
-            ax[3].imshow(probs, vmin=0, vmax=1, cmap="viridis")
-            ax[3].set_title("prob")
-
-            ax[4].imshow(pred & valid, cmap="gray")
-            ax[4].set_title(f"pred > {threshold}")
+            ax[k].imshow(gt & valid, cmap="gray")
+            ax[k].set_title("label")
+            ax[k + 1].imshow(probs, vmin=0, vmax=1, cmap="viridis")
+            ax[k + 1].set_title("prob")
+            ax[k + 2].imshow(pred & valid, cmap="gray")
+            ax[k + 2].set_title(f"pred > {threshold}")
 
             for a in ax:
                 a.axis("off")
@@ -118,6 +188,13 @@ if __name__ == "__main__":
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--max_plots", type=int, default=20)
     p.add_argument("--crop_size", type=int, default=None)
+    p.add_argument(
+        "--show",
+        nargs="+",
+        default=None,
+        help="which of the model's training sources to display next to the results "
+        "(e.g. s2, s1, tessera; several allowed). Default: s2 if the model used it, else its first source.",
+    )
 
     a = p.parse_args()
 
@@ -128,4 +205,5 @@ if __name__ == "__main__":
         threshold=a.threshold,
         max_plots=a.max_plots,
         crop_size=a.crop_size,
+        show=a.show,
     )
