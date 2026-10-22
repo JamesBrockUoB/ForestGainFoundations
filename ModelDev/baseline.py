@@ -85,6 +85,11 @@ def load_masks(tile_dir, window):
         with rasterio.open(tile_dir / "composites" / f"s1s2_{year}.tif") as src:
             vm = src.read(VALID_MASK_BAND_INDEX, window=window, out_dtype="float32")
         valid &= np.nan_to_num(vm, nan=0.0) > 0
+        # same rule as datasets.py: also drop pixels TESSERA has no embedding for
+        tessera_path = tile_dir / "embeddings" / f"tessera_{year}.tif"
+        if tessera_path.exists():
+            with rasterio.open(tessera_path) as src:
+                valid &= ~np.isnan(src.read(1, window=window, out_dtype="float32"))
     return valid, conf > 0, label_tf, full_shape
 
 

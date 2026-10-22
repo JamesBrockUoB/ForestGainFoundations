@@ -218,12 +218,19 @@ class MultiTemporalGainDataset(Dataset):
                 )
             frames.append(np.concatenate(parts, axis=0))
 
-            # Valid mask always comes from the S1/S2 composite so every input
-            # type is trained and scored on identical pixels.
+            # Valid mask comes from the S1/S2 composite, further restricted to
+            # pixels TESSERA has an embedding for (it marks sea / uncovered
+            # pixels as NaN). Applied whatever --sources is, so every input
+            # type is still trained and scored on identical pixels.
             mask_path = tile_dir / "composites" / f"s1s2_{year}.tif"
             with rasterio.open(mask_path) as src:
                 vm = src.read(VALID_MASK_BAND_INDEX).astype(np.float32)
             valid_masks.append(np.nan_to_num(vm, nan=0.0) > 0)
+
+            tessera_path = tile_dir / "embeddings" / f"tessera_{year}.tif"
+            if tessera_path.exists():
+                with rasterio.open(tessera_path) as src:
+                    valid_masks.append(~np.isnan(src.read(1)))
 
         pixels = np.stack(frames, axis=0)  # (T, C, H, W), may hold NaN
         combined_valid = np.all(np.stack(valid_masks, axis=0), axis=0).astype(

@@ -16,13 +16,19 @@ def build_static_layers(geom: ee.Geometry) -> dict[str, ee.Image]:
     fabdem = ee.ImageCollection(datasets.fabdem).filterBounds(geom).mosaic().clip(geom)
 
     fabdem_native = fabdem.setDefaultProjection(crs="EPSG:4326", scale=30)
+
+    # Give DEM the same bilinear + target grid treatment as slope
+    dem = fabdem_native.resample("bilinear").reproject(
+        crs=settings.crs_wkt, scale=settings.scale
+    )
+
     slope_native = ee.Terrain.slope(fabdem_native)
     slope = slope_native.resample("bilinear").reproject(
         crs=settings.crs_wkt, scale=settings.scale
     )
 
     return {
-        "fabdem": fabdem.rename("DEM"),
+        "fabdem": dem.rename("DEM"),
         "slope": slope.rename("slope"),
         "protected_area": _protected_area_mask(geom).clip(geom),
     }

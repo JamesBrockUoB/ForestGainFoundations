@@ -19,6 +19,7 @@ from export.year_chunks import chunk_years
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tiling.grid import crs_transform as tile_crs_transform
+from tiling.grid import footprint_bounds_lonlat
 
 
 class TesseraNoDataError(RuntimeError):
@@ -42,6 +43,11 @@ _MAX_CONCURRENT_YEARS = getattr(
     _DEFAULT_MAX_CONCURRENT_YEARS,
 )
 
+# Reject a tile when more than this fraction of it has no TESSERA embedding
+# (sea, or blocks that do not cover the tile). Smaller gaps are written as NaN
+# and masked out downstream.
+_MAX_NODATA_FRAC = getattr(settings, "tessera_max_nodata_frac", 0.01)
+
 # Errors that will not fix themselves on retry (e.g. a zero-byte / truncated
 # upstream file). Matched on message text as a fallback; the EOFError cause
 # check in _is_permanent is the sturdier signal.
@@ -63,11 +69,12 @@ def _is_permanent(exc: BaseException) -> bool:
 
 
 def tile_bbox(tile: dict) -> tuple[float, float, float, float]:
-    return (
-        tile["min_lon"],
-        tile["min_lat"],
-        tile["max_lon"],
-        tile["max_lat"],
+    return footprint_bounds_lonlat(
+        tile["x_min_m"],
+        tile["y_min_m"],
+        tile["x_max_m"],
+        tile["y_max_m"],
+        pad_deg=0.002,
     )
 
 
@@ -75,6 +82,7 @@ def _align_to_tile_grid(
     src_paths: list[str],
     dest_path: Path,
     tile: dict,
+    year: int,
 ) -> None:
     with rasterio.Env(GDAL_CACHEMAX=_GDAL_CACHEMAX_MB):
         ct = tile_crs_transform(tile)
@@ -130,6 +138,19 @@ def _align_to_tile_grid(
                 combined[fill] = piece[fill]
 
                 del piece
+
+        # TESSERA marks pixels it has no embedding for (e.g. sea) with exact zeros
+        # in every band; blocks that are missing entirely stay NaN. Treat both as
+        # no-data, reject the tile if too much of it is affected, and otherwise
+        # write the gaps as NaN. Raised before anything is written to disk.
+        nodata = np.isnan(combined).all(axis=0) | (combined == 0).all(axis=0)
+        nodata_frac = float(nodata.mean())
+        if nodata_frac > _MAX_NODATA_FRAC:
+            raise TesseraNoDataError(
+                f"TESSERA {year}: {nodata_frac:.0%} of tile has no embedding "
+                f"(limit {_MAX_NODATA_FRAC:.0%})"
+            )
+        combined[:, nodata] = np.nan
 
         meta = base_meta.copy()
         meta.update(
@@ -199,6 +220,7 @@ def _fetch_and_align_year(
                 files,
                 Path(dest_path),
                 tile,
+                year,
             )
 
         result_queue.put(
@@ -513,6 +535,7 @@ def download_tessera_with_retry(
     cancel_event: Event,
     retries: int = 2,
     years: list[int] | None = None,
+    raise_no_data: bool = False,
 ) -> bool:
     tile_id = tile["tile_id"]
 
@@ -543,6 +566,8 @@ def download_tessera_with_retry(
                 f"{tile_id} | TESSERA has no data for this tile; "
                 f"not retrying: {exc}"
             )
+            if raise_no_data:
+                raise
             return False
 
         except Exception as exc:
@@ -579,14 +604,22 @@ def fetch_tessera_in_chunks(
 
         retries = 2 if len(years) > 1 else 4
 
-        if download_tessera_with_retry(
-            tile,
-            output_dir,
-            logger,
-            cancel_event,
-            retries=retries,
-            years=years,
-        ):
+        try:
+            ok = download_tessera_with_retry(
+                tile,
+                output_dir,
+                logger,
+                cancel_event,
+                retries=retries,
+                years=years,
+                raise_no_data=True,
+            )
+        except TesseraNoDataError:
+            # Deterministic (no / too little data): splitting into smaller
+            # requests would only re-download the same blocks.
+            return False
+
+        if ok:
             return True
 
         if len(years) == 1:

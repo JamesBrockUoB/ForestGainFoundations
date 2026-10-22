@@ -89,7 +89,7 @@ SEARCH_MODE = os.getenv("SEARCH_MODE", "asset")
 
 MIN_VEG_FRACTION = 0.01
 MIN_LAND_FRACTION = 0.01
-MIN_GAIN_FRACTION = 0.01
+MIN_GAIN_FRACTION = 0.001
 
 # Coarse AOI-level S2 coverage gate (scale=500 mean, worst year). The strict
 # 99% requirement is enforced per tile in the tile imagery stage.

@@ -17,6 +17,7 @@ from export.composites import (
 )
 from gee_datasets.registry import Datasets
 from labels.gain import build_gain_layer
+from tiling.grid import footprint_bounds_lonlat
 
 NO_GAIN_SENTINEL = -9999.0
 
@@ -86,10 +87,15 @@ def check_tessera_coverage(tiles, logger=None):
     missing_by_tile: dict[str, list[int]] = {}
 
     for t in tiles:
-        x0 = math.floor(t["min_lon"] * 10)
-        x1 = math.floor(t["max_lon"] * 10 - 1e-9)
-        y0 = math.floor(t["min_lat"] * 10)
-        y1 = math.floor(t["max_lat"] * 10 - 1e-9)
+        # Footprint bounds, not the stored min/max_lon/lat: those are only the
+        # SW/NE corners and miss cells once the grid is rotated (EPSG:3035).
+        min_lon, min_lat, max_lon, max_lat = footprint_bounds_lonlat(
+            t["x_min_m"], t["y_min_m"], t["x_max_m"], t["y_max_m"]
+        )
+        x0 = math.floor(min_lon * 10)
+        x1 = math.floor(max_lon * 10 - 1e-9)
+        y0 = math.floor(min_lat * 10)
+        y1 = math.floor(max_lat * 10 - 1e-9)
         cells = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
         miss = [

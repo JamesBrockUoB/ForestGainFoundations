@@ -17,3 +17,5 @@ streamlit
 streamlit-folium
 pytest
 wandb
+label-studio
+streamlit-drawable-canvas

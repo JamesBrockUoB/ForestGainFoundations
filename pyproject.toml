@@ -34,6 +34,8 @@ dependencies = [
     "wandb",
     "pytorch-lightning",
     "pytest",
+    "label-studio",
+    "streamlit-drawable-canvas",
 ]
 
 

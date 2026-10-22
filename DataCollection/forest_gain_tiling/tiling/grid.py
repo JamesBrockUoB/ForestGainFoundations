@@ -36,6 +36,33 @@ def _xy2lonlat(x: float, y: float) -> tuple[float, float]:
     return lon, lat
 
 
+def footprint_bounds_lonlat(
+    x_min: float,
+    y_min: float,
+    x_max: float,
+    y_max: float,
+    n: int = 21,
+    pad_deg: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """Lon/lat bounding box of a grid-CRS rectangle's true footprint.
+
+    Unlike projecting just the SW and NE corners, this walks all four edges, so
+    it stays correct when the grid CRS is rotated relative to lon/lat (e.g.
+    EPSG:3035). Returns (min_lon, min_lat, max_lon, max_lat).
+    """
+    xl = np.linspace(x_min, x_max, n)
+    yl = np.linspace(y_min, y_max, n)
+    xs = np.concatenate([xl, xl, np.full(n, x_min), np.full(n, x_max)])
+    ys = np.concatenate([np.full(n, y_min), np.full(n, y_max), yl, yl])
+    lon, lat = _from_grid_crs.transform(xs, ys)
+    return (
+        float(lon.min()) - pad_deg,
+        float(lat.min()) - pad_deg,
+        float(lon.max()) + pad_deg,
+        float(lat.max()) + pad_deg,
+    )
+
+
 def tile_geom(tile: dict) -> ee.Geometry:
     return ee.Geometry.Rectangle(
         [tile["x_min_m"], tile["y_min_m"], tile["x_max_m"], tile["y_max_m"]],
@@ -124,8 +151,9 @@ def build_grid(
         xi = round(x_mins[k] / sz)
         yi = round(y_mins[k] / sz)
 
-        min_lon, min_lat = _xy2lonlat(float(x_mins[k]), float(y_mins[k]))
-        max_lon, max_lat = _xy2lonlat(float(x_maxs[k]), float(y_maxs[k]))
+        min_lon, min_lat, max_lon, max_lat = footprint_bounds_lonlat(
+            float(x_mins[k]), float(y_mins[k]), float(x_maxs[k]), float(y_maxs[k])
+        )
 
         yield {
             "tile_id": f"tile_{xi}_{yi}",
