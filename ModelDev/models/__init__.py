@@ -24,6 +24,8 @@ def build_model(
             depth_spatial=kwargs.get("depth_spatial", 4),
             num_heads=kwargs.get("num_heads", 4),
             max_frames=kwargs.get("max_frames", 8),
+            dropout=kwargs.get("dropout", 0.1),
+            skip_channels=kwargs.get("skip_channels", 32),
         )
     elif model_type == "unet_lstm":
         return UNetLSTM(

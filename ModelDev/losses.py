@@ -18,6 +18,7 @@ class FocalTverskyBCELoss(nn.Module):
 
     def __init__(
         self,
+        name: str = "bce_focal_tversky",
         loss_type: str = "hard",
         alpha: float = 0.5,
         beta: float = 0.5,
@@ -26,9 +27,11 @@ class FocalTverskyBCELoss(nn.Module):
         smooth: float = 1e-6,
     ):
         super().__init__()
+        if name not in ("bce", "dice", "focal_tversky", "bce_focal_tversky"):
+            raise ValueError(f"Unsupported loss '{name}'.")
         if loss_type not in ("hard", "soft"):
             raise ValueError(f"Invalid loss_type '{loss_type}'. Use 'hard' or 'soft'.")
-        self.loss_type = loss_type
+        self.name, self.loss_type = name, loss_type
         self.alpha, self.beta, self.gamma, self.smooth = alpha, beta, gamma, smooth
         self.register_buffer(
             "pos_weight",
@@ -72,4 +75,11 @@ class FocalTverskyBCELoss(nn.Module):
         )
         focal_tversky = (1.0 - tversky).clamp(min=0.0) ** self.gamma
 
+        if self.name == "bce":
+            return bce
+        if self.name == "dice":
+            # Dice is the symmetric, non-focal special case of Tversky.
+            return 1.0 - (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
+        if self.name == "focal_tversky":
+            return focal_tversky
         return bce + focal_tversky

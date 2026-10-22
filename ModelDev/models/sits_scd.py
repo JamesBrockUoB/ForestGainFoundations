@@ -11,6 +11,10 @@ class TemporalAttentionModule(nn.Module):
 
     def __init__(self, in_channels: int, num_heads: int = 4):
         super().__init__()
+        if num_heads < 1 or in_channels % num_heads:
+            raise ValueError(
+                f"in_channels ({in_channels}) must be divisible by num_heads ({num_heads})"
+            )
         self.num_heads = num_heads
         self.head_dim = in_channels // num_heads
         self.scale = self.head_dim**-0.5
@@ -112,6 +116,8 @@ class SitsSCD(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        if base_features < 1:
+            raise ValueError("base_features must be positive")
         f = base_features
 
         # 1. Multi-scale Shared Spatial Encoder

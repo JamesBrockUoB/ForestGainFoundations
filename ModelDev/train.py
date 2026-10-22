@@ -27,6 +27,11 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train Forest Gain Change Detection Model")
     p.add_argument("--loss_type", type=str, default="hard", choices=["hard", "soft"])
     p.add_argument(
+        "--loss", dest="loss_name", default="bce_focal_tversky",
+        choices=["bce", "dice", "focal_tversky", "bce_focal_tversky"],
+        help="Objective; loss_type only controls hard/soft confidence labels.",
+    )
+    p.add_argument(
         "--model_type",
         type=str,
         default="tsvit",
@@ -107,6 +112,15 @@ def parse_args():
         help="Label cleaning: fill holes smaller than this many pixels inside gain.",
     )
     p.add_argument("--no_augment", action="store_true")
+    # Architecture knobs. Ignored by architectures that do not use them.
+    p.add_argument("--base_features", type=int, default=64)
+    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--patch_size", type=int, default=16)
+    p.add_argument("--embed_dim", type=int, default=128)
+    p.add_argument("--depth_temporal", type=int, default=2)
+    p.add_argument("--depth_spatial", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--skip_channels", type=int, default=32)
     return p.parse_args()
 
 
@@ -129,6 +143,7 @@ def train(args):
             args.model_type,
             "+".join(sources),
             args.loss_type,
+            args.loss_name,
             f"crop{args.crop_size or 'full'}",
             f"bs{args.batch_size}",
             f"lr{args.learning_rate:g}",
@@ -193,11 +208,20 @@ def train(args):
         weight_decay=args.weight_decay,
         warmup_frac=args.warmup_frac,
         loss_type=args.loss_type,
+        loss_name=args.loss_name,
         tversky_alpha=args.tversky_alpha,
         tversky_beta=args.tversky_beta,
         tversky_gamma=args.tversky_gamma,
         pos_weight=args.pos_weight,
         sources=sources,
+        base_features=args.base_features,
+        num_heads=args.num_heads,
+        patch_size=args.patch_size,
+        embed_dim=args.embed_dim,
+        depth_temporal=args.depth_temporal,
+        depth_spatial=args.depth_spatial,
+        dropout=args.dropout,
+        skip_channels=args.skip_channels,
     )
 
     logger = pl.loggers.WandbLogger(project="Forest-Gain-CD")

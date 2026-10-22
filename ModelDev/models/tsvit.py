@@ -122,6 +122,18 @@ class TSViT(nn.Module):
         skip_channels: int = 32,
     ):
         super().__init__()
+        if patch_size < 1 or patch_size & (patch_size - 1):
+            raise ValueError("patch_size must be a positive power of two")
+        if img_size % patch_size:
+            raise ValueError(
+                f"img_size ({img_size}) must be divisible by patch_size ({patch_size})"
+            )
+        if num_heads < 1 or embed_dim % num_heads:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        if max_frames < 1:
+            raise ValueError("max_frames must be positive")
         self.patch_size = patch_size
         self.img_size = img_size
         self.h_p = img_size // patch_size

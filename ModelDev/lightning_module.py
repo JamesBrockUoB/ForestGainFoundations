@@ -19,6 +19,7 @@ class GainDetectionTask(pl.LightningModule):
         lr: float = DEFAULT_LR,
         weight_decay: float = 1e-2,
         warmup_frac: float = 0.05,
+        loss_name: str = "bce_focal_tversky",
         loss_type: str = "hard",
         tversky_alpha: float = 0.5,  # 0.5 / 0.5 / 1.0 = plain soft Dice (nothing to tune)
         tversky_beta: float = 0.5,
@@ -45,6 +46,7 @@ class GainDetectionTask(pl.LightningModule):
         )
 
         self.criterion = FocalTverskyBCELoss(
+            name=loss_name,
             loss_type=loss_type,
             alpha=tversky_alpha,
             beta=tversky_beta,

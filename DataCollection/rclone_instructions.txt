@@ -8,8 +8,8 @@ rclone config
 
 rclone ls gdrive:
 
-rclone ls isambard:/projects/b6be/jamesbrock.b6be/
+rclone ls isambard:/projects/b6ae/jamesbrock.b6ae/
 
 echo "test" > test.txt
 rclone copy test.txt gdrive:forest_gain_wales/
-rclone moveto gdrive:forest_gain_wales/test.txt isambard:/projects/b6be/jamesbrock.b6be/ForestGrowthFoundations/forest_gain_wales/
+rclone moveto gdrive:forest_gain_wales/test.txt isambard:/projects/b6ae/jamesbrock.b6ae/ForestGrowthFoundations/forest_gain_wales/
