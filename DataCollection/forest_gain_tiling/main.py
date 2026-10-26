@@ -322,10 +322,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     target_status = args.status or str(TileStatus.VALID)
 
     if target_status == str(TileStatus.REJECTED):
-        logger.warning(
-            "Targeting rejected tiles — these failed the filter checks "
-            "and will likely be rejected again unless thresholds have changed."
-        )
+        logger.warning("Targeting rejected tiles — these failed the filter checks")
 
     logger.info("Loading candidates from registry for export preparation")
     candidates = filter_candidates(
@@ -699,6 +696,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     settings.registry_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from export.tasks import use_scratch_tmp
+
+    use_scratch_tmp()  # temp files go to data/tmp_scratch and are deleted after every tile
 
     parser = build_parser()
     args = parser.parse_args()

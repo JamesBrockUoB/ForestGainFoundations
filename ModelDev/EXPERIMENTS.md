@@ -1,43 +1,118 @@
-# Experiment scripts
+# Forest Gain experiment scripts
 
-Run all commands from `ModelDev`. By default the runner only writes a manifest;
-add `--execute` after checking the printed commands. Results are comparable because
-each run fixes the data split and all unspecified `train.py` defaults.
+Run commands from `ModelDev`. `experiments.py` writes a JSON manifest and prints the generated `train.py` commands. Except for the adaptive benchmark, it does not train unless `--execute` is supplied. Review the manifest before launching experiments.
+
+## 1. Model and optimiser benchmark
+
+The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and maximises validation average precision (`val_ap`). The default is **15 adaptive trials per model** (45 training runs total); choose 10–25 trials per model depending on compute budget and how much redundancy the early trials show.
 
 ```bash
-# Tune S1+S2 architectures and optimiser settings (24 staged runs)
+# Write the search plan only (default: 15 trials per model, 45 total)
 python experiments.py benchmark --dry-run
+
+# Run Bayesian optimisation
 python experiments.py benchmark --execute
 
-# Source ablations using the selected default model
-python experiments.py data-sources --model tsvit --execute
+# Smaller or larger search budget, still 10–25 trials per model
+python experiments.py benchmark --execute --trials 10
+python experiments.py benchmark --execute --trials 25
+```
 
-# Compare BCE, Dice, Focal Tversky and BCE+Focal Tversky
+Search spaces:
+
+- **All models:** learning rate `3e-5`–`1e-3` (log scale), weight decay `1e-5`–`5e-2` (log scale), dropout `0`–`0.35`.
+- **TSViT:** embedding dimension `{96,128,160}`, attention heads `{4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`, patch size `{8,16,32}`, skip channels `{16,24,32,48}`.
+- **SITS_SCD:** base features `{32,48,64,96}`, attention heads `{2,4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`.
+- **U-Net_LSTM:** base features `{24,32,48,64,96}`, skip channels `{16,24,32,48}`, temporal depth `1`–`3`.
+
+The first five trials per model initialise the TPE search; later trials adapt to earlier validation AP results. Each model gets its own study and best-trial summary in `experiment_manifests/`. This is a practical budgeted search, not a guarantee of finding the global optimum. Use the same fixed `--split-seed` across trials and compare the best candidates on additional seeds before declaring a winner.
+
+**Holdout protection:** the updated `experiments.py` adds `--skip_test_eval` to every generated training command, and the updated `train.py` supports that flag. Replace your project’s `train.py` with the included updated file before running suites. This keeps the holdout untouched during tuning and ablations. After choosing final checkpoints, run evaluation explicitly once on those checkpoints. The Bayesian objective is validation AP, never holdout performance.
+
+## 2. Data-source ablation
+
+Use one selected/frozen model and training configuration for all 12 source combinations:
+
+```bash
+python experiments.py data-sources --model tsvit --execute
+```
+
+The combinations are S1, S2, S1+S2, AlphaEarth, Tessera, S1+AlphaEarth, S2+AlphaEarth, S1+S2+AlphaEarth, S1+Tessera, S2+Tessera, S1+S2+Tessera, and S1+S2+AlphaEarth+Tessera. Only use this suite after selecting the model and optimiser settings from the benchmark. Confirm each product exists in the dataset pipeline.
+
+## 3. Loss exploration
+
+```bash
 python experiments.py losses --model tsvit --sources s1 s2 --execute
 ```
 
-For the larger source ablation, use the best configuration selected from the
-benchmark by supplying its values to `train.py` directly. Keep the same split
-seed and holdout directory across all comparisons. The manifests in
-`experiment_manifests/` are an auditable record of every exact command.
+The suite covers all nine requested families:
 
-`train.py` now accepts `--base_features`, `--num_heads`, `--patch_size`,
-`--embed_dim`, `--depth_temporal`, `--depth_spatial`, `--dropout`, and
-`--skip_channels`, plus `--loss` (`bce`, `dice`, `focal_tversky`, or
-`bce_focal_tversky`).
+1. BCE
+2. Dice
+3. Focal Tversky
+4. BCE + Focal Tversky
+5. Focal
+6. Lovasz hinge
+7. BCE + Lovasz hinge
+8. BCE + OHEM (and BCE + Focal Tversky + OHEM)
+9. Focal + OHEM
 
-## Mask optimisation
+Parameter exploration includes:
 
-Run mask evaluation only after choosing a checkpoint; it scores the untouched
-holdout labels and writes all results to one CSV.
+- Focal Tversky and BCE + Focal Tversky: `tversky.alpha` `{0.3,0.5,0.7}`, `beta = 1-alpha`, and `gamma` `{1,1.33,2}`.
+- Focal: `gamma` `{1,2,3}` and `alpha` unset or `0.25`.
+- Lovasz and BCE + Lovasz: pooled-batch and per-image reduction.
+- OHEM: thresholds `0.7` and `0.9` for BCE-based recipes.
+- Focal + OHEM: all combinations of focal gamma `{1,2,3}`, focal alpha unset or `0.25`, and OHEM threshold `{0.7,0.9}`.
+
+**Focal + OHEM is implemented, not just listed as a command.** The Focal term calculates unreduced per-pixel focal losses and passes them to the configured reweighter. OHEM selects hard pixels using the model's confidence in the true class (threshold-based mmsegmentation-style selection), then the selected pixels' focal losses are reduced. `SegmentationLoss` handles the focal term's `(loss, auxiliary_loss, stats)` result just as it does BCE. Make sure the updated `terms.py` and loss package `__init__.py` are installed in the actual `losses/` package before running this suite.
+
+The suite uses one fixed model, source set, data split, and unspecified training defaults. It is a structured comparison, not a full Bayesian optimisation of every loss parameter. Use multiple seeds for shortlisted loss configurations.
+
+## 4. Pixel hardness
+
+```bash
+python experiments.py hardness --model tsvit --execute
+```
+
+The suite compares matched versions of BCE and BCE + Focal Tversky under:
+
+- no reweighting;
+- OHEM at thresholds `0.7` and `0.9`;
+- learned hardness, sweeping `hardness.c` `{0.01,0.1}` and auxiliary loss scale `hardness.alpha` `{0.001,0.01,0.05}`.
+
+The hardness branch mirrors the model's segmentation head on detached inputs, so the layer is the head module: TSViT `decoder` (a copy of the multi-conv decoder) and `decoder.final_head` (small default head on the fused features), SITS-SCD `final_head` and U-Net-LSTM `out_head` (small default head). `experiments.py` picks these per model (`HARDNESS_LAYERS`); override with `--hl-layer`, or pass `--hl_layer` to `train.py`. Run the suite once per model. That gives 12 (TSViT) or 6 (others) hardness configurations per loss family. The hardness branch consumes detached features, and the learned hardness weighting applies to the per-pixel BCE term; in BCE + Focal Tversky the Tversky term itself remains un-reweighted.
+
+This is a parameter sweep rather than a full Bayesian search. After the initial sweep, compare the strongest hardness settings against the matched no-reweighting and OHEM controls over multiple seeds.
+
+## 5. Temporal ablation
+
+```bash
+python experiments.py temporal --models tsvit sits_scd unet_lstm --seeds 0 1 2 --execute
+```
+
+Compares first+last year, intermediate frame subsets, and the whole sequence. The valid-pixel mask is taken over all years so the scored pixels stay consistent across frame subsets.
+
+## Common controls
+
+All non-benchmark suites accept:
+
+- `--dry-run`: write and print a manifest without training (default if `--execute` is omitted).
+- `--execute`: execute generated commands.
+- `--max-runs N`: cap runs for a smoke test.
+- `--output-dir DIR`: manifest directory (default `experiment_manifests`).
+- `--seeds 0 1 2`: repeat configurations for each seed.
+- `--loss-type hard|soft`: pass the selected loss type to each run.
+- `--epochs`, `--patience`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--data-dir`, `--holdout-dir`, `--split-seed`.
+
+The updated `train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
+
+## 6. Mask optimisation
+
+Run after selecting a checkpoint:
 
 ```bash
 python mask_sweep.py checkpoints/<run>/<best>.ckpt --output results/mask_sweep.csv
 ```
 
-The CSV contains thresholding at 0.50--0.90, removal and filling of connected
-components sized 1, 2, 5, 10 and 25 pixels, and the maximum mask coverage at
-minimum positive-mask precision of 55--80%. `coverage_pct` is the percentage
-of valid pixels retained as predicted gain. In this rare-event setting,
-positive-mask precision is the meaningful interpretation of mask “accuracy”; a
-separate `pixel_accuracy` column is retained for completeness.
+The CSV covers thresholding at `0.50`–`0.90`, removal and filling of connected components sized `1`, `2`, `5`, `10`, and `25` pixels, and maximum predicted-gain coverage at minimum positive-mask precision of `55`–`80%`. In this rare-event setting, precision is the relevant interpretation of positive-mask “accuracy”; `pixel_accuracy` is reported separately for completeness.

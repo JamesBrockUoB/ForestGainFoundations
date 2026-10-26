@@ -90,6 +90,8 @@
         from which the verification code can be pasted back into the HPC prompt.
       - For your GCP project associated with the project, ensure the Google Drive API is enabled if not using a default provided client ID/secret
 
+    Repeat this process for configuring your HPC connection if exporting files to HPC from your local machine.
+
     ### **Step 5**: Setup .env file.
     Create a file in the project root folder called `.env` with the following variables:
 

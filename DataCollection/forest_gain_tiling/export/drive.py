@@ -1,7 +1,9 @@
 import json
 import logging
+import os
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -190,14 +192,45 @@ def _ensure_dest_dirs(dest_dirs: set[str], logger: logging.Logger) -> bool:
     return True
 
 
-def rclone_read_bytes(src: str, logger: logging.Logger) -> bytes | None:
-    result = subprocess.run(["rclone", "cat", src], capture_output=True)
-    if result.returncode != 0:
+def rclone_read_bytes(
+    src: str, logger: logging.Logger, retries: int = 4
+) -> bytes | None:
+    for attempt in range(retries):
+        result = subprocess.run(["rclone", "cat", src], capture_output=True)
+        if result.returncode == 0:
+            return result.stdout
         logger.warning(
-            f"rclone cat failed: {src}: {result.stderr.decode(errors='replace')}"
+            f"rclone cat failed ({attempt + 1}/{retries}): {src}: "
+            f"{result.stderr.decode(errors='replace')[:300]}"
         )
-        return None
-    return result.stdout
+        time.sleep(2**attempt)
+    return None
+
+
+def share_ssh_connection(remote: str, logger: logging.Logger) -> None:
+    """Make every rclone call to an SFTP remote that uses `ssh = ...` reuse one SSH login (ControlMaster).
+    Without this each rclone call (several dozen per tile) opens its own login, and the HPC login node
+    starts closing them ('unexpected EOF'). Applied through an environment variable, so the rclone config
+    file is untouched; subprocesses inherit it."""
+    env_key = f"RCLONE_CONFIG_{remote.upper()}_SSH"
+    if env_key in os.environ:
+        return
+    try:
+        dump = subprocess.run(
+            ["rclone", "config", "dump"], capture_output=True, text=True, check=True
+        )
+        ssh = json.loads(dump.stdout).get(remote, {}).get("ssh")
+    except Exception as exc:
+        logger.warning(f"could not read rclone config for '{remote}': {exc}")
+        return
+    if not ssh or "ControlMaster" in ssh:
+        return
+    opts = (
+        "-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=10m "
+        "-o ServerAliveInterval=15 -o ServerAliveCountMax=3"  # a dead shared connection is dropped within ~45 s
+    )
+    os.environ[env_key] = ssh.replace("ssh ", f"ssh {opts} ", 1)
+    logger.info(f"rclone '{remote}': sharing one SSH connection ({opts})")
 
 
 def rclone_push(src: str, dest: str, logger: logging.Logger) -> bool:
@@ -280,7 +313,7 @@ def rclone_all_products(
 def check_hpc_available(
     dest_root: str,
     logger: logging.Logger,
-    timeout: float = 15.0,
+    timeout: float = 60.0,
 ) -> bool:
     if ":" not in dest_root:
         path = Path(dest_root)
@@ -298,6 +331,20 @@ def check_hpc_available(
         return False
 
     remote, path = dest_root.split(":", 1)
+    share_ssh_connection(remote, logger)
+
+    for attempt in (
+        1,
+        2,
+    ):  # the first SSH login can be slow; try once more before giving up
+        if _hpc_check_once(remote, path, dest_root, logger, timeout):
+            return True
+        if attempt == 1:
+            logger.info("retrying HPC check once")
+    return False
+
+
+def _hpc_check_once(remote, path, dest_root, logger, timeout) -> bool:
 
     try:
         result = subprocess.run(

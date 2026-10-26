@@ -14,14 +14,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from datasets import MultiTemporalGainDataset
+from eval import _checkpoint_sources, _checkpoint_years
+from lightning_module import GainDetectionTask
 from scipy import ndimage
 from torch.utils.data import DataLoader
-
-from datasets import MultiTemporalGainDataset
-from eval import _checkpoint_sources
-from lightning_module import GainDetectionTask
 from utils import get_device
-
 
 THRESHOLDS = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
 MORPH_SIZES = (1, 2, 5, 10, 25)
@@ -63,7 +61,9 @@ def scores(pred: np.ndarray, target: np.ndarray, valid: np.ndarray) -> dict[str,
     return {
         "precision": precision,
         "recall": recall,
-        "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "f1": (
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        ),
         "iou": tp / (tp + fp + fn) if tp + fp + fn else 0.0,
         "pixel_accuracy": (tp + tn) / max(1, tp + fp + fn + tn),
         "coverage_pct": 100 * (tp + fp) / max(1, valid.sum()),
@@ -72,16 +72,28 @@ def scores(pred: np.ndarray, target: np.ndarray, valid: np.ndarray) -> dict[str,
 
 def predict(checkpoint: str, data_dir: str, batch_size: int, num_workers: int):
     device = get_device()
-    task = GainDetectionTask.load_from_checkpoint(checkpoint, map_location=device).eval().to(device)
-    dirs = sorted(p for p in Path(data_dir).iterdir() if p.is_dir() and p.name.startswith("tile_"))
+    task = (
+        GainDetectionTask.load_from_checkpoint(checkpoint, map_location=device)
+        .eval()
+        .to(device)
+    )
+    dirs = sorted(
+        p for p in Path(data_dir).iterdir() if p.is_dir() and p.name.startswith("tile_")
+    )
     if not dirs:
         raise ValueError(f"No tile_* directories in {data_dir}")
-    dataset = MultiTemporalGainDataset(dirs, sources=_checkpoint_sources(task))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    dataset = MultiTemporalGainDataset(
+        dirs, sources=_checkpoint_sources(task), years=_checkpoint_years(task)
+    )
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
     probs, targets, valids = [], [], []
     with torch.no_grad():
         for batch in loader:
             prob = torch.sigmoid(task(batch["pixels"].to(device))).cpu().numpy()
+            if prob.ndim == 4 and prob.shape[1] == 1:
+                prob = prob[:, 0]  # (B, 1, H, W) -> (B, H, W), as in eval.py
             probs.append(prob)
             targets.append(batch["gain_mask"].numpy() > 0.5)
             valids.append(batch["gain_valid"].numpy() > 0.5)
@@ -93,12 +105,19 @@ def main() -> None:
     p.add_argument("checkpoint")
     p.add_argument("--data-dir", default="../DataCollection/data/holdout_tiles")
     p.add_argument("--output", default="mask_sweep.csv")
-    p.add_argument("--threshold", type=float, default=0.50, help="Base threshold for removal/filling sweeps.")
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.50,
+        help="Base threshold for removal/filling sweeps.",
+    )
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-workers", type=int, default=2)
     args = p.parse_args()
 
-    probs, target, valid = predict(args.checkpoint, args.data_dir, args.batch_size, args.num_workers)
+    probs, target, valid = predict(
+        args.checkpoint, args.data_dir, args.batch_size, args.num_workers
+    )
     rows: list[dict] = []
     # Threshold sweep and a precision-constrained coverage frontier use raw masks.
     for threshold in THRESHOLDS:
@@ -116,12 +135,28 @@ def main() -> None:
         eligible = [r for r in threshold_rows if r["precision"] >= min_precision]
         if eligible:
             best = max(eligible, key=lambda r: r["coverage_pct"])
-            row = {"experiment": "coverage_at_precision", "setting": min_precision,
-                   "threshold": best["threshold"], **{k: best[k] for k in best if k not in {"experiment", "setting", "threshold"}}}
+            row = {
+                "experiment": "coverage_at_precision",
+                "setting": min_precision,
+                "threshold": best["threshold"],
+                **{
+                    k: best[k]
+                    for k in best
+                    if k not in {"experiment", "setting", "threshold"}
+                },
+            }
         else:
-            row = {"experiment": "coverage_at_precision", "setting": min_precision,
-                   "threshold": None, "precision": None, "recall": None, "f1": None,
-                   "iou": None, "pixel_accuracy": None, "coverage_pct": 0.0}
+            row = {
+                "experiment": "coverage_at_precision",
+                "setting": min_precision,
+                "threshold": None,
+                "precision": None,
+                "recall": None,
+                "f1": None,
+                "iou": None,
+                "pixel_accuracy": None,
+                "coverage_pct": 0.0,
+            }
         rows.append(row)
 
     fields = list(rows[0])

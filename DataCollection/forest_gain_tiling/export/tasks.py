@@ -51,6 +51,34 @@ def get_tessera_scratch_dir() -> Path:
     return settings.data_dir / "tessera_scratch"
 
 
+def _scratch_tmp_dir() -> Path:
+    return settings.data_dir / "tmp_scratch"
+
+
+def clear_scratch_tmp() -> None:
+    """Empty the pipeline's temp folder (Python's tempfile and rclone write here, see use_scratch_tmp)."""
+    d = _scratch_tmp_dir()
+    if not d.exists():
+        return
+    for p in d.iterdir():
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+
+
+def use_scratch_tmp() -> None:
+    """Send every temp file this process (and its rclone children) creates to data_dir/tmp_scratch instead of the
+    macOS temp folder, which is never cleaned while the Mac stays on and fills 'System Data'. The folder is
+    emptied now (leftovers of a killed run) and after every tile. Run one pipeline at a time.
+    """
+    d = _scratch_tmp_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    clear_scratch_tmp()
+    os.environ["TMPDIR"] = str(d)
+    tempfile.tempdir = str(d)
+
+
 def _wait_for_all(
     tasks: dict[str, ee.batch.Task],
     logger: logging.Logger,
@@ -131,17 +159,25 @@ def _wait_for_all(
     return True
 
 
-def _dest_file_exists(dest_root: str, rel_path: str) -> bool:
+def _dest_file_exists(dest_root: str, rel_path: str, retries: int = 4) -> bool:
+    """True/False only when rclone gave a real answer. A dropped connection is retried and then raises,
+    so it can never be mistaken for 'file missing'."""
     full_path = f"{dest_root}/{rel_path}"
 
     if ":" not in dest_root:
         return Path(full_path).exists()
 
     parent, filename = full_path.rsplit("/", 1)
-    result = subprocess.run(["rclone", "lsf", parent], capture_output=True, text=True)
-    if result.returncode != 0:
-        return False
-    return filename in result.stdout.splitlines()
+    for attempt in range(retries):
+        result = subprocess.run(
+            ["rclone", "lsf", parent], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return filename in result.stdout.splitlines()
+        if result.returncode == 3:  # rclone: directory not found
+            return False
+        time.sleep(2**attempt)
+    raise RuntimeError(f"could not list {parent}: {result.stderr.strip()[:200]}")
 
 
 def _verify_tile_outputs(
@@ -338,8 +374,14 @@ def process_tile(
                 f"continuing so everything else is preserved"
             )
 
+        split_outputs: list[tuple[str, Path]] = []
         for category, name in bundled:
-            split_chunk_file(output_dir / category / f"{name}.tif", logger)
+            split_outputs.extend(
+                (category, path)
+                for path in split_chunk_file(
+                    output_dir / category / f"{name}.tif", logger
+                )
+            )
 
         if not local_output:
             for category in sorted({c for c, _ in bundled if c != "embeddings"}):
@@ -350,14 +392,19 @@ def process_tile(
                 ):
                     raise RuntimeError(f"failed to push split {category} files")
 
-            # Push the TESSERA years we do have.
-            for y in present_years:
+            # Push split AEE products and available TESSERA embeddings together.
+            # This needs one rclone/SFTP process rather than one connection per
+            # AEE year, and avoids accidentally excluding split AEE files.
+            if (
+                any(category == "embeddings" for category, _ in split_outputs)
+                or present_years
+            ):
                 if not rclone_push(
-                    str(output_dir / "embeddings" / f"tessera_{y}.tif"),
-                    f"{dest_root}/{tile_id}/embeddings/tessera_{y}.tif",
+                    str(output_dir / "embeddings"),
+                    f"{dest_root}/{tile_id}/embeddings",
                     logger,
                 ):
-                    raise RuntimeError(f"failed to push tessera_{y}.tif")
+                    raise RuntimeError("failed to push embeddings")
 
         missing = _verify_tile_outputs(
             tile_id,
@@ -442,6 +489,11 @@ def process_tile(
             cancel_event=cancel_event,
             drive_already_cleared=rclone_completed,
         )
+
+    finally:
+        # Whatever temp folders the tile's downloads created are no longer needed (only once TESSERA has stopped).
+        if t_tessera is None or not t_tessera.is_alive():
+            clear_scratch_tmp()
 
 
 def run_local(

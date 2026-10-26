@@ -1,15 +1,20 @@
 import pytorch_lightning as pl
 import torch
-import torchmetrics
-from config import DEFAULT_IMAGE_SIZE, DEFAULT_LR, NUM_INPUT_CHANNELS
-from losses import FocalTverskyBCELoss
+import torch.nn.functional as F
+from config import DEFAULT_IMAGE_SIZE, DEFAULT_LR, NUM_INPUT_CHANNELS, YEARS
+from hardness import HardnessBranch
+from losses import LossConfig, SegmentationLoss, pixel_weights
+from metrics import summarise
 from models import build_model
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torchmetrics.functional.classification import binary_average_precision
 
 
 class GainDetectionTask(pl.LightningModule):
-    """PyTorch Lightning Task for N-timestep satellite change/gain detection."""
+    """PyTorch Lightning Task for N-timestep satellite change/gain detection.
+
+    loss: a LossConfig as a dict (LossConfig.to_dict()). Checkpoints saved before the loss refactor stored the loss
+    options as flat hyperparameters (loss_name, tversky_alpha, ohem, hl_c, ...); those are converted automatically.
+    """
 
     def __init__(
         self,
@@ -19,24 +24,32 @@ class GainDetectionTask(pl.LightningModule):
         lr: float = DEFAULT_LR,
         weight_decay: float = 1e-2,
         warmup_frac: float = 0.05,
-        loss_name: str = "bce_focal_tversky",
-        loss_type: str = "hard",
-        tversky_alpha: float = 0.5,  # 0.5 / 0.5 / 1.0 = plain soft Dice (nothing to tune)
-        tversky_beta: float = 0.5,
-        tversky_gamma: float = 1.0,
-        pos_weight: float | None = None,
+        loss: dict | None = None,
         eval_threshold: float = 0.50,
         sources: tuple[str, ...] = ("s1", "s2"),
+        years: (
+            tuple[int, ...] | None
+        ) = None,  # frames the model sees (None = all of config.YEARS)
         **model_kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
 
+        if loss is None:  # checkpoint from before the loss refactor
+            loss_cfg, model_kwargs = LossConfig.from_legacy(model_kwargs)
+        else:
+            loss_cfg = LossConfig.from_dict(loss)
+        self.loss_cfg = loss_cfg
+
         self.lr = lr
         self.weight_decay = weight_decay
         self.warmup_frac = warmup_frac
         self.eval_threshold = eval_threshold
+        self.loss_type = (
+            loss_cfg.confidence
+        )  # 'soft' -> validation metrics use the confidence weights (see metrics.py)
         self.sources = tuple(sources)  # stored so eval can rebuild the right dataset
+        self.years = tuple(years) if years else tuple(YEARS)  # ditto (hparam `years`)
 
         self.model = build_model(
             model_type=model_type,
@@ -44,45 +57,66 @@ class GainDetectionTask(pl.LightningModule):
             img_size=img_size,
             **model_kwargs,
         )
+        self.criterion = SegmentationLoss(loss_cfg)
 
-        self.criterion = FocalTverskyBCELoss(
-            name=loss_name,
-            loss_type=loss_type,
-            alpha=tversky_alpha,
-            beta=tversky_beta,
-            gamma=tversky_gamma,
-            pos_weight=pos_weight,
-        )
+        # Pixel hardness (arXiv 2305.08462): a branch that mirrors the segmentation head `hardness.layer` on its detached
+        # inputs (see hardness.py). Training only; inference ignores it.
+        self.hardness = loss_cfg.reweight == "hardness"
+        self.hl_head = None
+        if self.hardness:
+            self.hl_head = HardnessBranch(
+                self.model,
+                loss_cfg.hardness.layer,
+                torch.zeros(1, len(self.years), in_channels, img_size, img_size),
+                head=loss_cfg.hardness.head,
+            )
 
-        metrics_kwargs = {
-            "task": "binary",
-            "threshold": self.eval_threshold,
+        # Per-tile (probs, targets, weights) of the valid val pixels, collected on the CPU (exact AP needs every prediction,
+        # and this keeps it independent of MPS op coverage). All metrics are computed from these at the end of the epoch.
+        self._val_samples: list[tuple[torch.Tensor, ...]] = []
+
+    def on_load_checkpoint(self, checkpoint):
+        # the loss holds no learned state; drop keys that older checkpoints stored (e.g. criterion.pos_weight)
+        checkpoint["state_dict"] = {
+            k: v
+            for k, v in checkpoint["state_dict"].items()
+            if not k.startswith("criterion.")
         }
-        self.val_f1 = torchmetrics.F1Score(**metrics_kwargs)
-        self.val_iou = torchmetrics.JaccardIndex(**metrics_kwargs)
-        self.val_precision = torchmetrics.Precision(**metrics_kwargs)
-        self.val_recall = torchmetrics.Recall(**metrics_kwargs)
-
-        # Threshold-free metrics. Scores are collected on the CPU (exact AP needs
-        # every prediction, and this keeps it independent of MPS op coverage).
-        self._val_probs: list[torch.Tensor] = []
-        self._val_targets: list[torch.Tensor] = []
-        self._val_tile_ap: list[torch.Tensor] = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def _loss(self, batch, logits):
+    def _loss(self, batch, logits, hardness_logits=None):
         return self.criterion(
             seg_logits=logits,
             gain_mask=batch["gain_mask"],
             gain_weight=batch["gain_weight"],
             gain_valid=batch["gain_valid"],
+            hardness_logits=hardness_logits,
         )
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        logits = self(batch["pixels"])
-        loss = self._loss(batch, logits)
+        d = None
+        if self.hardness:
+            with self.hl_head.capture():
+                logits = self(batch["pixels"])
+            d = self.hl_head()
+            if d.shape[-2:] != logits.shape[-2:]:
+                d = F.interpolate(
+                    d, size=logits.shape[-2:], mode="bilinear", align_corners=False
+                )
+        else:
+            logits = self(batch["pixels"])
+        loss = self._loss(batch, logits, d)
+        if self.criterion.stats:  # hardness stats or the OHEM kept fraction
+            for k, v in self.criterion.stats.items():
+                self.log(
+                    f"train_{k}",
+                    v,
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=batch["pixels"].shape[0],
+                )
 
         self.log(
             "train_loss",
@@ -104,27 +138,21 @@ class GainDetectionTask(pl.LightningModule):
             probs = probs.squeeze(1)
 
         valid = batch["gain_valid"] > 0.5
+        targets = (batch["gain_mask"] > 0.5).int()
+        weights = pixel_weights(
+            batch["gain_mask"], batch["gain_weight"], self.loss_type
+        )
 
-        if valid.any():
-            v_probs = probs[valid]
-            v_targets = (batch["gain_mask"][valid] > 0.5).int()
-
-            self.val_f1.update(v_probs, v_targets)
-            self.val_iou.update(v_probs, v_targets)
-            self.val_precision.update(v_probs, v_targets)
-            self.val_recall.update(v_probs, v_targets)
-
-            # Per-sample (= per-tile crop) scores for pooled AP and per-tile AP
-            for b in range(probs.shape[0]):
-                vb = valid[b]
-                if not vb.any():
-                    continue
-                pb = probs[b][vb].detach().float().cpu()
-                tb = (batch["gain_mask"][b][vb] > 0.5).int().cpu()
-                self._val_probs.append(pb)
-                self._val_targets.append(tb)
-                if tb.any():
-                    self._val_tile_ap.append(binary_average_precision(pb, tb))
+        for b in range(probs.shape[0]):
+            vb = valid[b]
+            if vb.any():
+                self._val_samples.append(
+                    (
+                        probs[b][vb].detach().float().cpu(),
+                        targets[b][vb].cpu(),
+                        weights[b][vb].float().cpu(),
+                    )
+                )
 
         self.log(
             "val_loss",
@@ -135,40 +163,28 @@ class GainDetectionTask(pl.LightningModule):
         )
 
     def on_validation_epoch_end(self):
-        self.log("val_f1", self.val_f1.compute(), prog_bar=True)
-        self.log("val_iou", self.val_iou.compute(), prog_bar=True)
-        self.log("val_precision", self.val_precision.compute())
-        self.log("val_recall", self.val_recall.compute())
-
-        if self._val_probs:
-            p = torch.cat(self._val_probs)
-            t = torch.cat(self._val_targets)
-            prevalence = t.float().mean().item()
-            ap = binary_average_precision(p, t).item() if t.any() else 0.0
-        else:
-            prevalence, ap = 0.0, 0.0
-        tile_ap = (
-            torch.stack(self._val_tile_ap).mean().item() if self._val_tile_ap else 0.0
-        )
+        soft = self.loss_type == "soft"
+        # hard: plain binary metrics. soft: every gain pixel counts with its confidence (same weights as the loss).
+        res = summarise(self._val_samples, self.eval_threshold, weighted=soft)
 
         # val_ap: AP over all valid val pixels (compare with baseline.py's AP).
         # val_map: mean of per-tile AP over tiles that contain gain.
         # A random scorer has val_ap == val_prevalence.
-        self.log("val_ap", ap, prog_bar=True)
-        self.log("val_map", tile_ap, prog_bar=True)
-        self.log("val_prevalence", prevalence)
+        self.log("val_f1", res["f1"], prog_bar=True)
+        self.log("val_iou", res["iou"], prog_bar=True)
+        self.log("val_precision", res["precision"])
+        self.log("val_recall", res["recall"])
+        self.log("val_ap", res["ap"], prog_bar=True)
+        self.log("val_map", res["map"], prog_bar=True)
+        self.log("val_prevalence", res["prevalence"])
 
-        self._val_probs.clear()
-        self._val_targets.clear()
-        self._val_tile_ap.clear()
+        if soft:  # unweighted versions, comparable with hard-loss runs
+            for k, v in summarise(
+                self._val_samples, self.eval_threshold, weighted=False
+            ).items():
+                self.log(f"val_bin_{k}", v)
 
-        for metric in (
-            self.val_f1,
-            self.val_iou,
-            self.val_precision,
-            self.val_recall,
-        ):
-            metric.reset()
+        self._val_samples.clear()
 
     def configure_optimizers(self):
         # No weight decay on biases / norm parameters

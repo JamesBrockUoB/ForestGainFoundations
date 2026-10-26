@@ -37,4 +37,4 @@ build/*
 
 *external_validation
 
-embedding_comparison
+embedding_comparison/

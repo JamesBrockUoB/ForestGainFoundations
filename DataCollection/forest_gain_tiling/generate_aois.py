@@ -73,9 +73,9 @@ YEARS = (2017, 2024)
 
 YEAR_START, YEAR_END = YEARS
 
-OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/valid_aois.json"
-REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / f"aois/rejected_aois.json"
-CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / f"aois/aoi_filter_checkpoint.json"
+OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / "aois/valid_aois.json"
+REJECTED_OUTPUT_FILE = PROJECT_ROOT / OUTPUT_DIR / "aois/rejected_aois.json"
+CHECKPOINT = PROJECT_ROOT / OUTPUT_DIR / "aois/aoi_filter_checkpoint.json"
 
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 

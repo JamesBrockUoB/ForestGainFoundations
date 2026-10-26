@@ -105,8 +105,12 @@ class MultiTemporalGainDataset(Dataset):
         label_sigma: float = 0.0,
         min_gain_px: int = 0,
         fill_holes_px: int = 0,
+        years: tuple[int, ...] | None = None,
     ):
         """
+        years: frames fed to the model (default all of config.YEARS), e.g. (2017, 2024) for bi-temporal change detection.
+        The valid-pixel mask is ALWAYS taken over every year in config.YEARS, so every year subset is trained and
+        scored on exactly the same pixels.
         sources: any of s1, s2, alphaearth, tessera (channels are concatenated).
         crop_size: random crop (train) / center crop (eval). None keeps full tile.
         repeats:   virtual dataset length multiplier (more steps per epoch).
@@ -123,7 +127,12 @@ class MultiTemporalGainDataset(Dataset):
             raise ValueError(f"Unknown sources: {invalid_sources}")
 
         self.tile_dirs = sorted(tile_dirs)
-        self.years = YEARS
+        self.years = tuple(YEARS if years is None else sorted(years))
+        unknown = set(self.years) - set(YEARS)
+        if not self.years or unknown:
+            raise ValueError(
+                f"years must be a non-empty subset of {tuple(YEARS)}, got {years}"
+            )
         self.sources = sources
         self.augment = augment
         self.crop_size = crop_size
@@ -206,22 +215,25 @@ class MultiTemporalGainDataset(Dataset):
         tile_dir = self.tile_dirs[idx % len(self.tile_dirs)]
         frames, valid_masks = [], []
 
-        for year in self.years:
-            parts = []
-            for source in self.sources:
-                template, bands = SOURCES[source]
-                path = tile_dir / template.format(year=year)
-                if not path.exists():
-                    raise FileNotFoundError(f"Missing {source} raster: {path}")
-                parts.append(
-                    read_physical(path, bands, mask_nodata=source in EMBEDDING_SOURCES)
-                )
-            frames.append(np.concatenate(parts, axis=0))
+        for year in YEARS:
+            if year in self.years:
+                parts = []
+                for source in self.sources:
+                    template, bands = SOURCES[source]
+                    path = tile_dir / template.format(year=year)
+                    if not path.exists():
+                        raise FileNotFoundError(f"Missing {source} raster: {path}")
+                    parts.append(
+                        read_physical(
+                            path, bands, mask_nodata=source in EMBEDDING_SOURCES
+                        )
+                    )
+                frames.append(np.concatenate(parts, axis=0))
 
             # Valid mask comes from the S1/S2 composite, further restricted to
             # pixels TESSERA has an embedding for (it marks sea / uncovered
-            # pixels as NaN). Applied whatever --sources is, so every input
-            # type is still trained and scored on identical pixels.
+            # pixels as NaN). Applied whatever --sources and --years are, so every
+            # input type and frame subset is trained and scored on identical pixels.
             mask_path = tile_dir / "composites" / f"s1s2_{year}.tif"
             with rasterio.open(mask_path) as src:
                 vm = src.read(VALID_MASK_BAND_INDEX).astype(np.float32)

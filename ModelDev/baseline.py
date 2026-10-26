@@ -192,9 +192,9 @@ def sample_tile(tile_dir, sources, mode, rng, args, with_change, want_phys):
     idx = np.sort(idx)
 
     C = sum(len(SOURCES[s][1]) for s in sources)
-    flat_phys = np.empty((len(YEARS), C, len(idx)), dtype=np.float32)
+    flat_phys = np.empty((len(args.years), C, len(idx)), dtype=np.float32)
     warned = False
-    for ti, year in enumerate(YEARS):
+    for ti, year in enumerate(args.years):
         c0 = 0
         for s in sources:
             template, bands = SOURCES[s]
@@ -336,11 +336,21 @@ def main():
         help="center crop like train.py val (0=full)",
     )
     ap.add_argument(
+        "--years",
+        type=int,
+        nargs="+",
+        default=None,
+        choices=YEARS,
+        help="Frames used as features (default: all), like train.py --years. "
+        "The valid mask is still taken over every year, so the scored pixels do not change.",
+    )
+    ap.add_argument(
         "--sanity_px", type=int, default=50000, help="pixels kept for sanity stats"
     )
     args = ap.parse_args()
 
     sources = tuple(args.sources)
+    args.years = sorted(args.years) if args.years else list(YEARS)
 
     missing = [
         b
@@ -357,7 +367,7 @@ def main():
     if args.max_tiles:
         train_dirs = train_dirs[: args.max_tiles]
     print(
-        f"train tiles {len(train_dirs)} | val tiles {len(val_dirs)} | sources {sources}"
+        f"train tiles {len(train_dirs)} | val tiles {len(val_dirs)} | sources {sources} | years {args.years}"
     )
     rng = np.random.default_rng(args.seed)
 

@@ -19,6 +19,15 @@ def checkpoint_sources(ckpt) -> tuple[str, ...]:
     return tuple(hp.get("sources", ("s1", "s2")))
 
 
+def checkpoint_years(ckpt):
+    """Frames the checkpoint was trained on (None = all of config.YEARS, as for old checkpoints)."""
+    hp = torch.load(ckpt, map_location="cpu", weights_only=False).get(
+        "hyper_parameters", {}
+    )
+    years = hp.get("years")
+    return tuple(years) if years else None
+
+
 def source_slice(sources, name):
     """Channel slice of one source inside the concatenated input."""
     start = 0
@@ -107,7 +116,9 @@ def main(
         raise ValueError(f"No tile_* directories found in {test_root}")
 
     print(f"\n=== Step 2: Generating Gain Maps and Plots ({len(tile_dirs)} tiles) ===")
-    ds = MultiTemporalGainDataset(tile_dirs, sources=sources, crop_size=crop_size)
+    ds = MultiTemporalGainDataset(
+        tile_dirs, sources=sources, crop_size=crop_size, years=checkpoint_years(ckpt)
+    )
 
     for i, tile_dir in enumerate(tile_dirs):
         tid = tile_dir.name
