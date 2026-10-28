@@ -46,12 +46,36 @@ _MAX_CONCURRENT_YEARS = getattr(
 # Reject a tile when more than this fraction of it has no TESSERA embedding
 # (sea, or blocks that do not cover the tile). Smaller gaps are written as NaN
 # and masked out downstream.
-_MAX_NODATA_FRAC = getattr(settings, "tessera_max_nodata_frac", 0.01)
+_MAX_NODATA_FRAC = getattr(
+    settings, "tessera_max_nodata_frac", 1.0
+)  # 1.0 = no limit, accept any fraction of NaN
+
+# --- GeoTessera >= 0.11 dataset selection -------------------------------------------------------
+# GeoTesseraZarr streams the global v1.1 "dclimate" run by default (2017-2025). Embeddings from
+# different (version, variant) pairs are NOT interchangeable, so the pair is pinned explicitly and
+# stamped into every aligned GeoTIFF; cached files from any other dataset are discarded and refetched.
+# All four settings are optional.
+_norm_version = (
+    lambda v: str(v).strip().lower().lstrip("v")
+)  # noqa: E731  ("v1.1" -> "1.1")
+_DATASET_VERSION = _norm_version(getattr(settings, "tessera_dataset_version", "1.1"))
+_DATASET_VARIANT = (
+    str(getattr(settings, "tessera_dataset_variant", "dclimate")).strip().lower()
+)
+_CACHE_DIR = getattr(
+    settings, "tessera_cache_dir", None
+)  # persists Zarr metadata between runs
+_VIA_GATEWAY = getattr(
+    settings, "tessera_via_gateway", None
+)  # True/False; None = library default
+
+_TAG_VERSION = "TESSERA_DATASET_VERSION"
+_TAG_VARIANT = "TESSERA_DATASET_VARIANT"
 
 # Errors that will not fix themselves on retry (e.g. a zero-byte / truncated
-# upstream file). Matched on message text as a fallback; the EOFError cause
-# check in _is_permanent is the sturdier signal.
-_PERMANENT_MARKERS = ("No data left in file",)
+# upstream file, or the wrong dataset being served). Matched on message text as a
+# fallback; the EOFError cause check in _is_permanent is the sturdier signal.
+_PERMANENT_MARKERS = ("No data left in file", "dataset mismatch")
 
 
 def _is_permanent(exc: BaseException) -> bool:
@@ -66,6 +90,67 @@ def _is_permanent(exc: BaseException) -> bool:
             return True
         cur = cur.__cause__ or cur.__context__
     return False
+
+
+def open_tessera():
+    """GeoTesseraZarr client for the pinned (version, variant), e.g. v1.1 / dclimate."""
+    from geotessera import GeoTesseraZarr
+    from geotessera.registry import zarr_store_url
+
+    kwargs = {}
+    if _CACHE_DIR:
+        kwargs["cache_dir"] = str(_CACHE_DIR)
+    if _VIA_GATEWAY is not None:
+        kwargs["via_gateway"] = bool(_VIA_GATEWAY)
+
+    gt = GeoTesseraZarr(
+        zarr_store_url(f"v{_DATASET_VERSION}", _DATASET_VARIANT), **kwargs
+    )
+
+    ds = getattr(
+        gt, "dataset", None
+    )  # None for stores that are not a published dataset
+    expected = f"{_DATASET_VERSION}-{_DATASET_VARIANT}"
+    if ds is not None and str(ds.name).lower() != expected:
+        raise RuntimeError(
+            f"TESSERA dataset mismatch: opened {ds.name}, expected {expected}"
+        )
+    return gt
+
+
+def tile_is_current(path: Path) -> bool:
+    """True if an aligned tessera_<year>.tif was made from the pinned dataset."""
+    try:
+        with rasterio.open(path) as src:
+            tags = src.tags()
+    except Exception:
+        return False
+    return (
+        _norm_version(tags.get(_TAG_VERSION, "")) == _DATASET_VERSION
+        and str(tags.get(_TAG_VARIANT, "")).strip().lower() == _DATASET_VARIANT
+    )
+
+
+def _years_to_fetch(
+    embeddings_dir: Path,
+    target_years: list[int],
+    logger: logging.Logger,
+    tile_id: str,
+) -> list[tuple[int, Path]]:
+    """Years with no usable file. A file from another dataset (e.g. pre-0.11 v1.0, or untagged) is deleted."""
+    todo: list[tuple[int, Path]] = []
+    for year in target_years:
+        dest = embeddings_dir / f"tessera_{year}.tif"
+        if dest.exists():
+            if tile_is_current(dest):
+                continue
+            logger.warning(
+                f"{tile_id} | TESSERA {year}: cached file is not from "
+                f"v{_DATASET_VERSION}/{_DATASET_VARIANT} (or has no dataset tag); refetching"
+            )
+            dest.unlink(missing_ok=True)
+        todo.append((year, dest))
+    return todo
 
 
 def tile_bbox(tile: dict) -> tuple[float, float, float, float]:
@@ -84,6 +169,11 @@ def _align_to_tile_grid(
     tile: dict,
     year: int,
 ) -> None:
+    """
+    Reproject the per-UTM-zone GeoTIFFs written by export_geotiffs
+    (tessera_<year>_utm<NN>.tif) onto the tile's EPSG grid. A tile that spans
+    a zone boundary gets several files; the first one with data wins per pixel.
+    """
     with rasterio.Env(GDAL_CACHEMAX=_GDAL_CACHEMAX_MB):
         ct = tile_crs_transform(tile)
 
@@ -101,6 +191,18 @@ def _align_to_tile_grid(
         with rasterio.open(src_paths[0]) as ref:
             count = ref.count
             base_meta = ref.meta.copy()
+            src_tags = ref.tags()
+
+        # Refuse anything that is not the pinned dataset before spending time on it.
+        src_ver = src_tags.get(_TAG_VERSION)
+        src_var = src_tags.get(_TAG_VARIANT)
+        if (src_ver is not None and _norm_version(src_ver) != _DATASET_VERSION) or (
+            src_var is not None and str(src_var).strip().lower() != _DATASET_VARIANT
+        ):
+            raise RuntimeError(
+                f"TESSERA {year}: dataset mismatch: got {src_ver}/{src_var}, "
+                f"expected {_DATASET_VERSION}/{_DATASET_VARIANT}"
+            )
 
         combined = np.full(
             (count, size, size),
@@ -139,10 +241,10 @@ def _align_to_tile_grid(
 
                 del piece
 
-        # TESSERA marks pixels it has no embedding for (e.g. sea) with exact zeros
-        # in every band; blocks that are missing entirely stay NaN. Treat both as
-        # no-data, reject the tile if too much of it is affected, and otherwise
-        # write the gaps as NaN. Raised before anything is written to disk.
+        # Pixels without an embedding are NaN in v1.1 dclimate (it does not mark water separately);
+        # exact zeros in every band are also treated as no-data (older stores used them for sea).
+        # Reject the tile if too much of it is affected, otherwise write the gaps as NaN.
+        # Raised before anything is written to disk.
         nodata = np.isnan(combined).all(axis=0) | (combined == 0).all(axis=0)
         nodata_frac = float(nodata.mean())
         if nodata_frac > _MAX_NODATA_FRAC:
@@ -163,6 +265,14 @@ def _align_to_tile_grid(
             nodata=np.nan,
         )
 
+        tags = {
+            _TAG_VERSION: src_ver or _DATASET_VERSION,
+            _TAG_VARIANT: src_var or _DATASET_VARIANT,
+        }
+        for k in ("TESSERA_DATASET_VERSION_PATH", "TESSERA_SOURCE"):
+            if k in src_tags:
+                tags[k] = src_tags[k]
+
         # Never write directly to the final path. If the subprocess is
         # terminated during the write, the incomplete file must not look
         # like a successfully downloaded year.
@@ -171,6 +281,7 @@ def _align_to_tile_grid(
         try:
             with rasterio.open(tmp_path, "w", **meta) as dst:
                 dst.write(combined)
+                dst.update_tags(**tags)
 
             os.replace(tmp_path, dest_path)
 
@@ -185,43 +296,36 @@ def _align_to_tile_grid(
 
 
 def _fetch_and_align_year(
-    embeddings_dir: str,
     bbox: tuple[float, float, float, float],
     year: int,
     dest_path: str,
     tile: dict,
+    scratch_dir: str,
     result_queue,
 ) -> None:
+    """Runs in a subprocess. scratch_dir is owned (and removed) by the parent, so a killed
+    subprocess cannot leak its temporary export."""
     try:
-        from geotessera import GeoTessera
+        gt = open_tessera()
 
-        tessera = GeoTessera(
-            embeddings_dir=embeddings_dir,
-            bbox=bbox,
+        # Writes tessera_<year>_utm<NN>.tif, one file per intersecting UTM zone.
+        files = gt.export_geotiffs(
+            bbox,
+            year,
+            scratch_dir,
+            bands=None,
+            compress="lzw",
         )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tiles_to_fetch = tessera.registry.load_blocks_for_region(
-                bounds=bbox,
-                year=year,
-            )
+        if not files:
+            raise TesseraNoDataError(f"TESSERA {year}: no data available")
 
-            files = tessera.export_embedding_geotiffs(
-                tiles_to_fetch=tiles_to_fetch,
-                output_dir=tmp,
-                bands=None,
-                compress="lzw",
-            )
-
-            if not files:
-                raise TesseraNoDataError(f"TESSERA {year}: no data available")
-
-            _align_to_tile_grid(
-                files,
-                Path(dest_path),
-                tile,
-                year,
-            )
+        _align_to_tile_grid(
+            [str(f) for f in files],
+            Path(dest_path),
+            tile,
+            year,
+        )
 
         result_queue.put(
             {
@@ -271,6 +375,10 @@ def _reap(proc: mp.Process) -> None:
         proc.join()
 
 
+def _new_scratch(embeddings_dir: Path, year: int) -> str:
+    return tempfile.mkdtemp(prefix=f".scratch_{year}_", dir=embeddings_dir)
+
+
 def download_tessera(
     tile: dict,
     output_dir: Path,
@@ -284,7 +392,8 @@ def download_tessera(
     A subprocess that exceeds the per-year timeout is terminated and its
     year is treated as failed.
 
-    Existing .tif files are skipped.
+    Existing .tif files are skipped if they were made from the pinned
+    dataset (v1.1 / dclimate by default); otherwise they are refetched.
     """
     tile_id = tile["tile_id"]
 
@@ -297,13 +406,7 @@ def download_tessera(
     bbox = tile_bbox(tile)
     target_years = list(settings.years if years is None else years)
 
-    years_to_fetch: list[tuple[int, Path]] = []
-
-    for year in target_years:
-        dest = embeddings_dir / f"tessera_{year}.tif"
-
-        if not dest.exists():
-            years_to_fetch.append((year, dest))
+    years_to_fetch = _years_to_fetch(embeddings_dir, target_years, logger, tile_id)
 
     if not years_to_fetch:
         return
@@ -317,8 +420,8 @@ def download_tessera(
     )
 
     logger.info(
-        f"{tile_id} | TESSERA: fetching {len(years_to_fetch)} year(s), "
-        f"{max_concurrent} at a time"
+        f"{tile_id} | TESSERA v{_DATASET_VERSION}/{_DATASET_VARIANT}: "
+        f"fetching {len(years_to_fetch)} year(s), {max_concurrent} at a time"
     )
 
     result_queue = _MP_CTX.Queue()
@@ -336,16 +439,16 @@ def download_tessera(
     aborted = False
 
     def launch(year: int, dest: Path) -> None:
-        scratch_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
+        scratch_dir = _new_scratch(embeddings_dir, year)
 
         proc = _MP_CTX.Process(
             target=_fetch_and_align_year,
             args=(
-                scratch_dir,
                 bbox,
                 year,
                 str(dest),
                 tile,
+                scratch_dir,
                 result_queue,
             ),
         )
@@ -657,6 +760,8 @@ def download_tessera_until_acquired(
     not time-sensitive. Each year is allowed to run to completion
     without retrying failed downloads.
 
+    Files from another dataset (or without a dataset tag) count as missing.
+
     Raises:
         TesseraNoDataError: the year has no data, or is permanently
             unreadable (bad upstream file). Callers should REJECT
@@ -674,8 +779,9 @@ def download_tessera_until_acquired(
 
     pending: list[int] = [
         year
-        for year in target_years
-        if not (embeddings_dir / f"tessera_{year}.tif").exists()
+        for year, _dest in _years_to_fetch(
+            embeddings_dir, target_years, logger, tile_id
+        )
     ]
 
     if not pending:
@@ -684,25 +790,26 @@ def download_tessera_until_acquired(
     max_concurrent = max(1, min(len(pending), _MAX_CONCURRENT_YEARS))
 
     logger.info(
-        f"{tile_id} | TESSERA: fetching {len(pending)} year(s), {max_concurrent} at a time"
+        f"{tile_id} | TESSERA v{_DATASET_VERSION}/{_DATASET_VARIANT}: "
+        f"fetching {len(pending)} year(s), {max_concurrent} at a time"
     )
 
     result_queue = _MP_CTX.Queue()
 
-    # year -> (process, raw_dir, dest)
+    # year -> (process, scratch_dir, dest)
     running: dict[int, tuple[mp.Process, str, Path]] = {}
 
     def launch(year: int) -> None:
         dest = embeddings_dir / f"tessera_{year}.tif"
-        raw_dir = tempfile.mkdtemp(prefix=f"tessera_raw_{year}_")
+        scratch_dir = _new_scratch(embeddings_dir, year)
 
         proc = _MP_CTX.Process(
             target=_fetch_and_align_year,
-            args=(raw_dir, bbox, year, str(dest), tile, result_queue),
+            args=(bbox, year, str(dest), tile, scratch_dir, result_queue),
         )
         proc.start()
 
-        running[year] = (proc, raw_dir, dest)
+        running[year] = (proc, scratch_dir, dest)
 
     try:
         while pending and len(running) < max_concurrent:
@@ -712,10 +819,10 @@ def download_tessera_until_acquired(
             try:
                 result = result_queue.get(timeout=0.5)
             except queue.Empty:
-                for year, (proc, raw_dir, dest) in list(running.items()):
+                for year, (proc, scratch_dir, dest) in list(running.items()):
                     if not proc.is_alive():
                         proc.join()
-                        shutil.rmtree(raw_dir, ignore_errors=True)
+                        shutil.rmtree(scratch_dir, ignore_errors=True)
                         del running[year]
 
                         if proc.exitcode != 0:
@@ -738,11 +845,11 @@ def download_tessera_until_acquired(
             if year not in running:
                 continue
 
-            proc, raw_dir, dest = running.pop(year)
+            proc, scratch_dir, dest = running.pop(year)
             proc.join(timeout=5)
             if proc.is_alive():
                 _reap(proc)
-            shutil.rmtree(raw_dir, ignore_errors=True)
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
             if result["success"]:
                 logger.info(f"TESSERA {year}: acquired")
@@ -753,9 +860,9 @@ def download_tessera_until_acquired(
             msg = f"{result['error_type']}: {result['error']}"
 
             if result["error_type"] == "no_data":
-                for y, (p, rd, _d) in list(running.items()):
+                for y, (p, sd, _d) in list(running.items()):
                     _reap(p)
-                    shutil.rmtree(rd, ignore_errors=True)
+                    shutil.rmtree(sd, ignore_errors=True)
                 running.clear()
                 raise TesseraNoDataError(result["error"])
 
@@ -770,9 +877,9 @@ def download_tessera_until_acquired(
             raise RuntimeError(f"{year}: failed: {msg}")
 
     finally:
-        for _year, (proc, raw_dir, _dest) in list(running.items()):
+        for _year, (proc, scratch_dir, _dest) in list(running.items()):
             _reap(proc)
-            shutil.rmtree(raw_dir, ignore_errors=True)
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
         try:
             result_queue.close()

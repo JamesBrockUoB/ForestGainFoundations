@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import math
+import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from pathlib import Path
 
 import ee
 import numpy as np
@@ -46,73 +47,87 @@ def split_by_hemisphere(tiles: list[dict]) -> tuple[list[dict], list[dict]]:
     return north, south
 
 
-def _pack(year, ix, iy):
-    # ix in [-1800, 1799], iy in [-900, 899]
-    return (year - 2000) * 10**8 + (ix + 1800) * 10**4 + (iy + 900)
+# GeoTesseraZarr (>= 0.11) streams v1.1 / dclimate, whose tile registry (one row per 2048 px tile, zone and
+# year) replaces the old NPY manifest. Load it once, keep usable rows as sorted arrays, cache on disk.
+_VERSION = str(getattr(settings, "tessera_dataset_version", "1.1")).lstrip("vV")
+_VARIANT = str(getattr(settings, "tessera_dataset_variant", "dclimate"))
+_CACHE = Path(
+    getattr(settings, "tessera_cache_dir", None) or "~/.cache/geotessera"
+).expanduser()
 
 
 @lru_cache(maxsize=1)
-def _coverage_keys() -> np.ndarray:
-    """Every available (year, 0.1 degree cell) packed into a sorted array, built
-    once per process in memory. Registry lookups are serialised inside
-    GeoTessera, so bulk-loading beats per-tile calls."""
-    from geotessera import GeoTessera
+def _coverage_index() -> dict[int, tuple]:
+    """{year: (south, north, west, east, max_height)} of usable tiles (embedded, <= 50% refused)."""
+    from geotessera.icechunk import TileRegistry
+    from geotessera.registry import find_dataset
 
-    rows = GeoTessera().registry.get_available_embeddings()
-    parts = []
-    for i in range(0, len(rows), 500_000):
-        a = np.asarray(rows[i : i + 500_000], dtype=np.float64)
-        parts.append(
-            _pack(
-                a[:, 0].astype(np.int64),
-                np.floor(a[:, 1] * 10).astype(np.int64),
-                np.floor(a[:, 2] * 10).astype(np.int64),
-            )
+    reg = TileRegistry(find_dataset(_VERSION, _VARIANT).tile_registry, cache_dir=_CACHE)
+    key = hashlib.md5("|".join(p[3] for p in reg.parts()).encode()).hexdigest()[:12]
+    path = _CACHE / f"coverage_{_VERSION}_{_VARIANT}_{key}.npz"
+    if not path.exists():
+        print(
+            "TESSERA: building coverage index (first run only, downloads the tile registry)...",
+            flush=True,
         )
-    del rows
-    return np.unique(np.concatenate(parts))
+        df = reg.tiles()
+        refused = (df.refused_px / df.eligible_px.where(df.eligible_px > 0)).fillna(0)
+        df = df[df.embedded.astype(bool) & (refused <= 0.5)]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.stem + ".tmp.npz")
+        np.savez_compressed(
+            tmp,
+            year=df.year,
+            s=df.bbox_south,
+            n=df.bbox_north,
+            w=df.bbox_west,
+            e=df.bbox_east,
+        )
+        tmp.replace(path)
+    z = np.load(path)
+    index = {}
+    for y in np.unique(z["year"]):
+        m = z["year"] == y
+        o = np.argsort(z["s"][m])
+        s, n, w, e = (z[k][m][o] for k in "snwe")
+        index[int(y)] = (s, n, w, e, float((n - s).max()))
+    return index
+
+
+def _has_data(index, year, bbox) -> bool:
+    s, n, w, e, h = index[year]
+    west, south, east, north = bbox
+    lo, hi = np.searchsorted(s, south - h), np.searchsorted(s, north, "right")
+    s, n, w, e = s[lo:hi], n[lo:hi], w[lo:hi], e[lo:hi]
+    lon = np.where(
+        w > e, (w <= east) | (e >= west), (w <= east) & (e >= west)
+    )  # w > e: antimeridian
+    return bool((lon & (n >= south)).any())
 
 
 def warm_tessera_cache() -> None:
-    _coverage_keys()
-
-
-def _present(keys: np.ndarray, q: np.ndarray) -> bool:
-    idx = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
-    return bool((keys[idx] == q).any())
+    _coverage_index()
 
 
 def check_tessera_coverage(tiles, logger=None):
-    keys = _coverage_keys()
+    index = _coverage_index()
     missing_by_tile: dict[str, list[int]] = {}
 
-    for t in tiles:
-        # Footprint bounds, not the stored min/max_lon/lat: those are only the
-        # SW/NE corners and miss cells once the grid is rotated (EPSG:3035).
-        min_lon, min_lat, max_lon, max_lat = footprint_bounds_lonlat(
-            t["x_min_m"], t["y_min_m"], t["x_max_m"], t["y_max_m"]
+    for tile in tiles:
+        bbox = footprint_bounds_lonlat(
+            tile["x_min_m"], tile["y_min_m"], tile["x_max_m"], tile["y_max_m"]
         )
-        x0 = math.floor(min_lon * 10)
-        x1 = math.floor(max_lon * 10 - 1e-9)
-        y0 = math.floor(min_lat * 10)
-        y1 = math.floor(max_lat * 10 - 1e-9)
-        cells = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
-
-        miss = [
-            yr
-            for yr in settings.years
-            if not _present(
-                keys, np.array([_pack(yr, x, y) for x, y in cells], dtype=np.int64)
-            )
+        missing = [
+            y for y in settings.years if y not in index or not _has_data(index, y, bbox)
         ]
-        if miss:
-            missing_by_tile[t["tile_id"]] = miss
+        if missing:
+            missing_by_tile[tile["tile_id"]] = missing
             if logger:
                 logger.debug(
-                    f"TESSERA coverage missing | tile={t['tile_id']} | years={miss}"
+                    f"TESSERA coverage missing | tile={tile['tile_id']} | years={missing}"
                 )
 
-    covered = [t for t in tiles if t["tile_id"] not in missing_by_tile]
+    covered = [tile for tile in tiles if tile["tile_id"] not in missing_by_tile]
     return covered, missing_by_tile
 
 
