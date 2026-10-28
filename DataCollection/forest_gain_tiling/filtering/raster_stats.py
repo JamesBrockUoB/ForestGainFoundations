@@ -58,7 +58,7 @@ def _coverage_keys() -> np.ndarray:
     GeoTessera, so bulk-loading beats per-tile calls."""
     from geotessera import GeoTessera
 
-    rows = GeoTessera().registry.get_available_embeddings()
+    rows = GeoTessera(dataset_version="v1").registry.get_available_embeddings()
     parts = []
     for i in range(0, len(rows), 500_000):
         a = np.asarray(rows[i : i + 500_000], dtype=np.float64)

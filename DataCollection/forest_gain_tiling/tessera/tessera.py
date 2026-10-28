@@ -196,6 +196,7 @@ def _fetch_and_align_year(
         from geotessera import GeoTessera
 
         tessera = GeoTessera(
+            dataset_version="v1",
             embeddings_dir=embeddings_dir,
             bbox=bbox,
         )
