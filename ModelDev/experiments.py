@@ -88,7 +88,7 @@ def benchmark(args: argparse.Namespace) -> list[dict]:
     """Static preview configurations. Actual benchmark execution uses adaptive TPE search."""
     rows = []
     # Representative preview only; --execute uses the Bayesian/TPE objective below.
-    for model in ("tsvit", "sits_scd", "unet_lstm"):
+    for model in args.models or ("tsvit", "sits_scd", "unet_lstm"):
         rows.append(
             _base(args, model, ("s1", "s2"))
             | {
