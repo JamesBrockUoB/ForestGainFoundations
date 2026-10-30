@@ -89,6 +89,9 @@ GAIN_ASSETS = [
     "projects/symbolic-base-346316/assets/hrl_gain_20m_eu",
     "projects/symbolic-base-346316/assets/hrl_gain_20m",
 ]
+WOODLAND_SUPPLEMENT_ASSET = (
+    "projects/symbolic-base-346316/assets/woodland_supplement_3035_10m"
+)
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
 CLOUD_SCORE_PLUS = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
 CLOUD_SCORE_PLUS_BAND = "cs_cdf"
@@ -146,7 +149,7 @@ BASEMAPS = {
 
 S2_A, S2_B = f"S2 {YEAR_A} RGB", f"S2 {YEAR_B} RGB"
 DW_A, DW_B = f"DW trees {YEAR_A} (prob)", f"DW trees {YEAR_B} (prob)"
-HRL = "HRL gain (helper)"
+GAIN_RECORDS = "Gain records"
 NDVI = f"NDVI Delta ({YEAR_B} - {YEAR_A})"
 SLOPE = "Slope"
 LAYERS = {  # Earth Engine layers: name -> cache file stem
@@ -155,10 +158,11 @@ LAYERS = {  # Earth Engine layers: name -> cache file stem
     DW_B: "dw_2024",
     DW_A: "dw_2017",
     NDVI: "ndvi_delta",
-    HRL: "gain_conf",
+    # Bump the cache stem so existing HRL-only rasters are regenerated with woodland.
+    GAIN_RECORDS: "gain_conf_hrl_woodland",
     SLOPE: "slope",
 }
-START = "Starting mask (what you edit)"
+START = "Starting mask"
 DW_NT_A = (
     f"DW {YEAR_A} non-tree mask"  # derived from the DW layer with the threshold slider
 )
@@ -397,13 +401,18 @@ def _layer_image(layer, geom):
         return _peak_ndvi(geom, YEAR_B).subtract(_peak_ndvi(geom, YEAR_A)).rename(
             "dndvi"
         ), ["dndvi"]
-    if layer == HRL:
-        a = _gain_asset()
-        gain = (
-            a.select(0).gt(0).unmask(0).toFloat().resample("bilinear").gt(0.5)
-        )  # bilinear 10 m mask
-        conf = a.select(1).unmask(0).toFloat().max(1)  # >= 1 so every gain px shows
-        return gain.multiply(conf).rename("gain_conf"), ["gain_conf"]
+    if layer == GAIN_RECORDS:
+        # Combine the HRL gain records with the supplementary woodland-creation
+        # raster. The HRL confidence is retained; woodland-only pixels receive
+        # a display value of 1 so they are visible in the same overlay.
+        hrl = _gain_asset()
+        hrl_gain = hrl.select(0).gt(0).unmask(0).toFloat().resample("bilinear").gt(0.5)
+        hrl_conf = hrl.select(1).unmask(0).toFloat().max(1)
+        woodland = (
+            ee.Image(WOODLAND_SUPPLEMENT_ASSET).select(0).gt(0).unmask(0).toFloat()
+        )
+        combined = hrl_gain.multiply(hrl_conf).max(woodland)
+        return combined.rename("gain_conf"), ["gain_conf"]
     if layer == SLOPE:
         dem = ee.ImageCollection("COPERNICUS/DEM/GLO30").select("DEM")
         mosaic = dem.mosaic().setDefaultProjection(dem.first().select(0).projection())
@@ -836,7 +845,7 @@ st.sidebar.selectbox(
 
 with st.sidebar.expander("🧪 Build a representative annotation sample", expanded=False):
     st.caption(
-        "Randomly sample tiles within country × HRL-gain-percentage strata. Country is taken from an existing country field or looked up from GEE LSIB."
+        "Randomly sample tiles within country × gain-percentage strata. Country is taken from an existing country field or looked up from GEE LSIB."
     )
     sample_n = st.number_input(
         "Number of tiles",
@@ -1118,10 +1127,12 @@ def build_composite_layer(enabled, op):
             col, a = _tint(m & valid, colour)
             canvas = _blend(canvas, col, a * op[name])
 
-    if enabled.get(HRL) and arrays.get(HRL) is not None:
-        g = np.nan_to_num(arrays[HRL][0])
+    if enabled.get(GAIN_RECORDS) and arrays.get(GAIN_RECORDS) is not None:
+        g = np.nan_to_num(arrays[GAIN_RECORDS][0])
         colour = plt.get_cmap("Greens")(0.35 + 0.65 * np.clip(g / 100.0, 0, 1))[..., :3]
-        canvas = _blend(canvas, colour, op[HRL] * (g > 0))  # only where there is gain
+        canvas = _blend(
+            canvas, colour, op[GAIN_RECORDS] * (g > 0)
+        )  # only where there is gain
 
     if enabled.get(SLOPE) and arrays.get(SLOPE) is not None:
         s = np.nan_to_num(arrays[SLOPE][0])
@@ -1261,37 +1272,25 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
 
 st.markdown("---")
 
-# Equal-width side panels keep the centre column's midpoint fixed relative to both panels,
-# even when the available main-page width changes as the sidebar is resized.
-col_layers, col_canvas, col_tools = st.columns([1.15, 2.2, 1.15])
-
-# --- LAYER COMPOSITOR PANEL ---
-with col_layers:
-    st.subheader("🎛️ Layer Compositor")
-    st.caption(
-        "Layers are generated from Earth Engine the first time you switch them on for a tile, then cached."
-    )
-
+# --- COMPACT ANNOTATION CONTROLS ---------------------------------------------------------------
+# Keep the canvas as the main full-width work surface. Layer controls are available on demand.
+with st.expander("🎛️ Layer compositor", expanded=False):
     default_on = {S2_B, START}
-    default_op = {START: 0.4, HRL: 0.7}
+    default_op = {START: 0.4, GAIN_RECORDS: 0.7}
     enabled_layers, opacities = {}, {}
-    for layer in list(LAYERS) + DERIVED:
-        # full-width checkbox (long names wrap instead of truncating) with its opacity slider underneath
-        enabled_layers[layer] = st.checkbox(
-            layer, value=layer in default_on, key=f"en_{layer}"
-        )
-        opacities[layer] = st.slider(
-            f"{layer} Opacity",
-            0.0,
-            1.0,
-            default_op.get(layer, 1.0),
-            key=f"op_{layer}",
-            label_visibility="collapsed",
-        )
-    st.caption(
-        "HRL gain is only a helper layer: keep it off while you label so it does not steer the masks."
-    )
-
+    layer_cols = st.columns(3)
+    for i, layer in enumerate(list(LAYERS) + DERIVED):
+        with layer_cols[i % 3]:
+            enabled_layers[layer] = st.checkbox(
+                layer, value=layer in default_on, key=f"en_{layer}"
+            )
+            opacities[layer] = st.slider(
+                f"{layer} Opacity",
+                0.0,
+                1.0,
+                default_op.get(layer, 1.0),
+                key=f"op_{layer}",
+            )
     with st.expander("Cached layers for this tile"):
         for layer in LAYERS:
             st.write(("✅ " if layer_path(tile_id, layer).exists() else "⬜ ") + layer)
@@ -1300,61 +1299,58 @@ with col_layers:
                 layer_path(tile_id, layer).unlink(missing_ok=True)
             st.rerun()
 
+st.subheader("🛠️ Segmentation tools")
+st.caption(
+    "Yellow = starting gain mask. Green adds gain, red removes gain, and blue marks cloud / unclear areas to ignore."
+)
+tool_cols = st.columns([1.2, 1, 1, 1.5])
+with tool_cols[0]:
+    paint_class = st.selectbox("Class", list(CLASSES), key="paint_class")
+with tool_cols[1]:
+    drawing_mode = st.selectbox(
+        "Tool", ["freedraw", "polygon", "rect", "point (fill)"], index=0, key="tool"
+    )
+with tool_cols[2]:
+    stroke_width = st.slider("Brush", 1, 25, 6, key="brush")
+# Keep the user's canvas-size choice independently of the tile and canvas widget.
+# Streamlit may recreate the canvas component when the tile changes; this preference
+# must survive that remount and every navigation-triggered rerun.
+if "canvas_size_preference" not in st.session_state:
+    st.session_state["canvas_size_preference"] = int(
+        st.session_state.get("annotation_canvas_size", 768)
+    )
+if "annotation_canvas_size" not in st.session_state:
+    st.session_state["annotation_canvas_size"] = int(
+        st.session_state["canvas_size_preference"]
+    )
 
-# --- SEGMENTATION TOOLS PANEL ---
-with col_tools:
-    st.subheader("🛠️ Segmentation Tools")
+
+def _remember_canvas_size():
+    st.session_state["canvas_size_preference"] = int(
+        st.session_state["annotation_canvas_size"]
+    )
+
+
+with tool_cols[3]:
+    CANVAS = st.select_slider(
+        "Canvas scale (pixels)",
+        options=[512, 768, 1024, 1280],
+        key="annotation_canvas_size",
+        on_change=_remember_canvas_size,
+        help="Choose one of the four square canvas sizes; saved masks remain 256 × 256.",
+    )
+CANVAS = int(CANVAS)
+rgb_c, hex_c = CLASSES[paint_class]
+canvas_drawing_mode = "point" if drawing_mode == "point (fill)" else drawing_mode
+if drawing_mode == "point (fill)":
     st.caption(
-        "Yellow = the starting gain mask (non-tree in 2017, tree in 2024). Paint corrections on top: green adds gain, "
-        "red removes gain, blue marks cloud / unclear areas to ignore. Where strokes overlap, erase beats add and add beats ignore."
+        "Draw a closed outline, choose Point (fill), then click inside it. The enclosed area is filled on Save."
     )
-    tool_cols = st.columns([1.25, 1, 1])
-    with tool_cols[0]:
-        paint_class = st.selectbox("Class", list(CLASSES), key="paint_class")
-    with tool_cols[1]:
-        drawing_mode = st.selectbox(
-            "Tool",
-            ["freedraw", "polygon", "rect", "point (fill)"],
-            index=0,
-            key="tool",
-        )
-    with tool_cols[2]:
-        stroke_width = st.slider("Brush", 1, 25, 6, key="brush")
-    fill_tolerance = st.slider(
-        "Fill colour tolerance",
-        0,
-        100,
-        18,
-        help="For point (fill): include connected pixels whose displayed background colour is within this RGB distance of the clicked pixel.",
-    )
-    view_quadrant = st.selectbox(
-        "View / zoom",
-        [
-            "Full tile",
-            "Top-left quarter",
-            "Top-right quarter",
-            "Bottom-left quarter",
-            "Bottom-right quarter",
-        ],
-        key=f"view_quadrant_{tile_id}",
-        help="Label one quarter at a time, then switch back to Full tile or another quarter. Edits are saved in full-tile coordinates.",
-    )
-    rgb_c, hex_c = CLASSES[paint_class]
-    if drawing_mode == "point (fill)":
-        canvas_drawing_mode = "point"
-        st.caption(
-            "Choose a class, then click a region on the image. Fill follows connected pixels of similar displayed colour."
-        )
-    else:
-        canvas_drawing_mode = drawing_mode
 
 
-# --- strokes are stored in FULL-tile canvas coordinates, whatever view they were drawn in ---------------------------
-# A quarter view shows one 256x256-canvas-px quadrant of the 512x512 full canvas magnified 2x. Strokes drawn there are
-# converted back to full-tile coordinates before storing, and the stored strokes are converted into the current view
-# before they are drawn, so drawings survive zooming in and back out (and appear magnified when you zoom in).
-# Every Fabric.js object is positioned by (left, top) and sized by (scaleX, scaleY), so the conversion only needs to
-# remap those - the path/rect/circle geometry inside the object is left alone.
+# --- strokes are stored in full-tile coordinates and rescaled when the canvas size changes -------------------------
+# Fabric.js objects are positioned by (left, top) and sized by (scaleX, scaleY); rescale those values while retaining
+# the underlying full-tile drawing geometry.
 def _remap_drawing(drawing, scale, ox, oy, to_view):
     """Copy of a Fabric.js canvas JSON with every object moved/scaled between full-tile and view coordinates.
     to_view=True : full-tile -> view   (p' = scale * (p - origin))
@@ -1408,56 +1404,34 @@ def canvas_panel():
     for err in errors:
         st.warning("Could not generate " + err)
 
-    # Crop the displayed tile for quarter-level labelling. The underlying labels remain
-    # full-resolution (256x256); each quarter is enlarged to the same 512x512 canvas.
-    half_canvas = CANVAS // 2
-    quadrant_boxes = {
-        "Full tile": (0, 0, CANVAS, CANVAS),
-        "Top-left quarter": (0, 0, half_canvas, half_canvas),
-        "Top-right quarter": (half_canvas, 0, CANVAS, half_canvas),
-        "Bottom-left quarter": (0, half_canvas, half_canvas, CANVAS),
-        "Bottom-right quarter": (half_canvas, half_canvas, CANVAS, CANVAS),
-    }
-    qx0, qy0, qx1, qy1 = quadrant_boxes[view_quadrant]
-    if view_quadrant == "Full tile":
-        canvas_bg_img = bg_img
-    else:
-        canvas_bg_img = bg_img.crop((qx0, qy0, qx1, qy1)).resize(
-            (CANVAS, CANVAS), Image.NEAREST
-        )
+    # Always display the complete tile; canvas scaling changes only its display resolution.
+    canvas_bg_img = bg_img
 
-    state = json.dumps(
-        [
-            tile_id,
-            start_mode,
-            DW_THR,
-            MIN_PX,
-            enabled_layers,
-            opacities,
-            view_quadrant,
-        ],
-        sort_keys=True,
-    )
-    canvas_key = "canvas_" + hashlib.md5(state.encode()).hexdigest()[:12]
+    canvas_state = json.dumps([tile_id, CANVAS], sort_keys=True)
+    canvas_key = "canvas_" + hashlib.md5(canvas_state.encode()).hexdigest()[:12]
 
     stroke_store = st.session_state.setdefault(
         "_strokes", {}
-    )  # tile_id -> drawing in FULL-tile coordinates
-    view_scale = CANVAS / (qx1 - qx0)  # 1 for the full tile, 2 for a quarter
+    )  # tile_id -> drawing in full-tile coordinates at its recorded canvas size
+    size_store = st.session_state.setdefault("_stroke_canvas_sizes", {})
+    previous_size = int(size_store.get(tile_id, 512))
+    resize_scale = CANVAS / previous_size
 
-    # FIX: Only load initial_drawing when the canvas key changes (mount/layer change).
-    # On subsequent reruns triggered by drawing strokes, pass None so st_canvas doesn't blink or reset.
     if (
         "_last_canvas_key" not in st.session_state
         or st.session_state["_last_canvas_key"] != canvas_key
     ):
         st.session_state["_last_canvas_key"] = canvas_key
         stored = stroke_store.get(tile_id)
-        initial_draw_payload = (
-            _remap_drawing(stored, view_scale, qx0, qy0, to_view=True)
-            if stored
-            else None
-        )
+        if stored:
+            resized_stored = (
+                _remap_drawing(stored, resize_scale, 0, 0, to_view=True)
+                if resize_scale != 1
+                else stored
+            )
+            initial_draw_payload = resized_stored
+        else:
+            initial_draw_payload = None
     else:
         initial_draw_payload = None
 
@@ -1472,14 +1446,14 @@ def canvas_panel():
         width=CANVAS,
         drawing_mode=canvas_drawing_mode,
         point_display_radius=max(2, stroke_width),
+        return_image_data=True,
         key=canvas_key,
     )
 
     drawn = canvas_result.json_data
     if drawn is not None and drawn.get("objects"):
-        stroke_store[tile_id] = _remap_drawing(
-            drawn, view_scale, qx0, qy0, to_view=False
-        )
+        stroke_store[tile_id] = copy.deepcopy(drawn)
+        size_store[tile_id] = CANVAS
         st.session_state["_strokes_seen"] = canvas_key
 
     if st.button("💾 Save forest gain mask", type="primary"):
@@ -1491,10 +1465,13 @@ def canvas_panel():
             painted = a > 0
 
             def to_tile(m):
-                # Reduce the visible canvas to its underlying pixel resolution.
-                side = SIZE if view_quadrant == "Full tile" else SIZE // 2
-                scale = CANVAS // side
-                return m.reshape(side, scale, side, scale).mean(axis=(1, 3)) >= 0.25
+                # Area-average to the underlying mask grid. BOX resampling supports
+                # every canvas size (including non-multiples of 256) without changing
+                # the saved 256 x 256 mask resolution.
+                side = SIZE
+                mask_image = Image.fromarray((m.astype(np.uint8) * 255), mode="L")
+                reduced = mask_image.resize((side, side), Image.Resampling.BOX)
+                return np.asarray(reduced, dtype=np.uint8) >= 64
 
             add_canvas = painted & (g > r) & (g > b)
             erase_canvas = painted & (r > g) & (r > b)
@@ -1535,19 +1512,7 @@ def canvas_panel():
             add_local = to_tile(add_canvas)
             erase_local = to_tile(erase_canvas)
             ign_local = to_tile(ign_canvas)
-            if view_quadrant == "Full tile":
-                add, erase, ign = add_local, erase_local, ign_local
-            else:
-                # Map local quarter edits back to the correct 128x128 region of the full tile.
-                add = np.zeros((SIZE, SIZE), dtype=bool)
-                erase = np.zeros((SIZE, SIZE), dtype=bool)
-                ign = np.zeros((SIZE, SIZE), dtype=bool)
-                row0 = 0 if "Top" in view_quadrant else SIZE // 2
-                col0 = 0 if "left" in view_quadrant else SIZE // 2
-                region = (slice(row0, row0 + SIZE // 2), slice(col0, col0 + SIZE // 2))
-                add[region] = add_local
-                erase[region] = erase_local
-                ign[region] = ign_local
+            add, erase, ign = add_local, erase_local, ign_local
             # When revisiting another quarter, start from the already-saved full-tile
             # masks so edits elsewhere are retained. On the first save, use the chosen
             # starting masks (Dynamic World / blank / previously saved).
@@ -1594,11 +1559,11 @@ def canvas_panel():
                 f"Saved: gain {100 * gain.mean():.1f}% of tile ({int(gain.sum())} px), "
                 f"ignore {100 * ignore.mean():.1f}% (written to `{tile_id}.tif`)."
             )
-            target = next_unlabelled(tile_id) if view_quadrant == "Full tile" else None
+            target = next_unlabelled(tile_id)
             if target is None:
                 st.success(msg)
             else:
-                # Auto-advance to the next unlabelled queue tile (full-tile saves only).
+                # Auto-advance to the next unlabelled queue tile.
                 stroke_store.pop(tile_id, None)
                 st.session_state["_pending"] = {
                     "selected_tile_id": target,
@@ -1607,8 +1572,7 @@ def canvas_panel():
                 st.rerun(scope="app")
 
 
-with col_canvas:
-    canvas_panel()
+canvas_panel()
 
 # --- prefetch the next queue tiles' Earth Engine layers while you label this one ---
 upcoming, _t = [], tile_id
