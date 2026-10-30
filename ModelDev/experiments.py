@@ -164,7 +164,7 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     all_results = []
-    for model in ("tsvit", "sits_scd", "unet_lstm"):
+    for model in args.models or ("tsvit", "sits_scd", "unet_lstm"):
         study = optuna.create_study(
             direction="maximize",
             sampler=optuna.samplers.TPESampler(
