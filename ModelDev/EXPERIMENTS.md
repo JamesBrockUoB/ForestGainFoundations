@@ -2,7 +2,7 @@
 
 Run commands from `ModelDev`. `experiments.py` writes a JSON manifest and prints the generated `train.py` commands. Except for the adaptive benchmark, it does not train unless `--execute` is supplied. Review the manifest before launching experiments.
 
-Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases).
+Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM array for the parallel benchmark).
 
 ## Experiment tracking (Weights & Biases)
 
@@ -29,30 +29,72 @@ This writes `<out>.runs.csv` (one row per run), `<out>.csv` and `<out>.md` (per 
 
 ## 1. Model and optimiser benchmark
 
-The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and maximises validation average precision (`val_ap`). The default is **15 adaptive trials per model** (45 training runs total); choose 10–25 trials per model depending on compute budget and how much redundancy the early trials show.
+The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and maximises validation average precision (`val_ap`). `--trials` is the **total budget per model** (default 15, so 45 training runs across three models); choose 10–25 depending on compute budget and how much redundancy the early trials show.
 
 ```bash
 # Write the search plan only (default: 15 trials per model, 45 total)
 python experiments.py benchmark --dry-run
 
-# Run Bayesian optimisation
+# Serial: one process, one in-memory study per model
 python experiments.py benchmark --execute
-
-# Smaller or larger search budget, still 10–25 trials per model
-python experiments.py benchmark --execute --trials 10
 python experiments.py benchmark --execute --trials 25
 ```
 
-Search spaces:
+### Running trials in parallel (SLURM)
+
+Parallel workers share one Optuna study stored in a journal file on a shared filesystem. Each worker asks the study for a trial, trains it, reports `val_ap`, and repeats until the total `--trials` budget has been claimed. Submit one array per model:
+
+```bash
+sbatch --export=ALL,MODEL=tsvit      run_fg_benchmark.sh
+sbatch --export=ALL,MODEL=sits_scd   run_fg_benchmark.sh
+sbatch --export=ALL,MODEL=unet_lstm  run_fg_benchmark.sh
+sbatch --export=ALL,MODEL=tsvit,TRIALS=20 run_fg_benchmark.sh   # larger budget
+```
+
+`run_fg_benchmark.sh` is a SLURM array (`--array=0-5`: 6 workers per model, 18 concurrent jobs for all three models). All tasks of one submission share `SLURM_ARRAY_JOB_ID`, which names the study and the output directory (`experiment_manifests/benchmark_<model>_<jobid>/`). Resubmit with `STUDY_TAG=<old job id>` to resume the same study.
+
+The matching flags in `experiments.py benchmark`:
+
+| Flag | Meaning |
+|---|---|
+| `--study-name` | Shared Optuna study name; every worker must use the same one |
+| `--storage-path` | Journal file on a shared filesystem; enables parallel workers. Needs exactly one model in `--models` |
+| `--worker-id` | Worker index; offsets the sampler seed and names the output files |
+
+Without `--storage-path` the benchmark runs serially with an in-memory study.
+
+Notes:
+
+- The first five trials per model are random (TPE start-up). With 6 workers they run at the same time, and TPE only adapts after they finish. In-flight trials are treated as poor results (`constant_liar`) so workers don't all explore the same region.
+- Past about 6 workers per study TPE gains little, because later trials start before earlier results come back. Raise `--trials` instead.
+- Workers can overshoot the budget by a trial or two if they ask at the same instant.
+- The journal file needs a filesystem with working file locks. If you see lock errors, move `--storage-path` to another shared filesystem.
+- Set the SLURM `--time` to roughly `ceil(trials / workers) × per-trial time` plus a buffer. If a task hits the time limit mid-trial, that trial stays "running" in the study and the other workers continue.
+- Each worker writes `benchmark_<model>_worker<NN>.json` and `benchmark_summary_worker<NN>_*.json` to its output directory. The authoritative best trial is in the journal:
+
+```python
+import optuna
+from experiments import _make_storage
+
+study = optuna.load_study(
+    study_name="forestgain_tsvit_<jobid>",
+    storage=_make_storage("experiment_manifests/benchmark_tsvit_<jobid>/optuna_journal.log"),
+)
+print(study.best_trial.number + 1, study.best_value, study.best_params)
+```
+
+Each trial's W&B group is the study name and its variant is `trialNN`, where NN is the global trial number across workers.
+
+### Search spaces
 
 - **All models:** learning rate `3e-5`–`1e-3` (log scale), weight decay `1e-5`–`5e-2` (log scale), dropout `0`–`0.35`.
 - **TSViT:** embedding dimension `{96,128,160}`, attention heads `{4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`, patch size `{8,16,32}`, skip channels `{16,24,32,48}`.
 - **SITS_SCD:** base features `{32,48,64,96}`, attention heads `{2,4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`.
 - **U-Net_LSTM:** base features `{24,32,48,64,96}`, skip channels `{16,24,32,48}`, temporal depth `1`–`3`.
 
-The first five trials per model initialise the TPE search; later trials adapt to earlier validation AP results. Each model gets its own study and best-trial summary in `experiment_manifests/`. This is a practical budgeted search, not a guarantee of finding the global optimum. Use the same fixed `--split-seed` across trials and compare the best candidates on additional seeds before declaring a winner.
+This is a practical budgeted search, not a guarantee of finding the global optimum. Use the same fixed `--split-seed` across trials and compare the best candidates on additional seeds before declaring a winner.
 
-**Holdout protection:** the updated `experiments.py` adds `--skip_test_eval` to every generated training command, and the updated `train.py` supports that flag. Replace your project’s `train.py` with the included updated file before running suites. This keeps the holdout untouched during tuning and ablations. After choosing final checkpoints, run evaluation explicitly once on those checkpoints. The Bayesian objective is validation AP, never holdout performance.
+**Holdout protection:** the updated `experiments.py` adds `--skip_test_eval` to every generated training command, and the updated `train.py` supports that flag. Replace your project's `train.py` with the included updated file before running suites. This keeps the holdout untouched during tuning and ablations. After choosing final checkpoints, run evaluation explicitly once on those checkpoints. The Bayesian objective is validation AP, never holdout performance.
 
 ## 2. Data-source ablation
 
@@ -152,6 +194,8 @@ All non-benchmark suites accept:
 - `--match-steps` / `--no-match-steps`: augmentation suite only, see section 6.
 - `--epochs`, `--patience`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--data-dir`, `--holdout-dir`, `--split-seed`.
 
+The benchmark accepts `--trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate` and `--weight-decay` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
+
 The updated `train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
 
 ## 7. Mask optimisation
@@ -162,4 +206,4 @@ Run after selecting a checkpoint:
 python mask_sweep.py checkpoints/<run>/<best>.ckpt --output results/mask_sweep.csv
 ```
 
-The sweep needs no retraining. The CSV covers thresholding at `0.50`–`0.90`, removal and filling of connected components sized `1`, `2`, `5`, `10`, and `25` pixels, and maximum predicted-gain coverage at minimum positive-mask precision of `55`–`80%`. In this rare-event setting, precision is the relevant interpretation of positive-mask “accuracy”; `pixel_accuracy` is reported separately for completeness.
+The sweep needs no retraining. The CSV covers thresholding at `0.50`–`0.90`, removal and filling of connected components sized `1`, `2`, `5`, `10`, and `25` pixels, and maximum predicted-gain coverage at minimum positive-mask precision of `55`–`80%`. In this rare-event setting, precision is the relevant interpretation of positive-mask "accuracy"; `pixel_accuracy` is reported separately for completeness.

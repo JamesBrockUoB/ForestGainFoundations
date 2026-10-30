@@ -3,13 +3,14 @@
 Examples
 --------
 python experiments.py benchmark --dry-run
+python experiments.py benchmark --models tsvit --execute --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
 python experiments.py data-sources --model tsvit --execute
 python experiments.py losses --model tsvit --execute --max-runs 12
 python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
 
 Suites
-  benchmark     lr / weight decay / size search, S1+S2
+  benchmark     lr / weight decay / size search, S1+S2 (Optuna TPE; parallel workers can share one study)
   data-sources  every input-source combination
   losses        bce, dice, focal Tversky, BCE+Tversky, focal, focal+OHEM, Lovasz, BCE+Lovasz, OHEM
   hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
@@ -154,8 +155,27 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
     return {"learning_rate": lr, "weight_decay": wd, "model_opt": _opts(**structure)}
 
 
+def _make_storage(path: str):
+    """Journal-file Optuna storage: safe for many concurrent workers on a shared filesystem."""
+    import optuna
+
+    try:  # Optuna >= 4
+        from optuna.storages.journal import JournalFileBackend
+
+        backend = JournalFileBackend(path)
+    except ImportError:  # Optuna 3.x
+        from optuna.storages import JournalFileStorage
+
+        backend = JournalFileStorage(path)
+    return optuna.storages.JournalStorage(backend)
+
+
 def run_bayesian_benchmark(args: argparse.Namespace) -> None:
-    """Sequential TPE optimisation: 10-25 adaptive trials per architecture, objective = best validation AP."""
+    """Parallel-safe TPE: many workers share one study; each asks for trials until the total budget is claimed.
+
+    Run a single worker (no --storage-path) for the original serial behaviour, or launch several processes with the
+    same --study-name / --storage-path and different --worker-id values (e.g. a SLURM array).
+    """
     try:
         import optuna
     except ImportError as exc:
@@ -163,40 +183,54 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    models = args.models or ("tsvit", "sits_scd", "unet_lstm")
+    if args.storage_path and len(models) != 1:
+        raise SystemExit(
+            "--storage-path/--study-name is per study: pass exactly one model in --models."
+        )
+
     all_results = []
-    for model in args.models or ("tsvit", "sits_scd", "unet_lstm"):
+    for model in models:
+        study_name = (
+            args.study_name
+            or f"forestgain_{model}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
         study = optuna.create_study(
             direction="maximize",
+            study_name=study_name,
+            storage=_make_storage(args.storage_path) if args.storage_path else None,
+            load_if_exists=True,
             sampler=optuna.samplers.TPESampler(
-                seed=args.seed, n_startup_trials=min(5, args.trials)
+                # Different seed per worker, otherwise workers can propose identical startup trials.
+                seed=args.seed + args.worker_id,
+                n_startup_trials=min(5, args.trials),
+                # Treat in-flight trials as bad results so concurrent workers don't pile onto the same region.
+                constant_liar=True,
             ),
-            study_name=f"forestgain_{model}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
         model_results = []
-        for index in range(args.trials):
+        while True:
+            # Counts running trials too, so workers stop once the whole budget is claimed.
+            # (Two workers asking at the same instant can overshoot by a trial or two.)
+            if len(study.get_trials(deepcopy=False)) >= args.trials:
+                break
             trial = study.ask()
-            suggested = _suggest_benchmark_trial(trial, model)
+            index = trial.number + 1  # global trial number across workers
             row = (
                 _base(args, model, ("s1", "s2"))
-                | suggested
+                | _suggest_benchmark_trial(trial, model)
                 | {
                     "seed": args.seed,
                     "loss_name": "bce_focal_tversky",
                     "wandb_group": study.study_name,
-                    "variant": f"trial{index + 1:02d}",
+                    "variant": f"trial{index:02d}",
                 }
             )
             cmd = command(row)
             print(
-                f"\n[{model} trial {index + 1}/{args.trials}] {' '.join(cmd)}",
+                f"\n[{model} trial {index}/{args.trials} worker {args.worker_id}] {' '.join(cmd)}",
                 flush=True,
             )
-            if not args.execute:
-                print(
-                    "Dry-run: adaptive Bayesian trials require --execute; no training launched."
-                )
-                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
-                continue
             proc = subprocess.run(
                 cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
@@ -208,13 +242,13 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
             )
             result = {
                 "model": model,
-                "trial": index + 1,
+                "trial": index,
+                "worker": args.worker_id,
                 "config": row,
                 "command": cmd,
                 "returncode": proc.returncode,
                 "val_ap": float(match.group(1)) if match else None,
             }
-            model_results.append(result)
             if proc.returncode != 0 or not match:
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
                 result["error"] = (
@@ -222,7 +256,7 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
                 )
                 if proc.returncode != 0:
                     print(
-                        f"Trial failed (exit {proc.returncode}); continuing to next trial.",
+                        f"Trial {index} failed (exit {proc.returncode}); continuing.",
                         file=sys.stderr,
                     )
                 else:
@@ -232,53 +266,47 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
                     )
             else:
                 study.tell(trial, float(match.group(1)))
-                result["best_so_far_val_ap"] = study.best_value
-                print(
-                    f"Trial val_ap={match.group(1)}; best so far={study.best_value:.5f}",
-                    flush=True,
-                )
-            manifest_path = out / f"benchmark_{model}_adaptive.json"
-            completed_now = study.get_trials(states=[optuna.trial.TrialState.COMPLETE])
-            best_info = None
-            if completed_now:
-                best_now = study.best_trial
-                best_info = {
-                    "number": best_now.number + 1,
-                    "value": study.best_value,
-                    "params": best_now.params,
-                }
-            manifest_path.write_text(
+                print(f"Trial {index} val_ap={match.group(1)}", flush=True)
+            model_results.append(result)
+            (out / f"benchmark_{model}_worker{args.worker_id:02d}.json").write_text(
                 json.dumps(
                     {
                         "suite": "benchmark",
                         "model": model,
+                        "worker": args.worker_id,
+                        "study": study.study_name,
                         "objective": "validation val_ap (max)",
                         "sampler": "Optuna TPE",
                         "trials_requested": args.trials,
                         "results": model_results,
-                        "best_trial": best_info,
                     },
                     indent=2,
                 )
             )
         all_results.extend(model_results)
-        completed = study.get_trials(states=[optuna.trial.TrialState.COMPLETE])
-        if args.execute and completed:
-            best = study.best_trial
+        done = study.get_trials(
+            deepcopy=False, states=[optuna.trial.TrialState.COMPLETE]
+        )
+        if done:
             print(
-                f"\nBEST {model}: trial {best.number + 1}, validation AP={study.best_value:.5f}, params={best.params}"
+                f"\nBEST so far ({model}): trial {study.best_trial.number + 1}, "
+                f"val_ap={study.best_value:.5f}, params={study.best_trial.params}"
             )
-        elif args.execute:
+        else:
             print(
-                f"\nNo successful trials for {model}; inspect the saved manifest and training logs.",
+                f"\nNo successful trials for {model} yet; inspect the saved manifest and training logs.",
                 file=sys.stderr,
             )
-    summary = out / f"benchmark_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    summary = (
+        out
+        / f"benchmark_summary_worker{args.worker_id:02d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
     summary.write_text(
         json.dumps(
             {
                 "suite": "benchmark",
                 "trials_per_model": args.trials,
+                "worker": args.worker_id,
                 "results": all_results,
             },
             indent=2,
@@ -551,7 +579,23 @@ def main() -> None:
         "--trials",
         type=int,
         default=15,
-        help="Bayesian benchmark trials PER MODEL (10–25; default 15).",
+        help="Bayesian benchmark TOTAL trials PER MODEL, shared across parallel workers (10-25; default 15).",
+    )
+    p.add_argument(
+        "--study-name",
+        default=None,
+        help="Shared Optuna study name (parallel workers must all use the same one).",
+    )
+    p.add_argument(
+        "--storage-path",
+        default=None,
+        help="Optuna journal file on a shared filesystem; enables parallel workers.",
+    )
+    p.add_argument(
+        "--worker-id",
+        type=int,
+        default=0,
+        help="Parallel worker index (used for sampler seed and output filenames).",
     )
     p.add_argument("--patience", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=8)
