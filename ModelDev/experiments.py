@@ -14,7 +14,11 @@ Suites
   losses        bce, dice, focal Tversky, BCE+Tversky, focal, focal+OHEM, Lovasz, BCE+Lovasz, OHEM
   hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
+  augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
 --seeds repeats every run per seed (seeds are the outer loop, so --max-runs still covers every config).
+
+Every run is labelled for Weights & Biases: --wandb_group = one launch (suite + timestamp, or --group), --variant = the
+seed-independent configuration label, --wandb_tags = suite / model. Aggregate over seeds with report.py.
 
 Each invocation writes a JSON manifest containing exact ``train.py`` commands.
 Review the manifest first; use ``--execute`` only when ready to train.
@@ -66,6 +70,11 @@ def _base(args: argparse.Namespace, model: str, sources: tuple[str, ...]) -> dic
         "split_seed": args.split_seed,
         # Do not evaluate the final holdout during model/loss/source selection.
         "skip_test_eval": True,
+        # Weights & Biases labelling
+        "suite": args.suite,
+        "wandb_group": args.group,
+        "wandb_tags": [args.suite, model],
+        **({"wandb_project": args.wandb_project} if args.wandb_project else {}),
         **({"loss_type": args.loss_type} if args.loss_type else {}),
     }
 
@@ -170,7 +179,12 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
             row = (
                 _base(args, model, ("s1", "s2"))
                 | suggested
-                | {"seed": args.seed, "loss_name": "bce_focal_tversky"}
+                | {
+                    "seed": args.seed,
+                    "loss_name": "bce_focal_tversky",
+                    "wandb_group": study.study_name,
+                    "variant": f"trial{index + 1:02d}",
+                }
             )
             cmd = command(row)
             print(
@@ -419,6 +433,65 @@ def temporal(args: argparse.Namespace) -> list[dict]:
     return rows
 
 
+def augmentation(args: argparse.Namespace) -> list[dict]:
+    """Training-time augmentation / sampling. Everything else (model, sources, loss, lr, wd) is fixed.
+
+    repeats multiplies the steps per epoch, so with --match-steps (default) epochs and patience are divided by repeats:
+    every repeats value then gets the same number of optimiser steps, and only the *diversity* of samples differs.
+    """
+
+    def r(variant, repeats=1, **extra):
+        k = repeats if args.match_steps else 1
+        return _run(
+            args,
+            variant=variant,
+            repeats=repeats,
+            epochs=max(1, round(args.epochs / k)),
+            patience=max(1, round(args.patience / k)) if args.patience else 0,
+            **extra,
+        )
+
+    rows = [
+        r("baseline")
+    ]  # train.py defaults: rot90+flip, gain 0.03, frame 0.01, no frame drop, full tile, repeats 1
+    # which augmentation family helps
+    rows += [
+        r("aug-off", no_augment=True),
+        r("geo-only", gain_sigma=0.0, frame_sigma=0.0),
+        r("spectral-only", no_geo_aug=True),
+    ]
+    # spectral strength (gain_sigma, frame_sigma)
+    rows += [
+        r(f"spectral-g{g}-f{f}", gain_sigma=g, frame_sigma=f)
+        for g, f in ((0.1, 0.03), (0.2, 0.05))
+    ]
+    # interior-frame dropout
+    rows += [r(f"framedrop{p}", frame_drop_p=p) for p in (0.1, 0.25)]
+    # repeats: more augmented samples per tile per epoch (same total steps), plus an un-augmented control
+    rows += [r(f"repeats{n}", repeats=n) for n in (2, 4, 8)]
+    rows.append(r("repeats4-noaug", repeats=4, no_augment=True))
+    # random training crops (val stays full tile); crop must be a multiple of the model's patch size
+    rows += [r(f"crop{c}-repeats4", crop_size=c, repeats=4) for c in (128, 192)]
+    # soft-label jitter only exists for the soft loss
+    if args.loss_type == "soft":
+        rows += [r(f"label-sigma{s}", label_sigma=s) for s in (0.0, 0.05, 0.1, 0.2)]
+    return rows
+
+
+def auto_variant(row: dict) -> str:
+    """Seed-independent label for a configuration (used when a suite does not set `variant` itself)."""
+    parts = [
+        row.get("model_type"),
+        "+".join(row.get("sources", [])),
+        row.get("loss_name"),
+        row.get("reweight") if row.get("reweight") not in (None, "none") else None,
+        row.get("hl_layer"),
+        *(row.get("loss_opt") or ()),
+        "y" + "-".join(map(str, row["years"])) if row.get("years") else None,
+    ]
+    return "_".join(p for p in parts if p)
+
+
 def command(row: dict) -> list[str]:
     cmd = [sys.executable, "train.py"]
     for key, value in row.items():
@@ -440,6 +513,7 @@ SUITES = {
     "losses": losses,
     "hardness": hardness,
     "temporal": temporal,
+    "augmentation": augmentation,
 }
 
 
@@ -518,12 +592,29 @@ def main() -> None:
         "Default: 2017,2024 | 2017,2021,2024 | 2017,2020,2022,2024 | all.",
     )
     p.add_argument(
+        "--group",
+        default=None,
+        help="W&B group for every run of this launch (default: <suite>_<timestamp>).",
+    )
+    p.add_argument(
+        "--wandb-project", default=None, help="W&B project (default: train.py's)."
+    )
+    p.add_argument(
+        "--match-steps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Augmentation suite: divide epochs/patience by repeats so all runs get equal optimiser steps.",
+    )
+    p.add_argument(
         "--hl-layer",
         default=None,
         help="Hardness suite: override the segmentation-head module the hardness branch mirrors "
         "(default per model: see HARDNESS_LAYERS).",
     )
     args = p.parse_args()
+    args.group = (
+        args.group or f"{args.suite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
     if args.suite == "benchmark":
         if not 10 <= args.trials <= 25:
             p.error("--trials must be between 10 and 25 for the Bayesian benchmark")
@@ -577,11 +668,13 @@ def main() -> None:
         return
 
     rows = SUITES[args.suite](args)
+    rows = [r | {"variant": r.get("variant") or auto_variant(r)} for r in rows]
     rows = [r | {"seed": seed} for seed in (args.seeds or [args.seed]) for r in rows]
     if args.max_runs:
         rows = rows[: args.max_runs]
     manifest = {
         "suite": args.suite,
+        "wandb_group": args.group,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "runs": [{"config": r, "command": command(r)} for r in rows],
     }

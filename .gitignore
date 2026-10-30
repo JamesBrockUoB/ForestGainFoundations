@@ -34,7 +34,20 @@ build/*
 *checkpoints*
 
 *experimental_sites_shapes
-
-*external_validation
+*copernicus_tree_change
+*Woodland Creation 16-17 England
+*woodland_creation_16_17_merged
 
 embedding_comparison/
+
+tile_cache
+
+annotation_queue.csv
+
+gain_tile_counts_gee10.csv
+
+gain_tiles_10m_combined.geojson
+
+tmp_requirements.txt
+
+ground_truth_masks/

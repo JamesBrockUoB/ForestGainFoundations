@@ -156,11 +156,66 @@ def parse_args(argv=None):
         default=0,
         help="Label cleaning: fill holes smaller than this inside gain.",
     )
-    g.add_argument("--no_augment", action="store_true")
+    g.add_argument(
+        "--no_augment", action="store_true", help="Turn ALL augmentation off."
+    )
+    g.add_argument(
+        "--no_geo_aug",
+        action="store_true",
+        help="Keep spectral/frame/label augmentation but drop rot90 + flip.",
+    )
+    g.add_argument(
+        "--gain_sigma",
+        type=float,
+        default=0.03,
+        help="Per-sample S2 brightness jitter (std).",
+    )
+    g.add_argument(
+        "--frame_sigma",
+        type=float,
+        default=0.01,
+        help="Per-frame S2 brightness jitter (std).",
+    )
+    g.add_argument(
+        "--frame_drop_p",
+        type=float,
+        default=0.0,
+        help="Chance each interior frame is replaced by its predecessor.",
+    )
+    g.add_argument(
+        "--label_sigma",
+        type=float,
+        default=None,
+        help="Soft-label jitter (std). Default: 0.1 with --loss_type soft, else 0.",
+    )
     g.add_argument(
         "--skip_test_eval",
         action="store_true",
         help="Do not evaluate holdout labels after training. Use during tuning/ablation; evaluate selected checkpoints once at the end.",
+    )
+
+    g = p.add_argument_group("experiment tracking (Weights & Biases)")
+    g.add_argument("--wandb_project", default="Forest-Gain-CD")
+    g.add_argument(
+        "--wandb_name",
+        default=None,
+        help="Run display name (default: '<variant>-s<seed>' or the checkpoint run name).",
+    )
+    g.add_argument(
+        "--wandb_group",
+        default=None,
+        help="Groups runs of one experiment launch, e.g. 'losses_20261030_0900'.",
+    )
+    g.add_argument("--wandb_tags", nargs="+", default=None)
+    g.add_argument(
+        "--suite",
+        default=None,
+        help="Experiment suite (W&B job_type): benchmark, losses, augmentation, ...",
+    )
+    g.add_argument(
+        "--variant",
+        default=None,
+        help="Seed-independent label of this configuration; use it to group seeds in W&B / reports.",
     )
     return p.parse_args(argv)
 
@@ -216,6 +271,12 @@ def run_name(args, loss_cfg, years) -> str:
             f"lr{args.learning_rate:g}",
             f"wd{args.weight_decay:g}",
             f"rep{args.repeats}",
+            *(["noaug"] if args.no_augment else []),
+            *(["nogeo"] if args.no_geo_aug and not args.no_augment else []),
+            *([f"gs{args.gain_sigma:g}"] if args.gain_sigma != 0.03 else []),
+            *([f"fs{args.frame_sigma:g}"] if args.frame_sigma != 0.01 else []),
+            *([f"fd{args.frame_drop_p:g}"] if args.frame_drop_p else []),
+            *([f"ls{args.label_sigma:g}"] if args.label_sigma is not None else []),
             *([f"mmu{args.min_gain_px}"] if args.min_gain_px else []),
             *([f"fill{args.fill_holes_px}"] if args.fill_holes_px else []),
             *(
@@ -243,14 +304,19 @@ def train(args):
     loss_cfg = build_loss_config(args, train_dirs)
     model_opts = parse_model_opts(args.model_opt)
 
-    ckpt_dir = Path("checkpoints") / run_name(args, loss_cfg, years)
+    name = run_name(args, loss_cfg, years)
+    ckpt_dir = Path("checkpoints") / name
     ckpt_dir.mkdir(parents=True, exist_ok=False)
-    (ckpt_dir / "args.json").write_text(
-        json.dumps(
-            {**vars(args), "loss_config": loss_cfg.to_dict(), "model_opts": model_opts},
-            indent=2,
-        )
-    )
+    config = {
+        **vars(args),
+        "loss_config": loss_cfg.to_dict(),
+        "model_opts": model_opts,
+        "run_name": name,
+        "checkpoint_dir": str(ckpt_dir),
+        "n_train_tiles": len(train_dirs),
+        "n_val_tiles": len(val_dirs),
+    }
+    (ckpt_dir / "args.json").write_text(json.dumps(config, indent=2))
 
     crop = args.crop_size or None
     img_size = crop or DEFAULT_IMAGE_SIZE
@@ -260,7 +326,15 @@ def train(args):
         augment=not args.no_augment,
         crop_size=crop,
         repeats=args.repeats,
-        label_sigma=0.1 if loss_cfg.confidence == "soft" else 0.0,
+        label_sigma=(
+            args.label_sigma
+            if args.label_sigma is not None
+            else (0.1 if loss_cfg.confidence == "soft" else 0.0)
+        ),
+        gain_sigma=args.gain_sigma,
+        frame_sigma=args.frame_sigma,
+        frame_drop_p=args.frame_drop_p,
+        geo_aug=not args.no_geo_aug,
         min_gain_px=args.min_gain_px,
         fill_holes_px=args.fill_holes_px,
         years=years,
@@ -304,7 +378,22 @@ def train(args):
         **model_opts,
     )
 
-    logger = pl.loggers.WandbLogger(project="Forest-Gain-CD")
+    wandb_name = args.wandb_name or (
+        f"{args.variant}-s{args.seed}" if args.variant else name
+    )
+    logger = pl.loggers.WandbLogger(
+        project=args.wandb_project,
+        name=wandb_name,
+        group=args.wandb_group,
+        job_type=args.suite,
+        tags=args.wandb_tags,
+        config=config,
+    )
+    logger.experiment.define_metric(
+        "val_ap", summary="max"
+    )  # run.summary['val_ap'] = best epoch, not last
+    config["wandb_run_id"] = logger.experiment.id
+    (ckpt_dir / "args.json").write_text(json.dumps(config, indent=2))
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",

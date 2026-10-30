@@ -103,6 +103,7 @@ class MultiTemporalGainDataset(Dataset):
         frame_sigma: float = 0.01,
         frame_drop_p: float = 0.0,
         label_sigma: float = 0.0,
+        geo_aug: bool = True,
         min_gain_px: int = 0,
         fill_holes_px: int = 0,
         years: tuple[int, ...] | None = None,
@@ -115,6 +116,7 @@ class MultiTemporalGainDataset(Dataset):
         crop_size: random crop (train) / center crop (eval). None keeps full tile.
         repeats:   virtual dataset length multiplier (more steps per epoch).
         label_sigma: jitter on soft confidence weights (use only with soft loss).
+        geo_aug: random 90-degree rotation + flip (only used when augment=True).
         min_gain_px: drop gain patches smaller than this many pixels (0 = off).
         fill_holes_px: fill holes smaller than this many pixels inside gain (0 = off).
         Both run on the full tile before any crop or augmentation.
@@ -141,6 +143,7 @@ class MultiTemporalGainDataset(Dataset):
         self.frame_sigma = frame_sigma
         self.frame_drop_p = frame_drop_p
         self.label_sigma = label_sigma
+        self.geo_aug = geo_aug
         self.min_gain_px = min_gain_px
         self.fill_holes_px = fill_holes_px
 
@@ -177,15 +180,16 @@ class MultiTemporalGainDataset(Dataset):
         T = pixels.shape[0]
 
         # Geometric: identical across frames and labels
-        k, flip = np.random.randint(4), np.random.rand() < 0.5
+        if self.geo_aug:
+            k, flip = np.random.randint(4), np.random.rand() < 0.5
 
-        def geo(a):
-            a = np.rot90(a, k, axes=(-2, -1))
-            return np.ascontiguousarray(np.flip(a, -1) if flip else a)
+            def geo(a):
+                a = np.rot90(a, k, axes=(-2, -1))
+                return np.ascontiguousarray(np.flip(a, -1) if flip else a)
 
-        pixels, gain_mask, gain_weight, valid = map(
-            geo, (pixels, gain_mask, gain_weight, valid)
-        )
+            pixels, gain_mask, gain_weight, valid = map(
+                geo, (pixels, gain_mask, gain_weight, valid)
+            )
 
         # Spectral: per-sample gain x small per-frame gain on S2 reflectance
         s2 = self.s2_channel_indices
