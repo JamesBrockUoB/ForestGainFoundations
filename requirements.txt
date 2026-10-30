@@ -18,3 +18,4 @@ streamlit-folium
 pytest
 wandb
 streamlit-drawable-canvas
+optuna

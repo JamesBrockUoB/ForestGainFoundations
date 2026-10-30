@@ -155,7 +155,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
 
 
 def run_bayesian_benchmark(args: argparse.Namespace) -> None:
-    """Sequential TPE optimisation: 10–25 adaptive trials per architecture, objective = best validation AP."""
+    """Sequential TPE optimisation: 10-25 adaptive trials per architecture, objective = best validation AP."""
     try:
         import optuna
     except ImportError as exc:
@@ -557,7 +557,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-2)
-    p.add_argument("--data-dir", default="../DataCollection/data/test_tiles")
+    p.add_argument("--data-dir", default="../DataCollection/data/forest_gain_tiles")
     p.add_argument("--holdout-dir", default="../DataCollection/data/holdout_tiles")
     p.add_argument("--split-seed", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
