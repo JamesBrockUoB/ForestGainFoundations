@@ -3,7 +3,7 @@
 Examples
 --------
 python experiments.py benchmark --dry-run
-python experiments.py benchmark --models tsvit --execute --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
+python experiments.py benchmark --models tsvit --execute --trials 50 --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
 python experiments.py data-sources --model tsvit --execute
 python experiments.py losses --model tsvit --execute --max-runs 12
 python experiments.py hardness --model tsvit --dry-run
@@ -17,6 +17,8 @@ Suites
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
   augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
 --seeds repeats every run per seed (seeds are the outer loop, so --max-runs still covers every config).
+
+After a benchmark, confirm_top_k.py retrains the best trials over several seeds with holdout evaluation.
 
 Every run is labelled for Weights & Biases: --wandb_group = one launch (suite + timestamp, or --group), --variant = the
 seed-independent configuration label, --wandb_tags = suite / model. Aggregate over seeds with report.py.
@@ -33,6 +35,7 @@ import json
 import re
 import subprocess
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +60,9 @@ SOURCE_SETS = (
     ("s1", "s2", "tessera"),
     ("s1", "s2", "alphaearth", "tessera"),
 )
+
+BENCHMARK_MODELS = ("tsvit", "sits_scd", "unet_lstm")
+BENCHMARK_LOSS = "bce_focal_tversky"
 
 
 def _base(args: argparse.Namespace, model: str, sources: tuple[str, ...]) -> dict:
@@ -89,7 +95,7 @@ def benchmark(args: argparse.Namespace) -> list[dict]:
     """Static preview configurations. Actual benchmark execution uses adaptive TPE search."""
     rows = []
     # Representative preview only; --execute uses the Bayesian/TPE objective below.
-    for model in args.models or ("tsvit", "sits_scd", "unet_lstm"):
+    for model in args.models or BENCHMARK_MODELS:
         rows.append(
             _base(args, model, ("s1", "s2"))
             | {
@@ -118,13 +124,18 @@ def _default_structure(model: str) -> dict:
 
 
 def _suggest_benchmark_trial(trial, model: str) -> dict:
-    """Search optimiser and model-specific architectural parameters without redundant knobs."""
+    """Search optimiser and model-specific architectural parameters without redundant knobs.
+
+    ``trial`` may be an Optuna Trial or a FixedTrial: confirm_top_k.py replays a stored trial's params through this
+    function to rebuild its exact training configuration.
+    """
     lr = trial.suggest_float("learning_rate", 3e-5, 1e-3, log=True)
     wd = trial.suggest_float("weight_decay", 1e-5, 5e-2, log=True)
     dropout = trial.suggest_float("dropout", 0.0, 0.35)
     if model == "tsvit":
         embed_dim = trial.suggest_categorical("embed_dim", [96, 128, 160])
         # Restrict head counts to divisors of each candidate embedding dimension.
+        # (All current candidates divide by 4 and 8, so the search space is static.)
         heads = [h for h in (4, 8) if embed_dim % h == 0]
         structure = dict(
             embed_dim=embed_dim,
@@ -181,13 +192,23 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
     except ImportError as exc:
         raise SystemExit("Bayesian benchmark needs Optuna: pip install optuna") from exc
 
+    # multivariate / constant_liar are flagged experimental by Optuna; the warnings are harmless.
+    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    models = args.models or ("tsvit", "sits_scd", "unet_lstm")
+    models = args.models or BENCHMARK_MODELS
     if args.storage_path and len(models) != 1:
         raise SystemExit(
             "--storage-path/--study-name is per study: pass exactly one model in --models."
         )
+
+    # Random start-up trials before TPE models the objective: about a third of the budget, between 5 and 24.
+    startup = (
+        args.startup_trials
+        if args.startup_trials is not None
+        else min(24, max(5, args.trials // 3))
+    )
 
     all_results = []
     for model in models:
@@ -203,7 +224,9 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
             sampler=optuna.samplers.TPESampler(
                 # Different seed per worker, otherwise workers can propose identical startup trials.
                 seed=args.seed + args.worker_id,
-                n_startup_trials=min(5, args.trials),
+                n_startup_trials=min(startup, args.trials),
+                # Model interactions between parameters (e.g. best lr depends on model size).
+                multivariate=True,
                 # Treat in-flight trials as bad results so concurrent workers don't pile onto the same region.
                 constant_liar=True,
             ),
@@ -211,21 +234,27 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
         model_results = []
         while True:
             # Counts running trials too, so workers stop once the whole budget is claimed.
-            # (Two workers asking at the same instant can overshoot by a trial or two.)
             if len(study.get_trials(deepcopy=False)) >= args.trials:
                 break
             trial = study.ask()
+            if trial.number >= args.trials:
+                # Another worker claimed the last slot between the check above and ask(): give this one back
+                # without training, so the budget is exact.
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                break
             index = trial.number + 1  # global trial number across workers
             row = (
                 _base(args, model, ("s1", "s2"))
                 | _suggest_benchmark_trial(trial, model)
                 | {
                     "seed": args.seed,
-                    "loss_name": "bce_focal_tversky",
+                    "loss_name": BENCHMARK_LOSS,
                     "wandb_group": study.study_name,
                     "variant": f"trial{index:02d}",
                 }
             )
+            # Store the exact training config so confirm_top_k.py can replay it.
+            trial.set_user_attr("config", row)
             cmd = command(row)
             print(
                 f"\n[{model} trial {index}/{args.trials} worker {args.worker_id}] {' '.join(cmd)}",
@@ -276,8 +305,9 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
                         "worker": args.worker_id,
                         "study": study.study_name,
                         "objective": "validation val_ap (max)",
-                        "sampler": "Optuna TPE",
+                        "sampler": "Optuna TPE (multivariate, constant liar)",
                         "trials_requested": args.trials,
+                        "startup_trials": min(startup, args.trials),
                         "results": model_results,
                     },
                     indent=2,
@@ -578,8 +608,14 @@ def main() -> None:
     p.add_argument(
         "--trials",
         type=int,
-        default=15,
-        help="Bayesian benchmark TOTAL trials PER MODEL, shared across parallel workers (10-25; default 15).",
+        default=50,
+        help="Bayesian benchmark TOTAL trials PER MODEL, shared across parallel workers (default 50).",
+    )
+    p.add_argument(
+        "--startup-trials",
+        type=int,
+        default=None,
+        help="Random trials before TPE starts modelling (default: a third of --trials, between 5 and 24).",
     )
     p.add_argument(
         "--study-name",
@@ -660,21 +696,28 @@ def main() -> None:
         args.group or f"{args.suite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     if args.suite == "benchmark":
-        if not 10 <= args.trials <= 25:
-            p.error("--trials must be between 10 and 25 for the Bayesian benchmark")
+        if args.trials < 1:
+            p.error("--trials must be at least 1")
         if args.execute:
             run_bayesian_benchmark(args)
             return
         # A dry run reports the adaptive search plan; exact later trials depend on earlier val_ap results.
         out = Path(args.output_dir)
         out.mkdir(parents=True, exist_ok=True)
+        models = list(args.models or BENCHMARK_MODELS)
         manifest = {
             "suite": "benchmark",
-            "sampler": "Optuna TPE Bayesian optimisation",
+            "sampler": "Optuna TPE Bayesian optimisation (multivariate, constant liar)",
             "objective": "maximise validation val_ap",
             "trials_per_model": args.trials,
-            "models": ["tsvit", "sits_scd", "unet_lstm"],
+            "startup_trials": (
+                args.startup_trials
+                if args.startup_trials is not None
+                else min(24, max(5, args.trials // 3))
+            ),
+            "models": models,
             "sources": ["s1", "s2"],
+            "loss": BENCHMARK_LOSS,
             "search_spaces": {
                 "common": {
                     "learning_rate": "log-uniform [3e-5, 1e-3]",
@@ -706,7 +749,7 @@ def main() -> None:
         path = out / f"benchmark_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path.write_text(json.dumps(manifest, indent=2))
         print(
-            f"Wrote Bayesian benchmark plan ({args.trials} trials/model; {args.trials * 3} total) to {path}"
+            f"Wrote Bayesian benchmark plan ({args.trials} trials/model; {args.trials * len(models)} total) to {path}"
         )
         print("python experiments.py benchmark --execute --trials", args.trials)
         return

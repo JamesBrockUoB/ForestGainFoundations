@@ -2,7 +2,7 @@
 
 Run commands from `ModelDev`. `experiments.py` writes a JSON manifest and prints the generated `train.py` commands. Except for the adaptive benchmark, it does not train unless `--execute` is supplied. Review the manifest before launching experiments.
 
-Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM array for the parallel benchmark).
+Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM launcher and array for the parallel benchmark), `confirm_top_k.py` + `run_fg_confirm.sh` (multi-seed confirmation of the best benchmark trials, with holdout evaluation).
 
 ## Experiment tracking (Weights & Biases)
 
@@ -10,9 +10,9 @@ Every generated command carries labels so runs are named, grouped and reportable
 
 | Label | Set by | Meaning |
 |---|---|---|
-| `--wandb_group` | `experiments.py` (`--group` overrides) | one launch, default `<suite>_<timestamp>`; benchmark trials use the Optuna study name |
-| `--variant` | the suite (or auto-derived) | seed-independent label of a configuration, e.g. `repeats4`, `geo-only`, `trial07` |
-| `--suite` | `experiments.py` | W&B job type |
+| `--wandb_group` | `experiments.py` (`--group` overrides) | one launch, default `<suite>_<timestamp>`; benchmark trials use the Optuna study name; confirmation runs use `confirm_<study name>` |
+| `--variant` | the suite (or auto-derived) | seed-independent label of a configuration, e.g. `repeats4`, `geo-only`, `trial07`, `confirm-trial07` |
+| `--suite` | `experiments.py` | W&B job type (`benchmark`, `losses`, ..., `confirm`) |
 | `--wandb_tags` | `experiments.py` | suite and model |
 | run name | `train.py` | `<variant>-s<seed>` (or the checkpoint run name if no variant) |
 
@@ -25,38 +25,54 @@ python report.py --group augmentation_20261030_004812 --baseline baseline
 python report.py --suite losses --out reports/losses
 ```
 
-This writes `<out>.runs.csv` (one row per run), `<out>.csv` and `<out>.md` (per variant: n, mean, std, min, max, difference from the baseline, best run) and `<out>.png`. It reports validation AP only. Keep `--split-seed` fixed so seeds are the only variation within a variant.
+This writes `<out>.runs.csv` (one row per run), `<out>.csv` and `<out>.md` (per variant: n, mean, std, min, max, difference from the baseline, best run) and `<out>.png`. It reports validation AP only. Keep `--split-seed` fixed so seeds are the only variation within a variant. Confirmation runs (which also have holdout metrics) are aggregated by `confirm_top_k.py aggregate`, see section 1.
 
 ## 1. Model and optimiser benchmark
 
-The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and maximises validation average precision (`val_ap`). `--trials` is the **total budget per model** (default 15, so 45 training runs across three models); choose 10–25 depending on compute budget and how much redundancy the early trials show.
+The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and the `bce_focal_tversky` loss, and maximises validation average precision (`val_ap`). `--trials` is the **total budget per model** and is shared across parallel workers (default 50; there is no upper cap). The budget is exact: a worker that claims a slot beyond `--trials` hands it back without training.
 
 ```bash
-# Write the search plan only (default: 15 trials per model, 45 total)
+# Write the search plan only (default: 50 trials per model)
 python experiments.py benchmark --dry-run
 
 # Serial: one process, one in-memory study per model
-python experiments.py benchmark --execute
-python experiments.py benchmark --execute --trials 25
+python experiments.py benchmark --execute --trials 50
 ```
 
-### Running trials in parallel (SLURM)
+### Sampler
 
-Parallel workers share one Optuna study stored in a journal file on a shared filesystem. Each worker asks the study for a trial, trains it, reports `val_ap`, and repeats until the total `--trials` budget has been claimed. Submit one array per model:
+- **Random start-up:** the first `--startup-trials` trials are random (default: a third of `--trials`, between 5 and 24, so 16 for 50 trials). With parallel workers, trials that start before any result exists are effectively random too.
+- **Multivariate TPE:** parameters are modelled jointly, so interactions such as "the best learning rate depends on model size" are captured.
+- **Constant liar:** in-flight trials count as poor results, so concurrent workers don't pile onto the same region.
+- Failed trials (`FAIL`) are ignored by TPE but still use up budget. Check the failure rate, especially out-of-memory failures on large TSViT configurations (`patch_size=8` with a large `embed_dim` and deep spatial depth): TPE cannot learn to avoid configs it never sees a score for.
+
+### Running trials in parallel (SLURM): benchmark, then confirmation
+
+Run `run_fg_benchmark.sh` **with bash** (not `sbatch`) from a login node. It submits three chained jobs for one model:
 
 ```bash
-sbatch --export=ALL,MODEL=tsvit      run_fg_benchmark.sh
-sbatch --export=ALL,MODEL=sits_scd   run_fg_benchmark.sh
-sbatch --export=ALL,MODEL=unet_lstm  run_fg_benchmark.sh
-sbatch --export=ALL,MODEL=tsvit,TRIALS=20 run_fg_benchmark.sh   # larger budget
+MODEL=tsvit      bash run_fg_benchmark.sh
+MODEL=sits_scd   bash run_fg_benchmark.sh
+MODEL=unet_lstm  bash run_fg_benchmark.sh
+MODEL=tsvit TRIALS=60 TOP_K=3 CONFIRM_SEEDS="0 1 2" bash run_fg_benchmark.sh
 ```
 
-`run_fg_benchmark.sh` is a SLURM array (`--array=0-5`: 6 workers per model, 18 concurrent jobs for all three models). All tasks of one submission share `SLURM_ARRAY_JOB_ID`, which names the study and the output directory (`experiment_manifests/benchmark_<model>_<jobid>/`). Resubmit with `STUDY_TAG=<old job id>` to resume the same study.
+| Step | Job | What it does |
+|---|---|---|
+| 1 | `run_fg_benchmark.sh` array (`--array=0-5`, 6 workers) | parallel TPE workers on one shared study (`TRIALS`, default 50) |
+| 2 | `run_fg_confirm.sh` array, `--dependency=afterany` step 1 | retrains the top `TOP_K` (default 3) trials for each of `CONFIRM_SEEDS` (default `0 1 2`): 9 runs, one GPU each, each scored on the holdout tiles |
+| 3 | small CPU job, `--dependency=afterany` step 2 | `confirm_top_k.py aggregate`: mean ± std over seeds into `reports/confirm_<model>_<jobid>.{md,json,runs.csv}` |
+
+`afterany` means steps 2 and 3 still run if a benchmark worker hits the time limit. All tasks of the benchmark array share `SLURM_ARRAY_JOB_ID`, which names the study (`forestgain_<model>_<jobid>`) and the output directory (`experiment_manifests/benchmark_<model>_<jobid>/`). Resume a study by launching with `STUDY_TAG=<old job id>`: it adds trials until the study holds `TRIALS`.
+
+`sbatch run_fg_benchmark.sh` (with `--export=ALL,MODEL=...`) still works as before: it runs the benchmark array only, with no confirmation.
 
 The matching flags in `experiments.py benchmark`:
 
 | Flag | Meaning |
 |---|---|
+| `--trials` | Total trials per model, shared by all workers (default 50) |
+| `--startup-trials` | Random trials before TPE models the objective (default `min(24, max(5, trials // 3))`) |
 | `--study-name` | Shared Optuna study name; every worker must use the same one |
 | `--storage-path` | Journal file on a shared filesystem; enables parallel workers. Needs exactly one model in `--models` |
 | `--worker-id` | Worker index; offsets the sampler seed and names the output files |
@@ -65,12 +81,11 @@ Without `--storage-path` the benchmark runs serially with an in-memory study.
 
 Notes:
 
-- The first five trials per model are random (TPE start-up). With 6 workers they run at the same time, and TPE only adapts after they finish. In-flight trials are treated as poor results (`constant_liar`) so workers don't all explore the same region.
 - Past about 6 workers per study TPE gains little, because later trials start before earlier results come back. Raise `--trials` instead.
-- Workers can overshoot the budget by a trial or two if they ask at the same instant.
 - The journal file needs a filesystem with working file locks. If you see lock errors, move `--storage-path` to another shared filesystem.
-- Set the SLURM `--time` to roughly `ceil(trials / workers) × per-trial time` plus a buffer. If a task hits the time limit mid-trial, that trial stays "running" in the study and the other workers continue.
-- Each worker writes `benchmark_<model>_worker<NN>.json` and `benchmark_summary_worker<NN>_*.json` to its output directory. The authoritative best trial is in the journal:
+- Set the SLURM `--time` to roughly `ceil(trials / workers) × per-trial time` plus a buffer (50 trials / 6 workers = 9 trials each, about 18 h at 2 h per trial). If a task hits the time limit mid-trial, that trial stays "running" in the study forever; it counts toward the budget but is never selected.
+- Each trial's full training configuration is stored in the study (`trial.user_attrs["config"]`), which is how the confirmation step reproduces it exactly.
+- Each worker writes `benchmark_<model>_worker<NN>.json` and `benchmark_summary_worker<NN>_*.json` to its output directory. The authoritative record is the journal:
 
 ```python
 import optuna
@@ -92,9 +107,31 @@ Each trial's W&B group is the study name and its variant is `trialNN`, where NN 
 - **SITS_SCD:** base features `{32,48,64,96}`, attention heads `{2,4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`.
 - **U-Net_LSTM:** base features `{24,32,48,64,96}`, skip channels `{16,24,32,48}`, temporal depth `1`–`3`.
 
-This is a practical budgeted search, not a guarantee of finding the global optimum. Use the same fixed `--split-seed` across trials and compare the best candidates on additional seeds before declaring a winner.
+After a first batch, look at parameter importance (`optuna.importance.get_param_importances(study)`) and at whether the best trials sit on a range boundary. If so, widen the range and continue the same study.
 
-**Holdout protection:** the updated `experiments.py` adds `--skip_test_eval` to every generated training command, and the updated `train.py` supports that flag. Replace your project's `train.py` with the included updated file before running suites. This keeps the holdout untouched during tuning and ablations. After choosing final checkpoints, run evaluation explicitly once on those checkpoints. The Bayesian objective is validation AP, never holdout performance.
+### Confirmation and holdout (`confirm_top_k.py`)
+
+Benchmark trials are single-seed and scored on the same validation tiles that drive early stopping, so the best of many trials is partly the luckiest. The confirmation step retrains the top `TOP_K` trials (ranked by validation AP) for several seeds each. With the defaults that is 3 configurations × 3 seeds = **9 training runs**.
+
+- **The holdout is evaluated here, and only here.** Benchmark runs and every other suite pass `--skip_test_eval`. Confirmation runs do not, so `train.py` scores each run's best checkpoint on `--holdout_dir` and logs `test_*` metrics to W&B. Benchmark runs never saw the holdout, so seed 0 is retrained rather than reused.
+- **Selection rule:** the final model is the configuration with the best **mean validation AP** over its seeds. Holdout numbers are reported next to it but should not be used to choose between the three, otherwise the holdout stops being held out. Once chosen, do not change the configuration after looking at holdout results.
+- **Report:** `reports/confirm_<model>_<jobid>.md` ranks the configurations (n, validation AP and every `test_*` metric as mean ± std), names the selected one, and gives its learning rate, weight decay and architecture. `.runs.csv` has one row per run with the W&B URL and checkpoint directory; `.json` has the same data for scripts. Aggregation reads W&B, so it needs the runs to have finished and W&B access from the node.
+
+You can also run it by hand:
+
+```bash
+J=experiment_manifests/benchmark_tsvit_<jobid>
+python confirm_top_k.py select --model tsvit --study-name forestgain_tsvit_<jobid> --storage-path $J/optuna_journal.log
+python confirm_top_k.py select ... --execute            # train all 9 serially
+sbatch --export=ALL,MODEL=tsvit,STUDY_TAG=<jobid> --array=0-8 run_fg_confirm.sh
+python confirm_top_k.py aggregate --study-name forestgain_tsvit_<jobid> --out reports/confirm_tsvit
+```
+
+`select` prints the top-k trials and the exact 9 `train.py` commands and writes `confirm_plan.json` to the study's output directory. `run --index N` trains the N-th planned run (trial-major: index = rank × n_seeds + seed position); every SLURM task derives the same top-k from the finished study, so the tasks agree. Options: `--top-k`, `--seeds`, `--group`, `--wandb-project`. For a study created before trial configs were stored, the config is rebuilt from the trial's parameters using `--epochs/--patience/--batch-size/--data-dir/--holdout-dir/--split-seed`, which must match the benchmark's values.
+
+After choosing a winner, the checkpoints of its three runs are listed in the `.runs.csv` for later work. Run `mask_sweep.py` (section 7) on a selected checkpoint.
+
+**Holdout protection:** `experiments.py` adds `--skip_test_eval` to every generated training command, and `train.py` supports that flag. This keeps the holdout untouched during tuning and ablations. The same applies to the data-source, loss, hardness, temporal and augmentation suites: if you want holdout numbers for their final choices, run the chosen configuration once per seed with `--skip_test_eval` off, as the confirmation step does. The Bayesian objective is validation AP, never holdout performance.
 
 ## 2. Data-source ablation
 
@@ -194,9 +231,9 @@ All non-benchmark suites accept:
 - `--match-steps` / `--no-match-steps`: augmentation suite only, see section 6.
 - `--epochs`, `--patience`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--data-dir`, `--holdout-dir`, `--split-seed`.
 
-The benchmark accepts `--trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate` and `--weight-decay` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
+The benchmark accepts `--trials`, `--startup-trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate` and `--weight-decay` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
 
-The updated `train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
+`train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
 
 ## 7. Mask optimisation
 
