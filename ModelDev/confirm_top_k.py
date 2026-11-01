@@ -1,29 +1,39 @@
-"""Confirm the best benchmark configurations ACROSS ALL MODELS: retrain the global top-k over several seeds, with holdout evaluation.
+"""Confirm the best benchmark configurations: retrain the top-k over several seeds, with holdout evaluation.
 
 The benchmark selects on single-seed validation AP and never touches the holdout tiles. This script is the next step.
-It pools the completed trials of every benchmark study (one per architecture), takes the k best by validation AP
-overall (default 3, so the winners can be any mix of architectures), trains each for every seed (default 3 x 3 = 9 runs
-in total) with ``--skip_test_eval`` OFF, so train.py scores each run's best checkpoint on the holdout tiles, then
-aggregates.
+It pools the completed trials of every benchmark study, ranks them by validation AP, picks the top-k (see
+``--stratify-by``), trains each pick for every seed with ``--skip_test_eval`` OFF, so train.py scores each run's best
+checkpoint on the holdout tiles, then aggregates.
 
-Studies are given as ``MODEL,STUDY_NAME,JOURNAL_PATH`` (one per architecture), e.g.
+Studies are given as ``MODEL,STUDY_NAME,JOURNAL_PATH`` (one per study), e.g.
 ``tsvit,forestgain_tsvit_123,experiment_manifests/benchmark_tsvit_123/optuna_journal.log``.
+
+Selection (``--top-k`` is always PER STRATUM)
+---------------------------------------------
+--stratify-by none     (default) one pool: the global top-k over all studies, any mix of architectures
+--stratify-by model    top-k within each architecture, e.g. --top-k 1 = the best trial of every architecture
+--stratify-by <key>    top-k within each distinct value of <key>: a stored config key or an Optuna param of the trial,
+                       e.g. ``loss_name`` (``loss`` is accepted as an alias). Trials without that key go to the
+                       stratum "unknown".
+
+Number of runs = (number of strata) x top-k x (number of seeds).
 
 Modes
 -----
-select     print the global top-k and write the planned runs (add --execute to train them serially, for local use)
+select     print the selected trials and write the planned runs (add --execute to train them serially, for local use)
 run        train ONE planned run, picked by --index (SLURM array task id); index 0 also writes the plan manifest
-aggregate  read the finished runs from Weights & Biases: mean +/- std over seeds of val_ap and every test_* metric
+aggregate  read the finished runs from Weights & Biases: mean +/- std over seeds of val_ap and every test_* metric,
+           ranked overall, plus the best configuration of every architecture
 
 Examples
 --------
 python confirm_top_k.py select --studies tsvit,forestgain_tsvit_1,j1.log sits_scd,forestgain_sits_scd_2,j2.log \
-    unet_lstm,forestgain_unet_lstm_3,j3.log --group confirm_demo
-python confirm_top_k.py run --studies ... --group confirm_demo --index 4 --execute
+    unet_lstm,forestgain_unet_lstm_3,j3.log --group confirm_demo --stratify-by model --top-k 1
+python confirm_top_k.py run --studies ... --group confirm_demo --stratify-by model --top-k 1 --index 4 --execute
 python confirm_top_k.py aggregate --group confirm_demo --out reports/confirm_demo
 
 Selection rule: the final model is the configuration with the best MEAN VALIDATION AP over seeds. Holdout numbers are
-reported next to it but must not be used to choose between the top-k, otherwise the holdout is no longer held out.
+reported next to it but must not be used to choose between the picks, otherwise the holdout is no longer held out.
 Comparing architectures by benchmark val_ap is fair because every trial uses the same sources, loss, split and seed.
 """
 
@@ -36,6 +46,7 @@ import statistics
 import subprocess
 import warnings
 from pathlib import Path
+from typing import NamedTuple
 
 from experiments import (
     BENCHMARK_LOSS,
@@ -45,6 +56,15 @@ from experiments import (
     _suggest_benchmark_trial,
     command,
 )
+
+# Short names accepted by --stratify-by for config / param keys.
+STRATIFY_ALIASES = {"loss": "loss_name"}
+
+
+class Cand(NamedTuple):
+    model: str
+    study: str
+    trial: object  # optuna FrozenTrial
 
 
 def parse_studies(specs) -> list[tuple[str, str, str]]:
@@ -66,16 +86,16 @@ def group_name(args) -> str:
     )
 
 
-def candidates(args):
-    """All completed trials of all studies as (model, trial), best validation AP first.
+def candidates(args) -> list[Cand]:
+    """All completed trials of all studies, best validation AP first.
 
-    Deterministic (ties by model then trial number), so every SLURM array task derives the same top-k.
+    Deterministic (ties by model, study, trial number), so every SLURM array task derives the same selection.
     """
     import optuna
 
     warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    cands = []
+    cands: list[Cand] = []
     for model, name, path in parse_studies(args.studies):
         study = optuna.load_study(study_name=name, storage=_make_storage(path))
         done = [
@@ -86,15 +106,52 @@ def candidates(args):
             if t.value is not None
         ]
         print(f"study {name}: {len(done)} completed trials", flush=True)
-        cands += [(model, t) for t in done]
-    cands.sort(key=lambda c: (-c[1].value, c[0], c[1].number))
+        cands += [Cand(model, name, t) for t in done]
+    cands.sort(key=lambda c: (-c.trial.value, c.model, c.study, c.trial.number))
     return cands
 
 
-def confirm_row(model: str, trial, args, seed: int) -> dict:
+def stratum_of(c: Cand, key: str) -> str:
+    """Which pool a trial competes in for top-k selection."""
+    if key == "none":
+        return "all"
+    if key == "model":
+        return c.model
+    name = STRATIFY_ALIASES.get(key, key)
+    cfg = c.trial.user_attrs.get("config") or {}
+    if name in cfg:
+        return str(cfg[name])
+    if name in c.trial.params:
+        return str(c.trial.params[name])
+    return "unknown"
+
+
+def select_top(cands: list[Cand], top_k: int, stratify_by: str):
+    """Top-k per stratum as [(stratum, Cand)], strata in sorted order, each best first.
+
+    The order is deterministic: run index = position in this list * n_seeds + seed position.
+    """
+    strata: dict[str, list[Cand]] = {}
+    for c in cands:  # cands is sorted best first, so each stratum is too
+        strata.setdefault(stratum_of(c, stratify_by), []).append(c)
+    top = []
+    for s in sorted(strata):
+        top += [(s, c) for c in strata[s][:top_k]]
+    return top
+
+
+def variant_label(c: Cand, args) -> str:
+    """confirm-<model>-trialNN; uses the study name instead if one model has several studies (e.g. a loss search)."""
+    models = [m for m, _, _ in parse_studies(args.studies)]
+    key = c.model if len(set(models)) == len(models) else c.study
+    return f"confirm-{key}-trial{c.trial.number + 1:02d}"
+
+
+def confirm_row(c: Cand, args, seed: int) -> dict:
     """Training config of a stored trial, re-labelled for confirmation and with holdout evaluation switched on."""
     import optuna
 
+    model, trial = c.model, c.trial
     cfg = trial.user_attrs.get("config")
     if cfg is None:
         # Study created before configs were stored: replay the params through the search-space function.
@@ -120,14 +177,14 @@ def confirm_row(model: str, trial, args, seed: int) -> dict:
         "suite": "confirm",
         "wandb_group": group_name(args),
         "wandb_tags": ["confirm", model],
-        "variant": f"confirm-{model}-trial{trial.number + 1:02d}",
+        "variant": variant_label(c, args),
         "skip_test_eval": False,  # evaluate the best checkpoint on the holdout tiles
     }
 
 
 def build_plan(args):
-    top = candidates(args)[: args.top_k]
-    rows = [confirm_row(m, t, args, seed) for m, t in top for seed in args.seeds]
+    top = select_top(candidates(args), args.top_k, args.stratify_by)
+    rows = [confirm_row(c, args, seed) for _, c in top for seed in args.seeds]
     return top, rows
 
 
@@ -148,14 +205,18 @@ def write_plan(args, top, rows) -> Path:
             {
                 "wandb_group": group_name(args),
                 "studies": args.studies,
+                "stratify_by": args.stratify_by,
+                "top_k_per_stratum": args.top_k,
                 "top_trials": [
                     {
-                        "model": m,
-                        "trial": t.number + 1,
-                        "val_ap": t.value,
-                        "params": t.params,
+                        "stratum": s,
+                        "model": c.model,
+                        "study": c.study,
+                        "trial": c.trial.number + 1,
+                        "val_ap": c.trial.value,
+                        "params": c.trial.params,
                     }
-                    for m, t in top
+                    for s, c in top
                 ],
                 "seeds": args.seeds,
                 "runs": [{"config": r, "command": command(r)} for r in rows],
@@ -170,9 +231,15 @@ def cmd_select(args) -> None:
     top, rows = build_plan(args)
     if not top:
         raise SystemExit("No completed trials in any study yet.")
-    print(f"\nGlobal top {len(top)} (single-seed validation AP, all architectures):")
-    for m, t in top:
-        print(f"  {m:<10} trial {t.number + 1:>3}  val_ap={t.value:.5f}  {t.params}")
+    print(
+        f"\nTop {args.top_k} per stratum (stratify-by '{args.stratify_by}'), "
+        f"single-seed validation AP:"
+    )
+    for s, c in top:
+        print(
+            f"  [{s}] {c.model:<10} trial {c.trial.number + 1:>3}  "
+            f"val_ap={c.trial.value:.5f}  {c.trial.params}"
+        )
     path = write_plan(args, top, rows)
     print(f"\n{len(rows)} confirmation runs -> {path}")
     for r in rows:
@@ -190,15 +257,15 @@ def cmd_run(args) -> None:
     if args.index >= len(rows):
         print(
             f"Index {args.index} is beyond the {len(rows)} planned runs "
-            f"(only {len(top)} completed trials available); nothing to do."
+            f"({len(top)} selected trials); nothing to do."
         )
         return
     row = rows[args.index]
     cmd = command(row)
-    model, t = top[args.index // len(args.seeds)]
+    stratum, c = top[args.index // len(args.seeds)]
     print(
-        f"[confirm {args.index + 1}/{len(rows)}] {model} trial {t.number + 1} (val_ap {t.value:.5f}), "
-        f"seed {row['seed']}\n{' '.join(cmd)}",
+        f"[confirm {args.index + 1}/{len(rows)}] [{stratum}] {c.model} trial {c.trial.number + 1} "
+        f"(val_ap {c.trial.value:.5f}), seed {row['seed']}\n{' '.join(cmd)}",
         flush=True,
     )
     if args.execute:
@@ -240,8 +307,9 @@ def cmd_aggregate(args) -> None:
             and not isinstance(v, bool)
             and (k == "val_ap" or k.startswith("test_"))
         }
-        if isinstance(summary.get("val_ap.max"), (int, float)):  # <-- add
-            metrics["val_ap"] = float(summary["val_ap.max"])  # <-- add
+        # train.py logs the best-epoch validation AP as the summary key "val_ap.max".
+        if isinstance(summary.get("val_ap.max"), (int, float)):
+            metrics["val_ap"] = float(summary["val_ap.max"])
         records.append(
             {
                 "variant": r.config.get("variant") or r.name,
@@ -265,6 +333,9 @@ def cmd_aggregate(args) -> None:
         vals = [rec[key] for rec in by_variant[variant] if key in rec]
         return statistics.fmean(vals) if vals else float("-inf")
 
+    def cells_of(variant):
+        return [_fmt([rec[k] for rec in by_variant[variant] if k in rec]) for k in keys]
+
     ranked = sorted(by_variant, key=lambda v: mean_of(v, "val_ap"), reverse=True)
     best = ranked[0]
     best_cfg = {
@@ -273,6 +344,11 @@ def cmd_aggregate(args) -> None:
         )
         for k in ("model_type", "learning_rate", "weight_decay", "model_opts")
     }
+
+    # Best configuration of every architecture (first hit in the ranking), for architecture comparison.
+    best_per_model: dict[str, str] = {}
+    for v in ranked:
+        best_per_model.setdefault(by_variant[v][0].get("model") or "", v)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -292,13 +368,23 @@ def cmd_aggregate(args) -> None:
         "|" + "---|" * (len(keys) + 3),
     ]
     for v in ranked:
-        cells = [_fmt([rec[k] for rec in by_variant[v] if k in rec]) for k in keys]
         mark = " (selected)" if v == best else ""
         model = by_variant[v][0].get("model") or ""
         lines.append(
             f"| {v}{mark} | {model} | {len(by_variant[v])} | "
-            + " | ".join(cells)
+            + " | ".join(cells_of(v))
             + " |"
+        )
+    lines += [
+        "",
+        "## Best configuration per architecture (by mean validation AP)",
+        "",
+        "| model | variant | n | " + " | ".join(keys) + " |",
+        "|" + "---|" * (len(keys) + 3),
+    ]
+    for m, v in best_per_model.items():
+        lines.append(
+            f"| {m} | {v} | {len(by_variant[v])} | " + " | ".join(cells_of(v)) + " |"
         )
     lines += [
         "",
@@ -316,6 +402,7 @@ def cmd_aggregate(args) -> None:
                 "selected_variant": best,
                 "selected_config": best_cfg,
                 "selected_runs": by_variant[best],
+                "best_per_model": best_per_model,
                 "ranking": [
                     {
                         "variant": v,
@@ -350,9 +437,21 @@ def main() -> None:
             nargs="+",
             required=True,
             metavar="MODEL,STUDY_NAME,JOURNAL",
-            help="One entry per architecture; trials from all of them are pooled.",
+            help="One entry per study; trials from all of them are pooled.",
         )
-        sp.add_argument("--top-k", type=int, default=3, help="Global top-k trials.")
+        sp.add_argument(
+            "--top-k",
+            type=int,
+            default=3,
+            help="Top-k trials PER STRATUM (see --stratify-by).",
+        )
+        sp.add_argument(
+            "--stratify-by",
+            default="none",
+            metavar="none|model|KEY",
+            help="'none': one global top-k (default). 'model': top-k per architecture. "
+            "Any other value: top-k per distinct value of that config key / trial param (e.g. loss_name).",
+        )
         sp.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
         sp.add_argument(
             "--group",
@@ -383,7 +482,7 @@ def main() -> None:
         "--index",
         type=int,
         required=True,
-        help="Which planned run to train: ranked trial-major, index = rank * n_seeds + seed position.",
+        help="Which planned run to train: ranked trial-major, index = selection position * n_seeds + seed position.",
     )
     agg = sub.add_parser("aggregate")
     agg.add_argument(
