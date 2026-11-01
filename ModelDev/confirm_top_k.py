@@ -240,6 +240,8 @@ def cmd_aggregate(args) -> None:
             and not isinstance(v, bool)
             and (k == "val_ap" or k.startswith("test_"))
         }
+        if isinstance(summary.get("val_ap.max"), (int, float)):  # <-- add
+            metrics["val_ap"] = float(summary["val_ap.max"])  # <-- add
         records.append(
             {
                 "variant": r.config.get("variant") or r.name,

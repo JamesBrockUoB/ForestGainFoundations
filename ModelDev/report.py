@@ -43,7 +43,7 @@ def fetch_runs(
                 "model": cfg.get("model_type"),
                 "checkpoint_dir": cfg.get("checkpoint_dir"),
                 "url": run.url,
-                **{m: run.summary.get(m) for m in metrics},
+                **{m: run.summary.get(f"{m}.max", run.summary.get(m)) for m in metrics},
             }
         )
     return pd.DataFrame(rows)
