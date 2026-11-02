@@ -2,7 +2,7 @@
 
 Run commands from `ModelDev`. `experiments.py` writes a JSON manifest and prints the generated `train.py` commands. Except for the adaptive benchmark, it does not train unless `--execute` is supplied. Review the manifest before launching experiments.
 
-Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM launcher and array for the parallel benchmarks), `confirm_top_k.py` + `run_fg_confirm.sh` (multi-seed confirmation of the global top benchmark trials, with holdout evaluation).
+Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM launcher and arrays for the parallel benchmarks and the confirmation), `confirm_top_k.py` + `run_fg_confirm.sh` (multi-seed confirmation of the best benchmark trials, with holdout evaluation), `run_fg_data_sources.sh` (data-source sweep and confirmation of the top sources, with the best benchmark configuration of a model).
 
 ## Experiment tracking (Weights & Biases)
 
@@ -10,13 +10,15 @@ Every generated command carries labels so runs are named, grouped and reportable
 
 | Label | Set by | Meaning |
 |---|---|---|
-| `--wandb_group` | `experiments.py` (`--group` overrides) | one launch, default `<suite>_<timestamp>`; benchmark trials use the Optuna study name; confirmation runs use `confirm_<model><jobid>-...` |
+| `--wandb_group` | `experiments.py` (`--group` overrides) | one launch, default `<suite>_<timestamp>`; benchmark trials use the Optuna study name; confirmation runs use the `CONFIRM_GROUP` name |
 | `--variant` | the suite (or auto-derived) | seed-independent label of a configuration, e.g. `repeats4`, `geo-only`, `trial07`, `confirm-tsvit-trial07` |
 | `--suite` | `experiments.py` | W&B job type (`benchmark`, `losses`, ..., `confirm`) |
 | `--wandb_tags` | `experiments.py` | suite and model |
 | run name | `train.py` | `<variant>-s<seed>` (or the checkpoint run name if no variant) |
 
 `train.py` logs the full configuration to W&B, defines `val_ap` with a **max summary** (the run summary holds the best epoch, not the last), and writes the W&B run id and checkpoint directory to `checkpoints/<run>/args.json`. `--wandb_project` overrides the project (default `Forest-Gain-CD`). In the W&B UI, group by `variant` to collapse seeds into mean and min/max curves.
+
+**The summary key is `val_ap.max`.** Because of the max summary, the W&B API exposes the best-epoch validation AP as `val_ap.max`, not `val_ap`. `report.py`, `confirm_top_k.py aggregate` and the data-source confirmation read `val_ap.max` (falling back to `val_ap`). If a report shows empty validation AP columns, this is the first thing to check.
 
 Aggregate a launch over seeds:
 
@@ -25,7 +27,7 @@ python report.py --group augmentation_20261030_004812 --baseline baseline
 python report.py --suite losses --out reports/losses
 ```
 
-This writes `<out>.runs.csv` (one row per run), `<out>.csv` and `<out>.md` (per variant: n, mean, std, min, max, difference from the baseline, best run) and `<out>.png`. It reports validation AP only. Keep `--split-seed` fixed so seeds are the only variation within a variant. Confirmation runs (which also have holdout metrics) are aggregated by `confirm_top_k.py aggregate`, see section 1.
+This writes `<out>.runs.csv` (one row per run), `<out>.csv` and `<out>.md` (per variant: n, mean, std, min, max, difference from the baseline, best run) and `<out>.png`. It reports validation AP only. Keep `--split-seed` fixed so seeds are the only variation within a variant. Confirmation runs (which also have holdout metrics) are aggregated by `confirm_top_k.py aggregate`, see sections 1 and 2.
 
 ## 1. Model and optimiser benchmark
 
@@ -48,25 +50,25 @@ python experiments.py benchmark --execute --trials 50
 
 ### Running trials in parallel (SLURM): benchmark, then confirmation
 
-Run `run_fg_benchmark.sh` **with bash** (not `sbatch`) from a login node, in the directory where you keep your other job scripts and `logs/`. One command launches every model and the confirmation:
+Submit `run_fg_benchmark.sh` **with sbatch** from the directory where you keep your job scripts (`/projects/b6be/jamesbrock.b6be`), after `mkdir -p logs`. It runs as a small launcher job (2 GB, 10 minutes, no GPU, set by its `#SBATCH` header) that submits everything else:
 
 ```bash
-bash run_fg_benchmark.sh
-TRIALS=60 TOP_K=3 CONFIRM_SEEDS="0 1 2" bash run_fg_benchmark.sh
-MODELS="tsvit sits_scd" bash run_fg_benchmark.sh              # a subset of models
+sbatch run_fg_benchmark.sh
+TRIALS=60 TOP_K=3 CONFIRM_SEEDS="0 1 2" sbatch run_fg_benchmark.sh
+MODELS="tsvit sits_scd" sbatch run_fg_benchmark.sh              # a subset of models
 ```
+
+The launcher finds the real scripts through `SLURM_SUBMIT_DIR` (the directory you ran `sbatch` from), because Slurm runs a copy of the script from its spool directory. Worker arrays get their own resources (1 GPU, 32 GB, 24 h) explicitly. If your cluster refuses to submit jobs from compute nodes, run the launcher on the login node with `bash run_fg_benchmark.sh` instead; the script works either way.
 
 | Step | Job | What it does |
 |---|---|---|
-| 1 | one `run_fg_benchmark.sh` array per model (`--array=0-5`, 6 workers each) | parallel TPE workers on one shared study per model (`TRIALS`, default 50, per model) |
+| 1 | one array per model (`--array=0-5`, 6 workers each) | parallel TPE workers on one shared study per model (`TRIALS`, default 50, per model) |
 | 2 | one `run_fg_confirm.sh` array, `--dependency=afterany` on all benchmark arrays | pools the trials of every model, takes the **global** top `TOP_K` (default 3) by validation AP, and retrains each for every seed in `CONFIRM_SEEDS` (default `0 1 2`): 9 runs in total, one GPU each, each scored on the holdout tiles |
-| 3 | small CPU job, `--dependency=afterany` on step 2 | `confirm_top_k.py aggregate`: mean ± std over seeds into `reports/confirm_<...>.{md,json,runs.csv}` in `ModelDev` |
+| 3 | small CPU job, `--dependency=afterany` on step 2 | runs `run_fg_report.sh` (or the script in `REPORT_SCRIPT`) if it exists; otherwise the launcher prints a warning and skips it. Aggregate by hand with `confirm_top_k.py aggregate` (see below) |
 
-The global top 3 can be any mix of architectures (for example two SITS-SCD configurations and one TSViT). Comparing architectures this way is fair because every benchmark trial uses the same sources, loss, split and seed.
+The global top 3 can be any mix of architectures. To compare architectures instead (the best trial of each, several seeds each), run the confirmation by hand with `--stratify-by model`, see "Confirmation and holdout" below. Comparing architectures this way is fair because every benchmark trial uses the same sources, loss, split and seed.
 
-`afterany` means steps 2 and 3 still run if a benchmark worker hits the time limit. All tasks of one benchmark array share `SLURM_ARRAY_JOB_ID`, which names that model's study (`forestgain_<model>_<jobid>`) and output directory (`experiment_manifests/benchmark_<model>_<jobid>/`). Resume a model's study with `TAG_<model>=<old job id>`, for example `TAG_tsvit=123456 bash run_fg_benchmark.sh`: it adds trials until the study holds `TRIALS`.
-
-`sbatch --export=ALL,MODEL=tsvit run_fg_benchmark.sh` still runs one model's benchmark array only, with no confirmation.
+`afterany` means steps 2 and 3 still run if a benchmark worker hits the time limit. All tasks of one benchmark array share `SLURM_ARRAY_JOB_ID`, which names that model's study (`forestgain_<model>_<jobid>`) and output directory (`experiment_manifests/benchmark_<model>_<jobid>/`). Resume a model's study with `TAG_<model>=<old job id>`, for example `TAG_tsvit=123456 sbatch run_fg_benchmark.sh`: it adds trials until the study holds `TRIALS`. Do not resume finished benchmarks just to confirm them; run the confirmation by hand instead.
 
 The matching flags in `experiments.py benchmark`:
 
@@ -97,6 +99,7 @@ study = optuna.load_study(
     storage=_make_storage("experiment_manifests/benchmark_tsvit_<jobid>/optuna_journal.log"),
 )
 print(study.best_trial.number + 1, study.best_value, study.best_params)
+df = study.trials_dataframe()            # every trial: params, value, state
 ```
 
 Each trial's W&B group is the study name and its variant is `trialNN`, where NN is the global trial number across workers.
@@ -104,7 +107,7 @@ Each trial's W&B group is the study name and its variant is `trialNN`, where NN 
 ### Search spaces
 
 - **All models:** learning rate `3e-5`–`1e-3` (log scale), weight decay `1e-5`–`5e-2` (log scale), dropout `0`–`0.35`.
-- **TSViT:** embedding dimension `{96,128,160}`, attention heads `{4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`, patch size `{8,16,32}`, skip channels `{16,24,32,48}`.
+- **TSViT:** embedding dimension `{96,128,160}`, attention heads `{4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`, patch size `{8,16,32}`, skip channels `{16,24,32,48}`. `base_features` is not searched for TSViT (it stays at the model default, 64).
 - **SITS_SCD:** base features `{32,48,64,96}`, attention heads `{2,4,8}`, temporal depth `1`–`4`, spatial depth `2`–`6`.
 - **U-Net_LSTM:** base features `{24,32,48,64,96}`, skip channels `{16,24,32,48}`, temporal depth `1`–`3`.
 
@@ -112,41 +115,86 @@ After a first batch, look at parameter importance (`optuna.importance.get_param_
 
 ### Confirmation and holdout (`confirm_top_k.py`)
 
-Benchmark trials are single-seed and scored on the same validation tiles that drive early stopping, so the best of many trials is partly the luckiest. The confirmation step pools the completed trials of all benchmark studies, takes the global top `TOP_K` by validation AP, and retrains each for several seeds. With the defaults that is 3 configurations × 3 seeds = **9 training runs in total**, not per model.
+Benchmark trials are single-seed and scored on the same validation tiles that drive early stopping, so the best of many trials is partly the luckiest. The confirmation step pools the completed trials of all benchmark studies, selects the top `--top-k` trials per stratum by validation AP (`--stratify-by`, see below), and retrains each for several seeds. The number of runs is **strata × top-k × seeds**.
 
 - **The holdout is evaluated here, and only here.** Benchmark runs and every other suite pass `--skip_test_eval`. Confirmation runs do not, so `train.py` scores each run's best checkpoint on `--holdout_dir` and logs `test_*` metrics to W&B. Benchmark runs never saw the holdout, so seed 0 is retrained rather than reused.
-- **Selection rule:** the final model is the configuration with the best **mean validation AP** over its seeds. Holdout numbers are reported next to it but should not be used to choose between the three, otherwise the holdout stops being held out. Once chosen, do not change the configuration after looking at holdout results.
-- **Report:** `reports/confirm_<...>.md` ranks the configurations (model, n, validation AP and every `test_*` metric as mean ± std), names the selected one, and gives its learning rate, weight decay and architecture. `.runs.csv` has one row per run with the W&B URL and checkpoint directory; `.json` has the same data for scripts. Aggregation reads W&B, so it needs the runs to have finished and W&B access from the node.
-- **Labels:** confirmation runs use W&B job type `confirm`, group `confirm_<model><jobid>-...` and variant `confirm-<model>-trialNN`.
+- **Selection rule:** the final model is the configuration with the best **mean validation AP** over its seeds. Holdout numbers are reported next to it but should not be used to choose between configurations, otherwise the holdout stops being held out. Once chosen, do not change the configuration after looking at holdout results.
+- **Report:** `reports/<group>.md` ranks the configurations (model, n, validation AP and every `test_*` metric as mean ± std), names the selected one, gives its learning rate, weight decay and architecture, and has a second table with the **best configuration of every architecture**. `.runs.csv` has one row per run with the W&B URL and checkpoint directory; `.json` has the same data for scripts. Aggregation reads W&B, so it needs the runs to have finished and W&B access from the node.
+- **Labels:** confirmation runs use W&B job type `confirm`, the group you pass as `--group` / `CONFIRM_GROUP`, and variant `confirm-<model>-trialNN` (the study name replaces the model if one model has several studies).
+- **Group names:** use a fresh group for every confirmation. Re-using one mixes old and new runs, and `aggregate` would count them as extra seeds.
 
-Studies are passed as `MODEL,STUDY_NAME,JOURNAL_PATH`, one per architecture. To run it by hand, or to confirm benchmarks that are already finished:
+`--stratify-by` options (`--top-k` is always per stratum):
+
+| `--stratify-by` | picks |
+|---|---|
+| `none` (default) | the global top-k over all studies |
+| `model` | the top-k within each architecture, e.g. `--top-k 1` = the best trial of every architecture |
+| a config key or trial parameter | the top-k within each distinct value, e.g. `loss_name` (`loss` is an alias); trials without the key go to the stratum `unknown` |
+
+Studies are passed as `MODEL,STUDY_NAME,JOURNAL_PATH`, one per study. To run it by hand, or to confirm benchmarks that are already finished:
 
 ```bash
-S="tsvit,forestgain_tsvit_<id1>,experiment_manifests/benchmark_tsvit_<id1>/optuna_journal.log \
-   sits_scd,forestgain_sits_scd_<id2>,experiment_manifests/benchmark_sits_scd_<id2>/optuna_journal.log \
-   unet_lstm,forestgain_unet_lstm_<id3>,experiment_manifests/benchmark_unet_lstm_<id3>/optuna_journal.log"
-python confirm_top_k.py select --studies $S --group confirm_manual
-python confirm_top_k.py select --studies $S --group confirm_manual --execute      # train all 9 serially
-export CONFIRM_STUDIES="$S" CONFIRM_GROUP=confirm_manual TOP_K=3 CONFIRM_SEEDS="0 1 2"
-sbatch --export=ALL --array=0-8 run_fg_confirm.sh                                # or on SLURM
+P=/projects/b6be/jamesbrock.b6be/ForestGainFoundations/ModelDev/experiment_manifests
+export CONFIRM_STUDIES="tsvit,forestgain_tsvit_<id1>,$P/benchmark_tsvit_<id1>/optuna_journal.log sits_scd,forestgain_sits_scd_<id2>,$P/benchmark_sits_scd_<id2>/optuna_journal.log unet_lstm,forestgain_unet_lstm_<id3>,$P/benchmark_unet_lstm_<id3>/optuna_journal.log"
+export CONFIRM_GROUP=confirm_manual TOP_K=1 CONFIRM_SEEDS="0 1 2"
+# run_fg_confirm.sh passes --stratify-by "$CONFIRM_STRATIFY" if your copy has that line; export CONFIRM_STRATIFY=model
+
+cd ForestGainFoundations/ModelDev
+python confirm_top_k.py select --studies $CONFIRM_STUDIES --top-k 1 --stratify-by model --group confirm_manual   # plan only
+cd ../..
+sbatch --export=ALL --array=0-8 run_fg_confirm.sh                         # train on SLURM (array size = strata x top-k x seeds)
+cd ForestGainFoundations/ModelDev
 python confirm_top_k.py aggregate --group confirm_manual --out reports/confirm_manual
 ```
 
-`select` prints the global top-k trials and the exact 9 `train.py` commands and writes `confirm_plan.json` to `experiment_manifests/<group>/`. `run --index N` trains the N-th planned run (ranked trial-major: index = rank × n_seeds + seed position); every SLURM task derives the same top-k from the finished studies, so the tasks agree. Options: `--top-k`, `--seeds`, `--group`, `--wandb-project`, `--output-dir`. For a study created before trial configs were stored, the config is rebuilt from the trial's parameters using `--epochs/--patience/--batch-size/--data-dir/--holdout-dir/--split-seed`, which must match the benchmark's values.
+The studies in `CONFIRM_STUDIES` are separated by spaces and must not be quoted separately, because `run_fg_confirm.sh` expands the variable unquoted. Always run `select` first: it prints the selected trials and the exact `train.py` commands and writes `confirm_plan.json` to `experiment_manifests/<group>/`, without training. `run --index N` trains the N-th planned run (ranked trial-major: index = selection position × n_seeds + seed position); every SLURM task derives the same selection from the finished studies, so the tasks agree. An array larger than the plan is harmless: the extra tasks print "nothing to do" and exit. Options: `--top-k`, `--stratify-by`, `--seeds`, `--group`, `--wandb-project`, `--output-dir`. For a study created before trial configs were stored, the config is rebuilt from the trial's parameters using `--epochs/--patience/--batch-size/--data-dir/--holdout-dir/--split-seed`, which must match the benchmark's values.
 
-After choosing a winner, the checkpoints of its three runs are listed in the `.runs.csv` for later work. Run `mask_sweep.py` (section 7) on a selected checkpoint.
+After choosing a winner, the checkpoints of its runs are listed in the `.runs.csv` for later work. Run `mask_sweep.py` (section 7) on a selected checkpoint.
 
-**Holdout protection:** `experiments.py` adds `--skip_test_eval` to every generated training command, and `train.py` supports that flag. This keeps the holdout untouched during tuning and ablations. The same applies to the data-source, loss, hardness, temporal and augmentation suites: if you want holdout numbers for their final choices, run the chosen configuration once per seed with `--skip_test_eval` off, as the confirmation step does. The Bayesian objective is validation AP, never holdout performance.
+**Holdout protection:** `experiments.py` adds `--skip_test_eval` to every generated training command (except the confirmation of the top data sources, section 2), and `train.py` supports that flag. This keeps the holdout untouched during tuning and ablations. The same applies to the loss, hardness, temporal and augmentation suites: if you want holdout numbers for their final choices, run the chosen configuration once per seed with `--skip_test_eval` off, as the confirmation step does. The Bayesian objective is validation AP, never holdout performance.
 
 ## 2. Data-source ablation
 
-Use one selected/frozen model and training configuration for all 12 source combinations:
+Use one selected/frozen model and training configuration for all 12 source combinations. The configuration is the best benchmark trial of the chosen model, so that only the data source changes. There are two steps: a **sweep** over all sources (validation AP only), then a **confirmation** of the top sources on the holdout.
 
 ```bash
-python experiments.py data-sources --model tsvit --execute
+# 1. sweep: 12 source sets x 3 seeds = 36 runs, one per array task, at most 20 at once
+sbatch run_fg_data_sources.sh                                  # tsvit, benchmark trial 28
+sbatch --export=ALL,MODEL=unet_lstm run_fg_data_sources.sh     # unet_lstm, benchmark trial 33
+sbatch --export=ALL,MODEL=sits_scd run_fg_data_sources.sh      # sits_scd, benchmark trial 45
+
+# when the sweep has finished: rank the sources (validation AP, mean over seeds)
+python report.py --group data-sources_tsvit_<sweep job id> --metric val_ap \
+    --baseline tsvit_s1+s2_bce_focal_tversky --out reports/data_sources_tsvit
+
+# 2. confirmation: the top 3 sources x 3 seeds = 9 runs WITH holdout evaluation
+sbatch --array=0-8 --export=ALL,MODEL=tsvit,CONFIRM_FROM=data-sources_tsvit_<sweep job id> run_fg_data_sources.sh
+python confirm_top_k.py aggregate --group data-sources-confirm_tsvit_<confirm job id> --out reports/data_sources_confirm_tsvit
 ```
 
-The combinations are S1, S2, S1+S2, AlphaEarth, Tessera, S1+AlphaEarth, S2+AlphaEarth, S1+S2+AlphaEarth, S1+Tessera, S2+Tessera, S1+S2+Tessera, and S1+S2+AlphaEarth+Tessera. Only use this suite after selecting the model and optimiser settings from the benchmark. Confirm each product exists in the dataset pipeline.
+**Sweep.** `run_fg_data_sources.sh` is an array of 36 tasks (`--array=0-35%20`): one training run per (source set, seed). Task id = source index × number of seeds + seed position, so the first three tasks are source set 0 with seeds 0, 1, 2. Each task passes `--source-index N` to `experiments.py` so that it trains only that combination. The script sets the learning rate, weight decay, `--loss` and `--model-opt` from the model's best benchmark trial (override with `LR`, `WD`, `MODEL_OPT`, `LOSS`, `GROUP`, `MAX_RUNS`, `SEEDS` via `--export=ALL,...`). All tasks share one W&B group (`data-sources_<model>_<array job id>`), and each writes its manifest to its own directory (`experiment_manifests/<group>/seed<S>_src<N>/`). `--time` is per run (8 hours); raise it with `sbatch --time=...` for a slow model. If your limit is on submitted jobs rather than running jobs, submit the array in two halves (`--array=0-17` and `--array=18-35`) with the same `GROUP`. If you change the number of seeds, change `--array` to 12 × seeds.
+
+**Confirmation.** With `CONFIRM_FROM=<sweep group>`, each task reads the finished sweep from W&B, ranks the source combinations by mean validation AP over the sweep's seeds, takes the top `TOP_K` (default 3), and trains its own (source set, seed) with holdout evaluation switched on (`--top-sources-from` in `experiments.py` implies it). The ranking is deterministic, so all tasks agree, and each task prints the full ranking at the top of its log. The sweep must have **finished** first, otherwise the ranking uses partial results. Runs use the group `data-sources-confirm_<model>_<job id>` and variant `confirm-<model>-<sources>`. `confirm_top_k.py aggregate` then gives validation AP and every `test_*` metric as mean ± std per source set, ranked by validation AP. As in section 1, choose by validation AP and report the holdout numbers next to it without using them to choose. The seeds are retrained (not reused from the sweep) so the holdout is scored on a fresh run of each.
+
+To run it directly, pass the configuration explicitly; without `--model-opt` the architecture falls back to `train.py`'s defaults:
+
+```bash
+python experiments.py data-sources --model tsvit --seeds 0 1 2 --group data_sources_tsvit \
+  --learning-rate 0.00034779544459228077 --weight-decay 0.005786816724872467 --loss bce_focal_tversky \
+  --model-opt embed_dim=160 num_heads=4 depth_temporal=3 depth_spatial=2 patch_size=8 dropout=0.22185365097777363 skip_channels=24 \
+  --dry-run
+python experiments.py data-sources --model tsvit --seeds 0 1 2 --top-sources-from data_sources_tsvit --top-k 3 \
+  --group data_sources_confirm_tsvit --learning-rate ... --weight-decay ... --model-opt ... --dry-run
+```
+
+The combinations are S1, S2, S1+S2, AlphaEarth, Tessera, S1+AlphaEarth, S2+AlphaEarth, S1+S2+AlphaEarth, S1+Tessera, S2+Tessera, S1+S2+Tessera, and S1+S2+AlphaEarth+Tessera. Confirm each product exists in the dataset pipeline. Variants are named `<model>_<sources>_<loss>`.
+
+**Source bias.** The benchmark was run on S1 + S2, so the configuration is tuned for that input and may under-serve the others (especially the embedding sources, which have different channel statistics). To limit this:
+
+- Use the same seeds for every source set and compare differences against the S1+S2 baseline, not only means. Treat differences smaller than the seed spread (about 0.005 validation AP for TSViT) as ties.
+- Repeat the sweep with a second architecture (`MODEL=unet_lstm`). If the source ranking agrees across architectures, it is not an artefact of one model's hyperparameters.
+- For the leading source sets and S1+S2, run a short tuning search (learning rate, weight decay, dropout) and confirm with 3 seeds. If the ranking holds, it is robust to tuning; if it changes, report both tables. This needs the benchmark's `("s1", "s2")` source set replaced by `args.sources` in `run_bayesian_benchmark` and a separate `--study-name` per source set.
+- State the limitation. If a source beats S1+S2 even though the configuration favours S1+S2, the result is conservative.
 
 ## 3. Loss exploration
 
@@ -176,7 +224,7 @@ Parameter exploration includes:
 
 **Focal + OHEM is implemented, not just listed as a command.** The Focal term calculates unreduced per-pixel focal losses and passes them to the configured reweighter. OHEM selects hard pixels using the model's confidence in the true class (threshold-based mmsegmentation-style selection), then the selected pixels' focal losses are reduced. `SegmentationLoss` handles the focal term's `(loss, auxiliary_loss, stats)` result just as it does BCE. Make sure the updated `terms.py` and loss package `__init__.py` are installed in the actual `losses/` package before running this suite.
 
-The suite uses one fixed model, source set, data split, and unspecified training defaults. It is a structured comparison, not a full Bayesian optimisation of every loss parameter. Use multiple seeds for shortlisted loss configurations.
+The suite uses one fixed model, source set, data split, and unspecified training defaults. Pass the best benchmark configuration with `--learning-rate`, `--weight-decay` and `--model-opt` (as for the data-source ablation) so that the architecture is not left at `train.py`'s defaults. It is a structured comparison, not a full Bayesian optimisation of every loss parameter. Use multiple seeds for shortlisted loss configurations.
 
 ## 4. Pixel hardness
 
@@ -190,7 +238,7 @@ The suite compares matched versions of BCE and BCE + Focal Tversky under:
 - OHEM at thresholds `0.7` and `0.9`;
 - learned hardness, sweeping `hardness.c` `{0.01,0.1}` and auxiliary loss scale `hardness.alpha` `{0.001,0.01,0.05}`.
 
-The hardness branch mirrors the model's segmentation head on detached inputs, so the layer is the head module: TSViT `decoder` (a copy of the multi-conv decoder) and `decoder.final_head` (small default head on the fused features), SITS-SCD `final_head` and U-Net-LSTM `out_head` (small default head). `experiments.py` picks these per model (`HARDNESS_LAYERS`); override with `--hl-layer`, or pass `--hl_layer` to `train.py`. Run the suite once per model. That gives 12 (TSViT) or 6 (others) hardness configurations per loss family, plus 3 controls (no reweighting, OHEM 0.7, OHEM 0.9), i.e. 15 or 9 runs per loss family. The hardness branch consumes detached features, and the learned hardness weighting applies to the per-pixel BCE term; in BCE + Focal Tversky the Tversky term itself remains un-reweighted.
+The hardness branch mirrors the model's segmentation head on detached inputs, so the layer is the head module: TSViT `decoder` (a copy of the multi-conv decoder) and `decoder.final_head` (small default head on the fused features), SITS-SCD `final_head` and U-Net-LSTM `out_head` (small default head). `experiments.py` picks these per model (`HARDNESS_LAYERS`); override with `--hl-layer`, or pass `--hl_layer` to `train.py`. Run the suite once per model. That gives 12 (TSViT) or 6 (others) hardness configurations per loss family, plus 3 controls (no reweighting, OHEM 0.7, OHEM 0.9), i.e. 15 or 9 runs per loss family. The hardness branch consumes detached features, and the learned hardness weighting applies to the per-pixel BCE term; in BCE + Focal Tversky the Tversky term itself remains un-reweighted. `--model-opt`, `--learning-rate` and `--weight-decay` apply as in section 3.
 
 This is a parameter sweep rather than a full Bayesian search. After the initial sweep, compare the strongest hardness settings against the matched no-reweighting and OHEM controls over multiple seeds.
 
@@ -200,7 +248,7 @@ This is a parameter sweep rather than a full Bayesian search. After the initial 
 python experiments.py temporal --models tsvit sits_scd unet_lstm --seeds 0 1 2 --execute
 ```
 
-Compares first+last year (2017, 2024), 2017/2021/2024, 2017/2020/2022/2024, and the whole sequence (`--year-sets` overrides). The valid-pixel mask is taken over all years so the scored pixels stay consistent across frame subsets.
+Compares first+last year (2017, 2024), 2017/2021/2024, 2017/2020/2022/2024, and the whole sequence (`--year-sets` overrides). The valid-pixel mask is taken over all years so the scored pixels stay consistent across frame subsets. This suite compares several models, so it does not take `--model-opt`; each model uses `train.py`'s architecture defaults and the shared `--learning-rate` / `--weight-decay`.
 
 ## 6. Augmentation and sampling
 
@@ -209,7 +257,7 @@ python experiments.py augmentation --model tsvit --seeds 0 1 2 --execute
 python experiments.py augmentation --loss-type soft --execute   # also sweeps soft-label jitter
 ```
 
-Model, sources, loss, learning rate and weight decay are fixed. The baseline is `train.py`'s defaults: random 90-degree rotation and flip, S2 brightness jitter (`gain_sigma` 0.03, `frame_sigma` 0.01), no frame dropout, full tile, `repeats` 1. The suite (14 runs per seed, 18 with `--loss-type soft`) covers:
+Model, sources, loss, learning rate and weight decay are fixed (pass the best benchmark configuration with `--learning-rate`, `--weight-decay` and `--model-opt`). The baseline is `train.py`'s defaults: random 90-degree rotation and flip, S2 brightness jitter (`gain_sigma` 0.03, `frame_sigma` 0.01), no frame dropout, full tile, `repeats` 1. The suite (14 runs per seed, 18 with `--loss-type soft`) covers:
 
 - **Augmentation family:** all off (`--no_augment`), geometric only (`--gain_sigma 0 --frame_sigma 0`), spectral only (`--no_geo_aug`).
 - **Spectral strength:** `gain_sigma`/`frame_sigma` of 0.1/0.03 and 0.2/0.05.
@@ -234,9 +282,13 @@ All non-benchmark suites accept:
 - `--loss-type hard|soft`: pass the selected loss type to each run.
 - `--group NAME`: W&B group for the launch (default `<suite>_<timestamp>`); `--wandb-project NAME`: W&B project.
 - `--match-steps` / `--no-match-steps`: augmentation suite only, see section 6.
+- `--model-opt KEY=VAL ...`: architecture options passed to every run of the data-sources, losses, hardness and augmentation suites (use the best benchmark configuration).
+- `--loss NAME`: loss for the data-sources and temporal suites (default `bce_focal_tversky`, the benchmark loss).
+- `--source-index N`: data-sources suite, run only the N-th source combination (for parallel SLURM tasks).
+- `--top-sources-from GROUP` and `--top-k K`: data-sources suite, confirmation of the K best combinations of a finished sweep, with holdout evaluation (section 2).
 - `--epochs`, `--patience`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--data-dir`, `--holdout-dir`, `--split-seed`.
 
-The benchmark accepts `--trials`, `--startup-trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate` and `--weight-decay` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
+The benchmark accepts `--trials`, `--startup-trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate`, `--weight-decay` and `--model-opt` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
 
 `train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
 

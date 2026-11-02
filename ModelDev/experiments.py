@@ -5,18 +5,26 @@ Examples
 python experiments.py benchmark --dry-run
 python experiments.py benchmark --models tsvit --execute --trials 50 --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
 python experiments.py data-sources --model tsvit --execute
+python experiments.py data-sources --model tsvit --seeds 0 --loss bce_focal_tversky --learning-rate 3.5e-4 \
+    --weight-decay 5.8e-3 --model-opt embed_dim=160 num_heads=4 depth_temporal=3 depth_spatial=2 patch_size=8 \
+    dropout=0.22 skip_channels=24 --dry-run
 python experiments.py losses --model tsvit --execute --max-runs 12
 python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
 
 Suites
   benchmark     lr / weight decay / size search, S1+S2 (Optuna TPE; parallel workers can share one study)
-  data-sources  every input-source combination
+  data-sources  every input-source combination (use the best benchmark configuration: --learning-rate, --weight-decay,
+                --loss, --model-opt; --source-index N runs only the N-th combination, for parallel SLURM tasks;
+                --top-sources-from GROUP --top-k K retrains the K best combinations of a finished sweep over the
+                seeds WITH holdout evaluation: the confirmation step)
   losses        bce, dice, focal Tversky, BCE+Tversky, focal, focal+OHEM, Lovasz, BCE+Lovasz, OHEM
   hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
   augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
 --seeds repeats every run per seed (seeds are the outer loop, so --max-runs still covers every config).
+--model-opt passes architecture options to every run of data-sources, losses, hardness and augmentation (the temporal
+suite compares several models, so it does not use it).
 
 After a benchmark, confirm_top_k.py retrains the best trials over several seeds with holdout evaluation.
 
@@ -75,8 +83,8 @@ def _base(args: argparse.Namespace, model: str, sources: tuple[str, ...]) -> dic
         "data_dir": args.data_dir,
         "holdout_dir": args.holdout_dir,
         "split_seed": args.split_seed,
-        # Do not evaluate the final holdout during model/loss/source selection.
-        "skip_test_eval": True,
+        # Do not evaluate the final holdout during model/loss/source selection (only confirmation runs do).
+        "skip_test_eval": not getattr(args, "eval_holdout", False),
         # Weights & Biases labelling
         "suite": args.suite,
         "wandb_group": args.group,
@@ -345,19 +353,97 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
     print(f"Wrote benchmark results to {summary}")
 
 
+def _run_sources(run, model: str):
+    """Source combination of a finished W&B run as a frozenset (from its config, else from its variant label)."""
+    s = run.config.get("sources")
+    if isinstance(s, (list, tuple)) and s:
+        return frozenset(s)
+    variant = run.config.get("variant") or run.name
+    if variant.startswith(f"{model}_"):
+        return frozenset(variant[len(model) + 1 :].split("_")[0].split("+"))
+    return None
+
+
+def top_source_sets(args: argparse.Namespace) -> list[tuple[str, ...]]:
+    """Top --top-k source combinations of a FINISHED data-sources sweep, by mean validation AP over its seeds.
+
+    Reads the sweep's W&B group (--top-sources-from). The ranking is deterministic (ties by SOURCE_SETS order), so
+    every SLURM array task derives the same selection.
+    """
+    import statistics
+
+    import wandb
+
+    api = wandb.Api()
+    project = args.wandb_project or "Forest-Gain-CD"
+    lookup = {frozenset(s): s for s in SOURCE_SETS}
+    by_set: dict[tuple[str, ...], list[float]] = {}
+    for run in api.runs(
+        f"{api.default_entity}/{project}", filters={"group": args.top_sources_from}
+    ):
+        if run.state != "finished":
+            continue
+        summary = dict(run.summary)
+        val = summary.get("val_ap.max", summary.get("val_ap"))
+        sources = lookup.get(_run_sources(run, args.model))
+        if val is None or sources is None:
+            continue
+        by_set.setdefault(sources, []).append(float(val))
+    if not by_set:
+        raise SystemExit(
+            f"No finished runs with a validation AP in W&B group '{args.top_sources_from}'."
+        )
+    ranked = sorted(
+        by_set, key=lambda s: (-statistics.fmean(by_set[s]), SOURCE_SETS.index(s))
+    )
+    print(
+        f"Source combinations in '{args.top_sources_from}' (mean validation AP over seeds):"
+    )
+    for s in ranked:
+        print(
+            f"  {'+'.join(s):<34} n={len(by_set[s])}  val_ap={statistics.fmean(by_set[s]):.4f}"
+        )
+    return ranked[: args.top_k]
+
+
 def data_sources(args: argparse.Namespace) -> list[dict]:
-    return [
-        _base(args, args.model, sources)
-        | {"learning_rate": args.learning_rate, "weight_decay": args.weight_decay}
-        for sources in SOURCE_SETS
-    ]
+    """Every source combination with ONE fixed training configuration.
+
+    Pass the best benchmark configuration of the chosen model (--learning-rate, --weight-decay, --loss, --model-opt),
+    otherwise train.py's defaults are used for the architecture and the learning rate / weight decay defaults apply.
+    """
+    tuned = {
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "loss_name": args.loss,
+        **({"model_opt": args.model_opt} if args.model_opt else {}),
+    }
+    sets = top_source_sets(args) if args.top_sources_from else list(SOURCE_SETS)
+    if args.source_index is not None:
+        if not 0 <= args.source_index < len(sets):
+            print(
+                f"--source-index {args.source_index} is beyond the {len(sets)} planned source combinations; "
+                "nothing to do."
+            )
+            return []
+        sets = [sets[args.source_index]]  # one combination per SLURM array task
+    rows = []
+    for sources in sets:
+        row = _base(args, args.model, sources) | tuned
+        if (
+            args.top_sources_from
+        ):  # confirmation run: seed-independent label (holdout is evaluated, see main)
+            row["variant"] = f"confirm-{args.model}-{'+'.join(sources)}"
+        rows.append(row)
+    return rows
 
 
 def _run(args: argparse.Namespace, **extra) -> dict:
-    """One run of the chosen model / sources / lr / wd, plus the given overrides."""
+    """One run of the chosen model / sources / lr / wd (and --model-opt, if given), plus the given overrides."""
     return _base(args, args.model, tuple(args.sources)) | {
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        **({"model_opt": args.model_opt} if args.model_opt else {}),
         **extra,
     }
 
@@ -604,6 +690,26 @@ def main() -> None:
         default=["s1", "s2"],
         choices=("s1", "s2", "alphaearth", "tessera"),
     )
+    p.add_argument(
+        "--source-index",
+        type=int,
+        default=None,
+        help="Data-sources suite: run only the N-th source combination (0-11, order of SOURCE_SETS) so that "
+        "the combinations can run as parallel SLURM array tasks (default: all of them, serially).",
+    )
+    p.add_argument(
+        "--top-sources-from",
+        default=None,
+        metavar="WANDB_GROUP",
+        help="Data-sources suite, confirmation step: train only the --top-k best source combinations (mean validation "
+        "AP over seeds) of a FINISHED sweep in this W&B group, WITH holdout evaluation.",
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=3,
+        help="Number of source combinations for --top-sources-from.",
+    )
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument(
         "--trials",
@@ -637,6 +743,14 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-2)
+    p.add_argument(
+        "--model-opt",
+        nargs="+",
+        default=None,
+        metavar="KEY=VAL",
+        help="Architecture options passed as --model_opt to every run of the data-sources, losses, hardness and "
+        "augmentation suites, e.g. embed_dim=160 num_heads=4 (use the best benchmark configuration).",
+    )
     p.add_argument("--data-dir", default="../DataCollection/data/forest_gain_tiles")
     p.add_argument("--holdout-dir", default="../DataCollection/data/holdout_tiles")
     p.add_argument("--split-seed", type=int, default=0)
@@ -656,7 +770,7 @@ def main() -> None:
     p.add_argument(
         "--loss",
         default="bce_focal_tversky",
-        help="Loss for the temporal suite (the losses and hardness suites set their own).",
+        help="Loss for the temporal and data-sources suites (the losses and hardness suites set their own).",
     )
     p.add_argument(
         "--models",
@@ -692,6 +806,8 @@ def main() -> None:
         "(default per model: see HARDNESS_LAYERS).",
     )
     args = p.parse_args()
+    # Confirmation runs (and only those) evaluate the holdout tiles; every other suite keeps it untouched.
+    args.eval_holdout = bool(args.top_sources_from)
     args.group = (
         args.group or f"{args.suite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
