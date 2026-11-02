@@ -73,3 +73,5 @@ YEARS = list(range(2017, 2025))  # 2017 - 2024 inclusive
 DEFAULT_IMAGE_SIZE = 256
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_LR = 3e-4
+
+EMBEDDING_ABS_MAX = 30.0  # Tessera legit max ~20

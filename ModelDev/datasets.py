@@ -6,6 +6,7 @@ import rasterio
 import torch
 from config import (
     BAND_FILE_INDEX,
+    EMBEDDING_ABS_MAX,
     EMBEDDING_SOURCES,
     NORM_CLIP,
     NORM_NAN_FILL,
@@ -67,8 +68,13 @@ def read_physical(path: Path, band_names, mask_nodata: bool = False) -> np.ndarr
     with rasterio.open(path) as src:
         x = src.read(idx).astype(np.float32)
         nodata = src.nodata
-    if mask_nodata and nodata is not None and not np.isnan(nodata):
-        x[x == np.float32(nodata)] = np.nan
+    if mask_nodata:
+        if nodata is not None and not np.isnan(nodata):
+            x[x == np.float32(nodata)] = np.nan
+        # Corrupt values (inf, or finite but absurd): whole pixel becomes missing.
+        with np.errstate(invalid="ignore"):
+            bad = ~np.isfinite(x) | (np.abs(x) > EMBEDDING_ABS_MAX)
+        x[:, bad.any(axis=0)] = np.nan
     for i, b in enumerate(band_names):
         if b in S2_BANDS:
             x[i] /= S2_SCALE
