@@ -67,6 +67,9 @@ SOURCE_SETS = (
     ("s2", "tessera"),
     ("s1", "s2", "tessera"),
     ("s1", "s2", "alphaearth", "tessera"),
+    ("alphaearth", "tessera"),
+    ("s1", "alphaearth", "tessera"),
+    ("s2", "alphaearth", "tessera"),
 )
 
 BENCHMARK_MODELS = ("tsvit", "sits_scd", "unet_lstm")

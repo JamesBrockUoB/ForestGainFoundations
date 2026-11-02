@@ -29,6 +29,12 @@ python report.py --suite losses --out reports/losses
 
 This writes `<out>.runs.csv` (one row per run), `<out>.csv` and `<out>.md` (per variant: n, mean, std, min, max, difference from the baseline, best run) and `<out>.png`. It reports validation AP only. Keep `--split-seed` fixed so seeds are the only variation within a variant. Confirmation runs (which also have holdout metrics) are aggregated by `confirm_top_k.py aggregate`, see sections 1 and 2.
 
+## Embedding data handling (`datasets.py`)
+
+Tessera tiles can contain corrupt values that the export checks did not catch: finite but absurd values (up to 1.7e35, seen in `tile_1102_873` 2019 and `tile_1131_908` 2024; 159 pixels in total), and pixels that are bad in only some of their 128 channels. A single absurd value turns the loss into NaN and collapses training.
+
+`read_physical` therefore treats every embedding value that is NaN, infinite or has an absolute value above `EMBEDDING_ABS_MAX` (`config.py`, 50.0; the largest legitimate Tessera value measured over all 4000 tile-years is about 17.3, AlphaEarth values stay within about ±0.55) as missing, and a pixel that is missing in **any** channel is made missing in **all** channels. `normalize()` then zero-fills it, exactly like the sea / uncovered pixels Tessera marks as NaN. The bound is absolute, so it needs no statistics and no re-run when new data is collected. The valid-pixel mask is deliberately not changed, so every source combination is still scored on identical pixels.
+
 ## 1. Model and optimiser benchmark
 
 The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and the `bce_focal_tversky` loss, and maximises validation average precision (`val_ap`). `--trials` is the **total budget per model** and is shared across parallel workers (default 50; there is no upper cap). The budget is exact: a worker that claims a slot beyond `--trials` hands it back without training.
@@ -155,10 +161,10 @@ After choosing a winner, the checkpoints of its runs are listed in the `.runs.cs
 
 ## 2. Data-source ablation
 
-Use one selected/frozen model and training configuration for all 12 source combinations. The configuration is the best benchmark trial of the chosen model, so that only the data source changes. There are two steps: a **sweep** over all sources (validation AP only), then a **confirmation** of the top sources on the holdout.
+Use one selected/frozen model and training configuration for all 15 source combinations (every non-empty subset of S1, S2, AlphaEarth and Tessera). The configuration is the best benchmark trial of the chosen model, so that only the data source changes. There are two steps: a **sweep** over all sources (validation AP only), then a **confirmation** of the top sources on the holdout.
 
 ```bash
-# 1. sweep: 12 source sets x 3 seeds = 36 runs, one per array task, at most 20 at once
+# 1. sweep: 15 source sets x 3 seeds = 45 runs, one per array task, at most 20 at once
 sbatch run_fg_data_sources.sh                                  # tsvit, benchmark trial 28
 sbatch --export=ALL,MODEL=unet_lstm run_fg_data_sources.sh     # unet_lstm, benchmark trial 33
 sbatch --export=ALL,MODEL=sits_scd run_fg_data_sources.sh      # sits_scd, benchmark trial 45
@@ -172,7 +178,16 @@ sbatch --array=0-8 --export=ALL,MODEL=tsvit,CONFIRM_FROM=data-sources_tsvit_<swe
 python confirm_top_k.py aggregate --group data-sources-confirm_tsvit_<confirm job id> --out reports/data_sources_confirm_tsvit
 ```
 
-**Sweep.** `run_fg_data_sources.sh` is an array of 36 tasks (`--array=0-35%20`): one training run per (source set, seed). Task id = source index × number of seeds + seed position, so the first three tasks are source set 0 with seeds 0, 1, 2. Each task passes `--source-index N` to `experiments.py` so that it trains only that combination. The script sets the learning rate, weight decay, `--loss` and `--model-opt` from the model's best benchmark trial (override with `LR`, `WD`, `MODEL_OPT`, `LOSS`, `GROUP`, `MAX_RUNS`, `SEEDS` via `--export=ALL,...`). All tasks share one W&B group (`data-sources_<model>_<array job id>`), and each writes its manifest to its own directory (`experiment_manifests/<group>/seed<S>_src<N>/`). `--time` is per run (8 hours); raise it with `sbatch --time=...` for a slow model. If your limit is on submitted jobs rather than running jobs, submit the array in two halves (`--array=0-17` and `--array=18-35`) with the same `GROUP`. If you change the number of seeds, change `--array` to 12 × seeds.
+**Sweep.** `run_fg_data_sources.sh` is an array of 45 tasks (`--array=0-44%20`): one training run per (source set, seed). Task id = source index × number of seeds + seed position, so the first three tasks are source set 0 with seeds 0, 1, 2. Each task passes `--source-index N` to `experiments.py` so that it trains only that combination. The script sets the learning rate, weight decay, `--loss` and `--model-opt` from the model's best benchmark trial (override with `LR`, `WD`, `MODEL_OPT`, `LOSS`, `GROUP`, `MAX_RUNS`, `SEEDS` via `--export=ALL,...`). All tasks share one W&B group (`data-sources_<model>_<array job id>`), and each writes its manifest to its own directory (`experiment_manifests/<group>/seed<S>_src<N>/`). Each task requests **96 GB RAM and 4 hours** (`#SBATCH --mem=96G --time=04:00:00`): the DataLoader workers were OOM-killed at 32 GB when embedding sources are loaded, and `--time` is per run. Override with `sbatch --mem=... --time=...` for a slower model. If your limit is on submitted jobs rather than running jobs, submit the array in two halves (`--array=0-22` and `--array=23-44`) with the same `GROUP`. If you change the number of seeds, change `--array` to 15 × seeds, and `N_SETS` in the script if the number of source sets changes.
+
+**Resubmitting cancelled or failed tasks.** Pin `GROUP` to the original sweep's group, otherwise a new array job id creates a new W&B group and splits the sweep, and give only the missing task ids:
+
+```bash
+grep -h "group:" logs/fg-data-sources-<job id>_<task>.out        # the group the original tasks used
+sbatch --export=ALL,GROUP=<that group> --array=12-14,24-35%20 run_fg_data_sources.sh
+```
+
+Only resubmit tasks that have no finished run in W&B: the confirmation ranking averages every finished run of a source set in the group, so a duplicate (source set, seed) would be counted twice. Crashed and cancelled runs are ignored by the ranking (it only reads runs in state `finished` with a validation AP). The manifest folders under `experiment_manifests/<group>/` are written before training starts, so their existence does not mean a run completed; W&B is the source of truth. The task for a given source set and seed is `source index × 3 + seed position`.
 
 **Confirmation.** With `CONFIRM_FROM=<sweep group>`, each task reads the finished sweep from W&B, ranks the source combinations by mean validation AP over the sweep's seeds, takes the top `TOP_K` (default 3), and trains its own (source set, seed) with holdout evaluation switched on (`--top-sources-from` in `experiments.py` implies it). The ranking is deterministic, so all tasks agree, and each task prints the full ranking at the top of its log. The sweep must have **finished** first, otherwise the ranking uses partial results. Runs use the group `data-sources-confirm_<model>_<job id>` and variant `confirm-<model>-<sources>`. `confirm_top_k.py aggregate` then gives validation AP and every `test_*` metric as mean ± std per source set, ranked by validation AP. As in section 1, choose by validation AP and report the holdout numbers next to it without using them to choose. The seeds are retrained (not reused from the sweep) so the holdout is scored on a fresh run of each.
 
@@ -187,7 +202,7 @@ python experiments.py data-sources --model tsvit --seeds 0 1 2 --top-sources-fro
   --group data_sources_confirm_tsvit --learning-rate ... --weight-decay ... --model-opt ... --dry-run
 ```
 
-The combinations are S1, S2, S1+S2, AlphaEarth, Tessera, S1+AlphaEarth, S2+AlphaEarth, S1+S2+AlphaEarth, S1+Tessera, S2+Tessera, S1+S2+Tessera, and S1+S2+AlphaEarth+Tessera. Confirm each product exists in the dataset pipeline. Variants are named `<model>_<sources>_<loss>`.
+The 15 combinations are `SOURCE_SETS` in `experiments.py`, indexed 0-14 in this order: S1, S2, S1+S2, AlphaEarth, Tessera, S1+AlphaEarth, S2+AlphaEarth, S1+S2+AlphaEarth, S1+Tessera, S2+Tessera, S1+S2+Tessera, S1+S2+AlphaEarth+Tessera, AlphaEarth+Tessera, S1+AlphaEarth+Tessera, S2+AlphaEarth+Tessera. The last three (indices 12-14, tasks 36-44) complete the full factorial; they were appended so that the indices, W&B groups and results of the first 12 are unchanged. Confirm each product exists in the dataset pipeline. Variants are named `<model>_<sources>_<loss>`. Tessera-containing sets rely on the embedding handling described above.
 
 **Source bias.** The benchmark was run on S1 + S2, so the configuration is tuned for that input and may under-serve the others (especially the embedding sources, which have different channel statistics). To limit this:
 
@@ -284,7 +299,7 @@ All non-benchmark suites accept:
 - `--match-steps` / `--no-match-steps`: augmentation suite only, see section 6.
 - `--model-opt KEY=VAL ...`: architecture options passed to every run of the data-sources, losses, hardness and augmentation suites (use the best benchmark configuration).
 - `--loss NAME`: loss for the data-sources and temporal suites (default `bce_focal_tversky`, the benchmark loss).
-- `--source-index N`: data-sources suite, run only the N-th source combination (for parallel SLURM tasks).
+- `--source-index N`: data-sources suite, run only the N-th source combination, 0-14 (for parallel SLURM tasks).
 - `--top-sources-from GROUP` and `--top-k K`: data-sources suite, confirmation of the K best combinations of a finished sweep, with holdout evaluation (section 2).
 - `--epochs`, `--patience`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--data-dir`, `--holdout-dir`, `--split-seed`.
 
