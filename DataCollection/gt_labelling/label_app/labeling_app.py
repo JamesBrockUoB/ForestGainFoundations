@@ -151,7 +151,6 @@ S2_A, S2_B = f"S2 {YEAR_A} RGB", f"S2 {YEAR_B} RGB"
 DW_A, DW_B = f"DW trees {YEAR_A} (prob)", f"DW trees {YEAR_B} (prob)"
 GAIN_RECORDS = "Gain records"
 NDVI = f"NDVI Delta ({YEAR_B} - {YEAR_A})"
-SLOPE = "Slope"
 LAYERS = {  # Earth Engine layers: name -> cache file stem
     S2_B: f"s2_{S2_COMPOSITE}_2024",
     S2_A: f"s2_{S2_COMPOSITE}_2017",
@@ -160,7 +159,6 @@ LAYERS = {  # Earth Engine layers: name -> cache file stem
     NDVI: "ndvi_delta",
     # Bump the cache stem so existing HRL-only rasters are regenerated with woodland.
     GAIN_RECORDS: "gain_conf_hrl_woodland",
-    SLOPE: "slope",
 }
 START = "Starting mask"
 DW_NT_A = (
@@ -413,10 +411,7 @@ def _layer_image(layer, geom):
         )
         combined = hrl_gain.multiply(hrl_conf).max(woodland)
         return combined.rename("gain_conf"), ["gain_conf"]
-    if layer == SLOPE:
-        dem = ee.ImageCollection("COPERNICUS/DEM/GLO30").select("DEM")
-        mosaic = dem.mosaic().setDefaultProjection(dem.first().select(0).projection())
-        return ee.Terrain.slope(mosaic).resample("bilinear").rename("slope"), ["slope"]
+
     raise KeyError(layer)
 
 
@@ -1134,12 +1129,6 @@ def build_composite_layer(enabled, op):
             canvas, colour, op[GAIN_RECORDS] * (g > 0)
         )  # only where there is gain
 
-    if enabled.get(SLOPE) and arrays.get(SLOPE) is not None:
-        s = np.nan_to_num(arrays[SLOPE][0])
-        canvas = _blend(
-            canvas, plt.get_cmap("terrain")(np.clip(s / 45.0, 0, 1))[..., :3], op[SLOPE]
-        )
-
     s_gain, s_ign = starting_masks(arrays)
     if enabled.get(START):
         for m, c in ((s_gain, (255, 220, 0)), (s_ign, (0, 120, 255))):
@@ -1504,7 +1493,7 @@ def canvas_panel():
     # Always display the complete tile; canvas scaling changes only its display resolution.
     canvas_bg_img = bg_img
 
-    canvas_state = json.dumps([tile_id, CANVAS], sort_keys=True)
+    canvas_state = json.dumps([tile_id, CANVAS])
     canvas_key = "canvas_" + hashlib.md5(canvas_state.encode()).hexdigest()[:12]
 
     stroke_store = st.session_state.setdefault(
@@ -1514,23 +1503,18 @@ def canvas_panel():
     previous_size = int(size_store.get(tile_id, 512))
     resize_scale = CANVAS / previous_size
 
-    if (
-        "_last_canvas_key" not in st.session_state
-        or st.session_state["_last_canvas_key"] != canvas_key
-    ):
-        st.session_state["_last_canvas_key"] = canvas_key
+    if st.session_state.get("_init_key") != canvas_key:
         stored = stroke_store.get(tile_id)
         if stored:
-            resized_stored = (
+            st.session_state["_init_payload"] = (
                 _remap_drawing(stored, resize_scale, 0, 0, to_view=True)
                 if resize_scale != 1
-                else stored
+                else copy.deepcopy(stored)
             )
-            initial_draw_payload = resized_stored
         else:
-            initial_draw_payload = None
-    else:
-        initial_draw_payload = None
+            st.session_state["_init_payload"] = None
+        st.session_state["_init_key"] = canvas_key
+    initial_draw_payload = st.session_state["_init_payload"]
 
     canvas_result = st_canvas(
         initial_drawing=initial_draw_payload,
@@ -1546,6 +1530,15 @@ def canvas_panel():
         return_image_data=True,
         key=canvas_key,
     )
+
+    if "_canvas_payloads" not in st.session_state:
+        st.session_state["_canvas_payloads"] = {}
+
+    if canvas_result.image_data is not None:
+        st.session_state["_canvas_payloads"][tile_id] = {
+            "image_data": canvas_result.image_data,
+            "json_data": canvas_result.json_data,
+        }
 
     if drawing_mode == "point (fill)" and canvas_result.image_data is not None:
         pv_add, pv_erase, pv_ign, pv_warn = canvas_masks(
@@ -1574,11 +1567,36 @@ def canvas_panel():
         stroke_store[tile_id] = copy.deepcopy(drawn)
         size_store[tile_id] = CANVAS
         st.session_state["_strokes_seen"] = canvas_key
+    elif (
+        drawn is not None
+        and st.session_state.get("_strokes_seen") == canvas_key
+        and not drawn.get("objects")
+    ):
+        # strokes were on this canvas and are now gone (undo / reset): forget them so a remount does not bring them
+        # back. (An empty report from a canvas that has not restored its strokes yet is ignored.)
+        stroke_store.pop(tile_id, None)
 
     if st.button("💾 Save forest gain mask", type="primary"):
-        if canvas_result.image_data is None:
-            st.warning("Canvas not ready yet.")
+        from types import SimpleNamespace
+
+        payload = st.session_state["_canvas_payloads"].get(tile_id)
+
+        if canvas_result.image_data is not None:
+            payload = {
+                "image_data": canvas_result.image_data,
+                "json_data": canvas_result.json_data,
+            }
+            st.session_state["_canvas_payloads"][tile_id] = payload
+
+        if payload is None:
+            st.warning(
+                "Canvas has not returned image data yet. Please wait for it to load."
+            )
         else:
+            canvas_for_save = SimpleNamespace(
+                image_data=payload["image_data"],
+                json_data=payload["json_data"],
+            )
 
             def to_tile(m):
                 # Area-average to the underlying mask grid. BOX resampling supports
@@ -1590,7 +1608,7 @@ def canvas_panel():
                 return np.asarray(reduced, dtype=np.uint8) >= 64
 
             add_canvas, erase_canvas, ign_canvas, fill_warnings = canvas_masks(
-                canvas_result, canvas_bg_img, fill_tolerance, paint_class, CANVAS
+                canvas_for_save, canvas_bg_img, fill_tolerance, paint_class, CANVAS
             )
             for wmsg in fill_warnings:
                 st.warning(wmsg)

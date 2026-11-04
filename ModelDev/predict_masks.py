@@ -213,7 +213,6 @@ def main(
 
             fig.suptitle(f"{tid}\n{metric_text}")
 
-            fig.suptitle(tid)
             plt.tight_layout()
             plt.savefig(out / "plots" / f"{tid}.png", dpi=100)
             plt.close(fig)
