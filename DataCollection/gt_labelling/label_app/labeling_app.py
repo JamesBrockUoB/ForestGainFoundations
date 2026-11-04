@@ -1342,9 +1342,19 @@ with tool_cols[3]:
 CANVAS = int(CANVAS)
 rgb_c, hex_c = CLASSES[paint_class]
 canvas_drawing_mode = "point" if drawing_mode == "point (fill)" else drawing_mode
+fill_tolerance = 0
 if drawing_mode == "point (fill)":
     st.caption(
-        "Draw a closed outline, choose Point (fill), then click inside it. The enclosed area is filled on Save."
+        "Fill: draw a closed outline, switch Tool to 'point (fill)', then click inside it. The fill stops at your drawn "
+        "lines (a gap lets it leak, and an over-large fill is refused). Each point uses the class selected when it was "
+        "clicked. A preview below the canvas shows what Save will add."
+    )
+    fill_tolerance = st.slider(
+        "Fill colour tolerance (0 = stop only at drawn lines; higher = also stop at colour edges in the image)",
+        0,
+        120,
+        0,
+        key="fill_tol",
     )
 
 
@@ -1368,6 +1378,93 @@ def _remap_drawing(drawing, scale, ox, oy, to_view):
                 float(obj["strokeWidth"]) * f
             )  # not scaled with the object, so scale it by hand
     return out
+
+
+# --- point (fill) support ----------------------------------------------------------------------------------------
+MAX_FILL_FRAC = 0.6  # a fill larger than this share of the canvas is refused (almost always an outline with a gap)
+
+
+def _class_of_fill(fill, default):
+    """Class whose colour is closest to a fabric 'rgba(r, g, b, a)' fill string."""
+    import re
+
+    nums = re.findall(r"\d+\.?\d*", str(fill))
+    if len(nums) >= 3:
+        rgb = np.array([float(n) for n in nums[:3]])
+        return min(
+            CLASSES, key=lambda c: float(np.sum((np.array(CLASSES[c][0]) - rgb) ** 2))
+        )
+    return default
+
+
+def _fill_seeds(drawn, scale):
+    """Point marks (fabric circles) of the canvas JSON, in click order: [(x, y, radius, class or None)] in image pixels."""
+    seeds = []
+    for o in (drawn or {}).get("objects", []):
+        if o.get("type") != "circle":
+            continue
+        r = float(o.get("radius", 0))
+        sx, sy = float(o.get("scaleX", 1)), float(o.get("scaleY", 1))
+        cx = float(o["left"]) + (0.0 if o.get("originX") == "center" else r * sx)
+        cy = float(o["top"]) + (0.0 if o.get("originY") == "center" else r * sy)
+        rad = r * max(sx, sy) + float(o.get("strokeWidth", 0) or 0) / 2 + 1.5
+        seeds.append(
+            (cx * scale, cy * scale, rad * scale, _class_of_fill(o.get("fill"), None))
+        )
+    return seeds
+
+
+def canvas_masks(canvas_result, bg_img, tolerance, default_class, canvas_px):
+    """(add, erase, ignore, warnings): bool masks in canvas-image pixels.
+    Coloured strokes are classified by colour; every point mark is a flood fill that stops at the drawn strokes (and, if
+    tolerance > 0, at colour edges of the background composite)."""
+    rgba = canvas_result.image_data
+    h, w = rgba.shape[:2]
+    r, g, b, a = (rgba[..., i].astype(np.int32) for i in range(4))
+    painted = a > 0
+    seeds = _fill_seeds(canvas_result.json_data, w / float(canvas_px))
+    yy, xx = np.ogrid[:h, :w]
+    discs = np.zeros((h, w), bool)
+    for cx, cy, rad, _ in seeds:
+        discs |= (xx - cx) ** 2 + (yy - cy) ** 2 <= rad**2
+    strokes = painted & ~discs  # the point marks themselves are not strokes
+    masks = {
+        "gain (add)": strokes & (g > r) & (g > b),
+        "not gain (erase)": strokes & (r > g) & (r > b),
+        "ignore": strokes & (b > r) & (b > g),
+    }
+    warnings = []
+    if seeds:
+        bg = np.asarray(
+            bg_img.convert("RGB").resize((w, h), Image.NEAREST), dtype=np.int16
+        )
+        for cx, cy, rad, cls in seeds:
+            px = int(np.clip(round(cx), 0, w - 1))
+            py = int(np.clip(round(cy), 0, h - 1))
+            allowed = ~strokes
+            if tolerance > 0:
+                dist = np.sqrt(((bg - bg[py, px]) ** 2).sum(axis=2))
+                allowed = allowed & (dist <= tolerance * np.sqrt(3.0))
+            labels, _ = ndimage.label(
+                allowed
+            )  # 4-connected, so thin drawn lines block it
+            lab = labels[py, px]
+            if lab == 0:
+                warnings.append(
+                    "A fill point landed on a drawn line (or outside the colour tolerance) and was ignored."
+                )
+                continue
+            region = labels == lab
+            if region.mean() > MAX_FILL_FRAC:
+                warnings.append(
+                    f"A fill covering {100 * region.mean():.0f}% of the tile was ignored: the outline probably has a gap."
+                )
+                continue
+            cls = cls or default_class
+            for name in masks:
+                masks[name] = masks[name] & ~region
+            masks[cls] = masks[cls] | region
+    return masks["gain (add)"], masks["not gain (erase)"], masks["ignore"], warnings
 
 
 # --- CANVAS DISPLAY ---
@@ -1450,6 +1547,28 @@ def canvas_panel():
         key=canvas_key,
     )
 
+    if drawing_mode == "point (fill)" and canvas_result.image_data is not None:
+        pv_add, pv_erase, pv_ign, pv_warn = canvas_masks(
+            canvas_result, canvas_bg_img, fill_tolerance, paint_class, CANVAS
+        )
+        for wmsg in pv_warn:
+            st.warning(wmsg)
+        if pv_add.any() or pv_erase.any() or pv_ign.any():
+            ph, pw = pv_add.shape
+            pv = np.asarray(
+                canvas_bg_img.convert("RGB").resize((pw, ph)), dtype=np.float32
+            )
+            for m, name in (
+                (pv_add, "gain (add)"),
+                (pv_erase, "not gain (erase)"),
+                (pv_ign, "ignore"),
+            ):
+                pv[m] = 0.5 * pv[m] + 0.5 * np.array(CLASSES[name][0], dtype=np.float32)
+            st.image(
+                pv.astype(np.uint8),
+                caption="Fill preview: what Save will add (green gain, red erase, blue ignore)",
+            )
+
     drawn = canvas_result.json_data
     if drawn is not None and drawn.get("objects"):
         stroke_store[tile_id] = copy.deepcopy(drawn)
@@ -1460,9 +1579,6 @@ def canvas_panel():
         if canvas_result.image_data is None:
             st.warning("Canvas not ready yet.")
         else:
-            rgba = canvas_result.image_data
-            r, g, b, a = (rgba[..., i].astype(np.int32) for i in range(4))
-            painted = a > 0
 
             def to_tile(m):
                 # Area-average to the underlying mask grid. BOX resampling supports
@@ -1473,42 +1589,11 @@ def canvas_panel():
                 reduced = mask_image.resize((side, side), Image.Resampling.BOX)
                 return np.asarray(reduced, dtype=np.uint8) >= 64
 
-            add_canvas = painted & (g > r) & (g > b)
-            erase_canvas = painted & (r > g) & (r > b)
-            ign_canvas = painted & (b > r) & (b > g)
-            if drawing_mode == "point (fill)" and painted.any():
-                # Use the centre of the first point mark as the seed; flood-fill the connected
-                # region of the displayed composite with a configurable RGB tolerance.
-                ys, xs = np.where(painted)
-                seed_y, seed_x = int(np.median(ys)), int(np.median(xs))
-                background = np.asarray(
-                    canvas_bg_img.convert("RGB").resize(
-                        (CANVAS, CANVAS), Image.NEAREST
-                    ),
-                    dtype=np.int16,
-                )
-                seed_colour = background[seed_y, seed_x]
-                distance = np.sqrt(np.sum((background - seed_colour) ** 2, axis=2))
-                candidate = distance <= float(fill_tolerance) * np.sqrt(3.0)
-                labels, _ = ndimage.label(candidate)
-                seed_label = labels[seed_y, seed_x]
-                fill_region = (
-                    (labels == seed_label)
-                    if seed_label
-                    else np.zeros((CANVAS, CANVAS), bool)
-                )
-                if paint_class == "gain (add)":
-                    add_canvas = fill_region
-                    erase_canvas = np.zeros_like(fill_region)
-                    ign_canvas = np.zeros_like(fill_region)
-                elif paint_class == "not gain (erase)":
-                    erase_canvas = fill_region
-                    add_canvas = np.zeros_like(fill_region)
-                    ign_canvas = np.zeros_like(fill_region)
-                else:
-                    ign_canvas = fill_region
-                    add_canvas = np.zeros_like(fill_region)
-                    erase_canvas = np.zeros_like(fill_region)
+            add_canvas, erase_canvas, ign_canvas, fill_warnings = canvas_masks(
+                canvas_result, canvas_bg_img, fill_tolerance, paint_class, CANVAS
+            )
+            for wmsg in fill_warnings:
+                st.warning(wmsg)
             add_local = to_tile(add_canvas)
             erase_local = to_tile(erase_canvas)
             ign_local = to_tile(ign_canvas)

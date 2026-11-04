@@ -9,6 +9,8 @@ import torch
 from config import EMBEDDING_SOURCES, SOURCES
 from datasets import MultiTemporalGainDataset
 from eval import evaluate_checkpoint, generate_gain_map
+from losses import pixel_weights
+from metrics import summarise
 
 
 def checkpoint_sources(ckpt) -> tuple[str, ...]:
@@ -92,6 +94,9 @@ def main(
     (out / "plots").mkdir(parents=True, exist_ok=True)
 
     sources = checkpoint_sources(ckpt)
+    checkpoint = torch.load(ckpt, map_location="cpu", weights_only=False)
+    soft = checkpoint.get("hyper_parameters", {}).get("loss_type") == "soft"
+
     show = list(show) if show else ["s2" if "s2" in sources else sources[0]]
     bad = [s for s in show if s not in sources]
     if bad:
@@ -142,6 +147,20 @@ def main(
         gt = s["gain_mask"].numpy() > 0.5
         valid = s["gain_valid"].numpy() > 0.5
 
+        p = torch.from_numpy(probs[valid].astype(np.float32))
+        t = torch.from_numpy(gt[valid].astype(np.float32))
+
+        if soft:
+            w = pixel_weights(
+                s["gain_mask"][valid],
+                s["gain_weight"][valid],
+                "soft",
+            )
+        else:
+            w = torch.ones_like(p)
+
+        tile_metrics = summarise([(p, t, w)], threshold, weighted=soft)
+
         # 3. Save binary mask TIF matching spatial profile
         ref_tif = tile_dir / "composites" / f"s1s2_{ds.years[0]}.tif"
         with rasterio.open(ref_tif) as src:
@@ -183,6 +202,16 @@ def main(
 
             for a in ax:
                 a.axis("off")
+
+            metric_text = (
+                f"AP: {tile_metrics['ap']:.3f} | "
+                f"IoU: {tile_metrics['iou']:.3f} | "
+                f"F1: {tile_metrics['f1']:.3f}\n"
+                f"Recall: {tile_metrics['recall']:.3f} | "
+                f"Precision: {tile_metrics['precision']:.3f}"
+            )
+
+            fig.suptitle(f"{tid}\n{metric_text}")
 
             fig.suptitle(tid)
             plt.tight_layout()
