@@ -45,6 +45,7 @@ import json
 import statistics
 import subprocess
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -227,6 +228,62 @@ def write_plan(args, top, rows) -> Path:
     return path
 
 
+def write_confirmed_configs(
+    best_per_model,
+    by_variant,
+    runs,
+    group,
+    output_path="experiment_manifests/confirmed_configs.json",
+):
+    """Save the best confirmed configuration per architecture.
+
+    Selection is based exclusively on mean validation AP across seeds.
+    """
+
+    models = {}
+
+    for model, variant in best_per_model.items():
+        records = by_variant[variant]
+
+        # Select the highest-ranked configuration using validation AP.
+        val_values = [r["val_ap"] for r in records if "val_ap" in r]
+
+        if not val_values:
+            continue
+
+        # Find the corresponding W&B run configuration.
+        run = next(r for r in runs if (r.config.get("variant") or r.name) == variant)
+
+        cfg = dict(run.config)
+
+        models[model] = {
+            "variant": variant,
+            "mean_val_ap": statistics.fmean(val_values),
+            "learning_rate": cfg.get("learning_rate"),
+            "weight_decay": cfg.get("weight_decay"),
+            "loss_name": cfg.get("loss_name"),
+            "model_opt": cfg.get("model_opt", []),
+            "seeds": sorted(r["seed"] for r in records if r.get("seed") is not None),
+        }
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(
+        json.dumps(
+            {
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "wandb_group": group,
+                "selection_metric": "mean_val_ap",
+                "models": models,
+            },
+            indent=2,
+        )
+    )
+
+    print(f"Updated confirmed configurations: {output}")
+
+
 def cmd_select(args) -> None:
     top, rows = build_plan(args)
     if not top:
@@ -349,6 +406,13 @@ def cmd_aggregate(args) -> None:
     best_per_model: dict[str, str] = {}
     for v in ranked:
         best_per_model.setdefault(by_variant[v][0].get("model") or "", v)
+
+    write_confirmed_configs(
+        best_per_model,
+        by_variant,
+        runs,
+        group,
+    )
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

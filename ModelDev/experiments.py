@@ -192,6 +192,22 @@ def _make_storage(path: str):
     return optuna.storages.JournalStorage(backend)
 
 
+def load_confirmed_configs(
+    path="experiment_manifests/confirmed_configs.json",
+):
+    path = Path(path)
+
+    if not path.exists():
+        raise SystemExit(
+            f"Confirmed configurations not found: {path}. "
+            "Run confirm_top_k.py aggregate first."
+        )
+
+    data = json.loads(path.read_text())
+
+    return data["models"]
+
+
 def run_bayesian_benchmark(args: argparse.Namespace) -> None:
     """Parallel-safe TPE: many workers share one study; each asks for trials until the total budget is claimed.
 
@@ -559,24 +575,34 @@ def hardness(args: argparse.Namespace) -> list[dict]:
 
 
 def temporal(args: argparse.Namespace) -> list[dict]:
-    """Same model, sources and loss; only the frames the model sees change.
-    Scored pixels are identical for every subset (valid mask is taken over all years).
-    """
+    """Compare temporal frame subsets using confirmed model configurations."""
+
+    configs = load_confirmed_configs()
+
     year_sets = (
         [tuple(sorted(y)) for y in args.year_sets] if args.year_sets else YEAR_SETS
     )
+
     rows = []
+
     for model in args.models or [args.model]:
+
+        if model not in configs:
+            raise SystemExit(f"No confirmed configuration found for {model}.")
+
+        cfg = configs[model]
+
         for years in year_sets:
-            rows.append(
-                _base(args, model, tuple(args.sources))
-                | {
-                    "learning_rate": args.learning_rate,
-                    "weight_decay": args.weight_decay,
-                    "loss_name": args.loss,
-                    **({"years": list(years)} if years else {}),
-                }
-            )
+            row = _base(args, model, tuple(args.sources)) | {
+                "learning_rate": cfg["learning_rate"],
+                "weight_decay": cfg["weight_decay"],
+                "loss_name": cfg["loss_name"],
+                "model_opt": cfg["model_opt"],
+                **({"years": list(years)} if years else {}),
+            }
+
+            rows.append(row)
+
     return rows
 
 
