@@ -1,0 +1,433 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <style>
+        html,
+        body {
+            margin: 0;
+            background: transparent;
+            font: 13px sans-serif;
+            color: #ddd;
+            outline: none;
+        }
+
+        #bar {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            justify-content: center;
+            padding: 4px 0 6px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            cursor: pointer;
+            border: 1px solid #888;
+            background: transparent;
+            color: inherit;
+            border-radius: 6px;
+            padding: 3px 10px;
+        }
+
+        button:hover {
+            background: rgba(128, 128, 128, .25);
+        }
+
+        #msg {
+            color: #ff9f43;
+            min-height: 1em;
+        }
+
+        #wrap {
+            position: relative;
+            margin: 0 auto;
+            aspect-ratio: 1 / 1;
+            touch-action: none;
+            user-select: none;
+        }
+
+        #wrap canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #bg {
+            image-rendering: pixelated;
+        }
+
+        #paint {
+            opacity: .9;
+        }
+
+        #ov {
+            cursor: crosshair;
+        }
+    </style>
+</head>
+
+<body tabindex="0">
+    <div id="bar">
+        <button id="undo" title="Ctrl+Z">↶ Undo</button>
+        <button id="clear">Clear paint</button>
+        <label><input type="checkbox" id="fillshapes" checked> fill polygons / rectangles</label>
+        <span id="msg"></span>
+    </div>
+
+    <div id="wrap">
+        <canvas id="bg"></canvas>
+        <canvas id="paint"></canvas>
+        <canvas id="ov"></canvas>
+    </div>
+
+    <script>
+        const RES = 768;
+        const EDGE = 128;
+        const MAX_FILL = 0.6;
+        const UNDO_MAX = 20;
+
+        const $ = id => document.getElementById(id);
+        const bg = $('bg'), paint = $('paint'), ov = $('ov'), wrap = $('wrap');
+        [bg, paint, ov].forEach(c => { c.width = RES; c.height = RES; });
+        const bctx = bg.getContext('2d');
+        const pctx = paint.getContext('2d', { willReadFrequently: true });
+        const octx = ov.getContext('2d');
+        bctx.imageSmoothingEnabled = false;
+
+        let args = {}, token = null, bgSrc = null;
+        let undoStack = [], poly = [], drag = null, drawing = false, last = null, cursor = null, nChange = 0;
+        let lastTool = null, lastLayer = null;
+
+        function currentColor() {
+            return (args.layer === 'dw') ? '#FFD000' : '#00C800';
+        }
+
+        function send(type, extra) {
+            window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, extra || {}), "*");
+        }
+
+        function setHeight() {
+            send("streamlit:setFrameHeight", { height: Math.ceil($('bar').offsetHeight + wrap.offsetHeight + 12) });
+        }
+
+        function publish(token = args.token) {
+            nChange++;
+            send("streamlit:setComponentValue", {
+                value: {
+                    paint: paint.toDataURL("image/png"),
+                    n: nChange,
+                    token
+                },
+                dataType: "json"
+            });
+        }
+
+        function updateToolState() {
+            const t = args.tool || 'brush';
+            const l = args.layer || 'paint';
+            if (t !== lastTool || l !== lastLayer) {
+                lastTool = t;
+                lastLayer = l;
+                redrawOverlay();
+            }
+        }
+
+        window.addEventListener("message", ev => {
+            if (!ev.data || ev.data.type !== "streamlit:render") return;
+            args = ev.data.args || {};
+            if (ev.data.theme) document.body.style.color = ev.data.theme.textColor;
+            wrap.style.width = "min(" + (args.display_px || 512) + "px, 100%)";
+
+            if (args.token !== token) {
+                token = args.token;
+                undoStack = [];
+                poly = [];
+                drag = null;
+                pctx.clearRect(0, 0, RES, RES);
+                octx.clearRect(0, 0, RES, RES);
+                if (args.initial_paint) loadPaint(args.initial_paint);
+            }
+
+            if (args.background !== bgSrc) {
+                bgSrc = args.background;
+                const im = new Image();
+                im.onload = () => {
+                    bctx.clearRect(0, 0, RES, RES);
+                    bctx.drawImage(im, 0, 0, RES, RES);
+                };
+                im.src = bgSrc;
+            }
+
+            if ((args.tool || 'brush') !== 'polygon' && poly.length) {
+                poly = [];
+            }
+
+            updateToolState();
+            setHeight();
+        });
+
+        window.addEventListener("resize", setHeight);
+        send("streamlit:componentReady", { apiVersion: 1 });
+        setHeight();
+
+        function loadPaint(src) {
+            const im = new Image();
+            im.onload = () => {
+                pctx.clearRect(0, 0, RES, RES);
+                pctx.drawImage(im, 0, 0, RES, RES);
+            };
+            im.src = src;
+        }
+
+        function flash(t) {
+            $('msg').textContent = t;
+            clearTimeout(flash.t);
+            flash.t = setTimeout(() => $('msg').textContent = '', 5000);
+        }
+
+        function hexToRgb(h) {
+            const n = parseInt(h.slice(1), 16);
+            return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+        }
+
+        function scale() { return RES / wrap.clientWidth; }
+        function lineW() { return Math.max(1, (args.brush || 6) * scale()); }
+        function pos(e) {
+            const r = ov.getBoundingClientRect();
+            return [(e.clientX - r.left) * RES / r.width, (e.clientY - r.top) * RES / r.height];
+        }
+        function pushUndo() {
+            undoStack.push(pctx.getImageData(0, 0, RES, RES));
+            if (undoStack.length > UNDO_MAX) undoStack.shift();
+        }
+
+        function doUndo() {
+            if (!undoStack.length) return;
+            pctx.putImageData(undoStack.pop(), 0, 0);
+            publish();
+        }
+
+        function setBrush(erase) {
+            pctx.save();
+            pctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
+            pctx.strokeStyle = pctx.fillStyle = erase ? 'rgba(0,0,0,1)' : currentColor();
+            pctx.lineWidth = lineW();
+            pctx.lineCap = 'round';
+            pctx.lineJoin = 'round';
+        }
+
+        function dot(p, erase) {
+            setBrush(erase);
+            pctx.beginPath();
+            pctx.arc(p[0], p[1], pctx.lineWidth / 2, 0, 2 * Math.PI);
+            pctx.fill();
+            pctx.restore();
+        }
+
+        function seg(a, b, erase) {
+            setBrush(erase);
+            pctx.beginPath();
+            pctx.moveTo(a[0], a[1]);
+            pctx.lineTo(b[0], b[1]);
+            pctx.stroke();
+            pctx.restore();
+        }
+
+        function floodFill(x, y, rgb) {
+            x = Math.max(0, Math.min(RES - 1, Math.floor(x)));
+            y = Math.max(0, Math.min(RES - 1, Math.floor(y)));
+
+            const img = pctx.getImageData(0, 0, RES, RES);
+            const d = img.data;
+            const w = RES;
+            const s = (y * w + x) * 4;
+
+            const empty = d[s + 3] < EDGE;
+            const tr = d[s];
+            const tg = d[s + 1];
+            const tb = d[s + 2];
+
+            if (!empty && Math.abs(tr - rgb[0]) + Math.abs(tg - rgb[1]) + Math.abs(tb - rgb[2]) < 30) return false;
+
+            const match = i => empty ? d[i + 3] < EDGE
+                : (d[i + 3] >= EDGE && Math.abs(d[i] - tr) + Math.abs(d[i + 1] - tg) + Math.abs(d[i + 2] - tb) < 60);
+
+            const seen = new Uint8Array(w * w);
+            const q = new Int32Array(w * w);
+            let head = 0, tail = 0;
+            q[tail++] = y * w + x;
+            seen[y * w + x] = 1;
+
+            while (head < tail) {
+                const p = q[head++];
+                const px = p % w;
+
+                if (px > 0 && !seen[p - 1] && match((p - 1) * 4)) { seen[p - 1] = 1; q[tail++] = p - 1; }
+                if (px < w - 1 && !seen[p + 1] && match((p + 1) * 4)) { seen[p + 1] = 1; q[tail++] = p + 1; }
+                if (p >= w && !seen[p - w] && match((p - w) * 4)) { seen[p - w] = 1; q[tail++] = p - w; }
+                if (p < w * w - w && !seen[p + w] && match((p + w) * 4)) { seen[p + w] = 1; q[tail++] = p + w; }
+            }
+
+            if (empty && tail > MAX_FILL * w * w) {
+                flash('Fill ignored: it would cover ' + Math.round(100 * tail / (w * w)) + '% of the tile - the outline probably has a gap.');
+                return false;
+            }
+
+            for (let k = 0; k < tail; k++) {
+                const i = q[k] * 4;
+                d[i] = rgb[0];
+                d[i + 1] = rgb[1];
+                d[i + 2] = rgb[2];
+                d[i + 3] = 255;
+            }
+
+            pctx.putImageData(img, 0, 0);
+            return true;
+        }
+
+        function closePoly() {
+            if (poly.length < 3) {
+                poly = [];
+                redrawOverlay();
+                return;
+            }
+
+            pushUndo();
+            setBrush(false);
+            pctx.beginPath();
+            poly.forEach((p, i) => i ? pctx.lineTo(p[0], p[1]) : pctx.moveTo(p[0], p[1]));
+            pctx.closePath();
+            if ($('fillshapes').checked) pctx.fill();
+            pctx.stroke();
+            pctx.restore();
+            poly = [];
+            redrawOverlay();
+            publish();
+        }
+
+        function commitRect(a, b) {
+            if (Math.abs(a[0] - b[0]) < 2 && Math.abs(a[1] - b[1]) < 2) return;
+
+            pushUndo();
+            setBrush(false);
+            const x = Math.min(a[0], b[0]);
+            const y = Math.min(a[1], b[1]);
+            const w = Math.abs(a[0] - b[0]);
+            const h = Math.abs(a[1] - b[1]);
+
+            if ($('fillshapes').checked) pctx.fillRect(x, y, w, h);
+            pctx.strokeRect(x, y, w, h);
+            pctx.restore();
+            publish();
+        }
+
+        function redrawOverlay() {
+            octx.clearRect(0, 0, RES, RES);
+            const c = currentColor();
+            octx.strokeStyle = octx.fillStyle = c;
+            octx.lineWidth = Math.max(1, 2 * scale());
+
+            if (poly.length) {
+                octx.beginPath();
+                poly.forEach((p, i) => i ? octx.lineTo(p[0], p[1]) : octx.moveTo(p[0], p[1]));
+                if (cursor) octx.lineTo(cursor[0], cursor[1]);
+                octx.stroke();
+                poly.forEach(p => {
+                    octx.beginPath();
+                    octx.arc(p[0], p[1], 4 * scale(), 0, 7);
+                    octx.fill();
+                });
+            }
+
+            if (drag) {
+                octx.strokeRect(
+                    Math.min(drag.a[0], drag.b[0]),
+                    Math.min(drag.a[1], drag.b[1]),
+                    Math.abs(drag.a[0] - drag.b[0]),
+                    Math.abs(drag.a[1] - drag.b[1])
+                );
+            }
+        }
+
+        ov.addEventListener('pointerdown', e => {
+            const p = pos(e);
+            const t = args.tool || 'brush';
+
+            if (t === 'fill') {
+                pushUndo();
+                const rgb = hexToRgb(currentColor());
+                if (floodFill(p[0], p[1], rgb)) publish(); else undoStack.pop();
+                return;
+            }
+
+            if (t === 'polygon') {
+                if (poly.length >= 3 && Math.hypot(p[0] - poly[0][0], p[1] - poly[0][1]) < 12 * scale()) {
+                    closePoly();
+                    return;
+                }
+                const l = poly[poly.length - 1];
+                if (!l || Math.hypot(p[0] - l[0], p[1] - l[1]) > 2 * scale()) poly.push(p);
+                redrawOverlay();
+                return;
+            }
+
+            ov.setPointerCapture(e.pointerId);
+
+            if (t === 'brush' || t === 'eraser') {
+                pushUndo();
+                drawing = true;
+                last = p;
+                dot(p, t === 'eraser');
+            } else if (t === 'rect') {
+                drag = { a: p, b: p };
+            }
+        });
+
+        ov.addEventListener('pointermove', e => {
+            const p = pos(e);
+            const t = args.tool || 'brush';
+
+            if (drawing) {
+                seg(last, p, t === 'eraser');
+                last = p;
+            } else if (drag) {
+                drag.b = p;
+                redrawOverlay();
+            } else if (t === 'polygon' && poly.length) {
+                cursor = p;
+                redrawOverlay();
+            }
+        });
+
+        function endStroke() {
+            if (drawing) {
+                drawing = false;
+                publish();
+            } else if (drag) {
+                const d = drag;
+                drag = null;
+                redrawOverlay();
+                commitRect(d.a, d.b);
+            }
+        }
+
+        ov.addEventListener('pointerup', endStroke);
+        ov.addEventListener('pointercancel', endStroke);
+        ov.addEventListener('dblclick', () => { if ((args.tool || 'brush') === 'polygon') closePoly(); });
+
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && poly.length) closePoly();
+            else if (e.key === 'Escape') { poly = []; drag = null; redrawOverlay(); }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); doUndo(); }
+        });
+
+        $('undo').onclick = doUndo;
+        $('clear').onclick = () => { pushUndo(); pctx.clearRect(0, 0, RES, RES); publish(); };
+    </script>
+</body>
+
+</html>

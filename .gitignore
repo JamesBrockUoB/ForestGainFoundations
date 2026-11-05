@@ -51,3 +51,5 @@ gain_tiles_10m_combined.geojson
 tmp_requirements.txt
 
 ground_truth_masks/
+
+*analysis*

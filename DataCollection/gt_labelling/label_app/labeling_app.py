@@ -1,6 +1,4 @@
 import base64
-import copy
-import hashlib
 import io
 import json
 import os
@@ -17,29 +15,13 @@ import pandas as pd
 import rasterio
 import requests
 import streamlit as st
-import streamlit.elements.image as _st_image
 from folium.plugins import SideBySideLayers
+from paint_canvas import PAINT_RES, decode_paint, paint_canvas, paint_masks
 from PIL import Image
 from pyproj import Transformer
 from rasterio.transform import from_origin
 from scipy import ndimage
 from streamlit_folium import st_folium
-
-
-# --- streamlit-drawable-canvas fix --------------------------------------------------------------
-# The canvas calls streamlit.elements.image.image_to_url(...) to show its background image. Recent Streamlit
-# versions moved/changed that function, so the background (all your layers) silently never appears.
-# Replace it with a data-URL version BEFORE the canvas is imported/used; this works on every version.
-def _image_to_url(image, *args, **kwargs):
-    buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-
-_st_image.image_to_url = _image_to_url
-from streamlit_drawable_canvas import (  # noqa: E402  (must come after the patch)
-    st_canvas,
-)
 
 # Page Setup
 st.set_page_config(
@@ -48,23 +30,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# No vertical gap between widgets (Streamlit's default is 1rem). Raise the 0rem to add some back.
 st.markdown(
     """<style>
     [data-testid="stColumn"] [data-testid="stVerticalBlock"] { gap: 0rem; }
     [data-testid="stColumn"] [data-testid="stSlider"] { padding-bottom: 0; }
-
-    /* Keep the fixed-size drawing canvas centred in the middle column. */
-    div[data-testid="stColumn"]:nth-child(2) [data-testid="stCustomComponentV1"] {
-        display: flex;
-        justify-content: center;
-        width: 100%;
-    }
-    div[data-testid="stColumn"]:nth-child(2) [data-testid="stCustomComponentV1"] iframe {
-        display: block;
-        margin-left: auto;
-        margin-right: auto;
-    }
     </style>""",
     unsafe_allow_html=True,
 )
@@ -73,14 +42,10 @@ st.markdown(
 # CONFIG
 # ==========================================
 GEOJSON_PATH = "gain_tiles_10m_combined.geojson"
-CACHE_DIR = Path(
-    "./tile_cache"
-)  # layers are generated from Earth Engine on demand, then cached here
+CACHE_DIR = Path("./tile_cache")
 LABELS_DIR = Path("./ground_truth_masks")
-QUEUE_PATH = Path(
-    "./annotation_queue.csv"
-)  # the work queue (a stratified sample); survives restarts
-PREFETCH_AHEAD = 2  # how many upcoming queue tiles to fetch in the background
+QUEUE_PATH = Path("./annotation_queue.csv")
+PREFETCH_AHEAD = 2
 LABELS_DIR.mkdir(exist_ok=True, parents=True)
 CACHE_DIR.mkdir(exist_ok=True, parents=True)
 
@@ -98,34 +63,26 @@ CLOUD_SCORE_PLUS_BAND = "cs_cdf"
 CLOUD_SCORE_THRESH = 0.6
 SCENE_CLOUDY_PCT_MAX = 60
 SNOW_NDSI_THRESH, SNOW_NIR_MIN, SNOW_GREEN_MIN = 0.4, 1100, 1000
-LEAF_ON = ("05-01", "09-30")  # northern hemisphere only
+LEAF_ON = ("05-01", "09-30")
 DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
 YEAR_A, YEAR_B = 2017, 2024
 
-# Big map comparison uses Esri World Imagery Wayback releases (not Sentinel-2).
-# Release years are publication vintages; local capture dates can differ by location.
 WAYBACK_CONFIG_URL = (
     "https://s3-us-west-2.amazonaws.com/config.maptiles.arcgis.com/waybackconfig.json"
 )
 
-PX = 10.0  # metres per pixel
-SIZE = 256  # tile raster size in pixels (2560 m at 10 m)
-CANVAS = 512  # canvas size on screen = exactly 2 screen pixels per 10 m pixel
-K = CANVAS // SIZE
+PX = 10.0
+SIZE = 256
+CANVAS = 768
 NODATA = -9999.0
-# "medoid": each pixel takes ALL its bands from the single clear image closest to the per-band median, so colours
-# stay spectrally consistent (per-band medians of a few images mix dates and give coloured speckle).
-# "median": plain per-band median. Changing this uses a new cache file, so tiles are re-fetched once.
 S2_COMPOSITE = "medoid"
-S2_VMIN, S2_VMAX = (
-    0.0,
-    3000.0,
-)  # fixed display range for S2 reflectance; raise S2_VMAX for a flatter look
+S2_VMIN, S2_VMAX = (0.0, 3000.0)
 
-# Painting classes on the canvas: the colour of a stroke is its class
+PAINT_GREEN = "#00C800"
+DW_YELLOW = "#FFD000"
+
 CLASSES = {
-    "gain (add)": ((0, 200, 0), "#00C800"),
-    "not gain (erase)": ((255, 0, 0), "#FF0000"),
+    "gain (add)": ((0, 200, 0), PAINT_GREEN),
     "ignore": ((0, 0, 255), "#0000FF"),
 }
 
@@ -151,34 +108,24 @@ S2_A, S2_B = f"S2 {YEAR_A} RGB", f"S2 {YEAR_B} RGB"
 DW_A, DW_B = f"DW trees {YEAR_A} (prob)", f"DW trees {YEAR_B} (prob)"
 GAIN_RECORDS = "Gain records"
 NDVI = f"NDVI Delta ({YEAR_B} - {YEAR_A})"
-LAYERS = {  # Earth Engine layers: name -> cache file stem
+LAYERS = {
     S2_B: f"s2_{S2_COMPOSITE}_2024",
     S2_A: f"s2_{S2_COMPOSITE}_2017",
     DW_B: "dw_2024",
     DW_A: "dw_2017",
     NDVI: "ndvi_delta",
-    # Bump the cache stem so existing HRL-only rasters are regenerated with woodland.
     GAIN_RECORDS: "gain_conf_hrl_woodland",
 }
 START = "Starting mask"
-DW_NT_A = (
-    f"DW {YEAR_A} non-tree mask"  # derived from the DW layer with the threshold slider
-)
+DW_NT_A = f"DW {YEAR_A} non-tree mask"
 DW_T_B = f"DW {YEAR_B} tree mask"
-DERIVED = [
-    START,
-    DW_NT_A,
-    DW_T_B,
-]  # overlays computed from layers (no Dynamic World gain/loss calculation)
+DERIVED = [START, DW_NT_A, DW_T_B]
 
 
 def dw_name(year):
     return DW_A if year == YEAR_A else DW_B
 
 
-# ==========================================
-# EARTH ENGINE: layer generation (same masking as your composite code, defined inline)
-# ==========================================
 @st.cache_resource
 def init_ee():
     ee.Initialize(project=EE_PROJECT)
@@ -222,16 +169,13 @@ def _masked_s2(geom, start, end, snow=True):
 
 
 def _s2_rgb(geom, year):
-    """Full-year composite (medoid or median, see S2_COMPOSITE), cloud- and snow-masked. Bands B4, B3, B2."""
     bands = ["B4", "B3", "B2"]
     ic = _masked_s2(geom, f"{year}-01-01", f"{year + 1}-01-01", snow=True).select(bands)
     med = ic.median()
     if S2_COMPOSITE == "median":
         return med
 
-    def _with_score(
-        img,
-    ):  # negative squared distance to the median over the three bands
+    def _with_score(img):
         dist = img.subtract(med).pow(2).reduce(ee.Reducer.sum()).multiply(-1)
         return img.addBands(dist.rename("score"))
 
@@ -242,13 +186,6 @@ def _s2_rgb(geom, year):
     ttl=24 * 3600, show_spinner="Loading Esri Wayback imagery releases..."
 )
 def _wayback_releases():
-    """Fetch Esri's Wayback config and tolerate its real nested config schemas.
-
-    Esri's public config is not guaranteed to expose releaseDateLabel/date fields:
-    many entries identify the release via itemTitle (e.g. "World Imagery (Wayback
-    2024-01-25)") and use the numeric release ID as the dictionary key. Parse those
-    documented fields rather than treating a schema variation as no imagery.
-    """
     response = requests.get(WAYBACK_CONFIG_URL, timeout=25)
     response.raise_for_status()
     payload = response.json()
@@ -287,8 +224,6 @@ def _wayback_releases():
         if match:
             release_date = match.group(1)
         elif layer_match:
-            # Some older config entries only expose WB_YYYY_Rnn. The release date
-            # is unknown in that schema; do not fabricate a specific publication date.
             release_date = f"{layer_match.group(1)}-07-01"
         else:
             continue
@@ -302,7 +237,6 @@ def _wayback_releases():
             if url_match:
                 release_num = url_match.group(1)
         if release_num is None:
-            # The config commonly uses the numeric release number as the object key.
             for key, value in item.items():
                 if (
                     isinstance(value, (str, int))
@@ -315,7 +249,6 @@ def _wayback_releases():
             continue
         try:
             release_num = int(release_num)
-            # Validate actual dates; skip placeholder values that aren't valid.
             _date.fromisoformat(release_date)
         except (TypeError, ValueError):
             continue
@@ -323,8 +256,6 @@ def _wayback_releases():
 
     releases = sorted(found.values())
     if not releases:
-        # Keep the real response diagnostic so a network/config failure is not
-        # misreported as proof that the Wayback archive does not exist.
         content_type = response.headers.get("content-type", "unknown")
         preview = response.text[:180].replace("\n", " ")
         raise RuntimeError(
@@ -337,12 +268,10 @@ def _wayback_releases():
 
 @st.cache_resource(ttl=24 * 3600, show_spinner="Preparing Esri historical imagery...")
 def map_imagery_url(year):
-    """XYZ URL for an Esri World Imagery Wayback publication vintage."""
     releases = _wayback_releases()
     year_releases = [r for r in releases if r[0].startswith(f"{int(year)}-")]
     if not year_releases:
         raise RuntimeError(f"No Esri World Imagery Wayback release found for {year}")
-    # Pick the release nearest mid-year, giving a stable representative vintage.
     chosen_date, release_num = min(
         year_releases,
         key=lambda r: abs(int(r[0][5:7]) * 31 + int(r[0][8:10]) - (6 * 31 + 15)),
@@ -352,7 +281,6 @@ def map_imagery_url(year):
 
 
 def _peak_ndvi(geom, year):
-    """Leaf-on NDVI (May-Sep), cloud-masked only - same as your s2_peak_ndvi."""
     return (
         _masked_s2(geom, f"{year}-{LEAF_ON[0]}", f"{year}-{LEAF_ON[1]}", snow=False)
         .map(
@@ -364,7 +292,6 @@ def _peak_ndvi(geom, year):
 
 
 def _dw_trees(geom, year):
-    """Dynamic World 'trees' probability, mean over the leaf-on months (clear observations only)."""
     return (
         ee.ImageCollection(DW_COLLECTION)
         .filterDate(f"{year}-{LEAF_ON[0]}", f"{year}-{LEAF_ON[1]}")
@@ -386,7 +313,6 @@ def _gain_asset():
 
 
 def _layer_image(layer, geom):
-    """(ee.Image, band names) for one layer."""
     if layer == S2_B:
         return _s2_rgb(geom, YEAR_B), ["B4", "B3", "B2"]
     if layer == S2_A:
@@ -400,9 +326,6 @@ def _layer_image(layer, geom):
             "dndvi"
         ), ["dndvi"]
     if layer == GAIN_RECORDS:
-        # Combine the HRL gain records with the supplementary woodland-creation
-        # raster. The HRL confidence is retained; woodland-only pixels receive
-        # a display value of 1 so they are visible in the same overlay.
         hrl = _gain_asset()
         hrl_gain = hrl.select(0).gt(0).unmask(0).toFloat().resample("bilinear").gt(0.5)
         hrl_conf = hrl.select(1).unmask(0).toFloat().max(1)
@@ -411,14 +334,10 @@ def _layer_image(layer, geom):
         )
         combined = hrl_gain.multiply(hrl_conf).max(woodland)
         return combined.rename("gain_conf"), ["gain_conf"]
-
     raise KeyError(layer)
 
 
 def generate_layer(layer, x_min, y_min, x_max, y_max):
-    """Pull one layer for the tile from Earth Engine as a (bands, 256, 256) float32 array, masked pixels = NaN.
-    Needs init_ee() to have run already (it is also called from the prefetch thread, which must not touch st.*).
-    """
     geom = ee.Geometry.Rectangle([x_min, y_min, x_max, y_max], "EPSG:3035", False)
     img, bands = _layer_image(layer, geom)
     req = dict(
@@ -448,18 +367,16 @@ def layer_path(tile_id, layer):
 
 
 def fetch_layer(tile_id, layer, x_min, y_min, x_max, y_max):
-    """Generate one layer and cache it atomically (safe to call from a thread; no st.* calls)."""
     p = layer_path(tile_id, layer)
     arr = generate_layer(layer, x_min, y_min, x_max, y_max)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f".{p.stem}.{os.getpid()}.{threading.get_ident()}.tmp.npy")
     np.save(tmp, arr)
-    os.replace(tmp, p)  # readers never see a half-written file
+    os.replace(tmp, p)
     return arr
 
 
 def get_layer(tile_id, layer, x_min, y_min, x_max, y_max):
-    """Cached layer array, generated on first use. Returns (array or None, error text or None)."""
     p = layer_path(tile_id, layer)
     if p.exists():
         return np.load(p), None
@@ -472,8 +389,6 @@ def get_layer(tile_id, layer, x_min, y_min, x_max, y_max):
 
 
 class _Prefetcher:
-    """Background worker that fetches the layers needed for labelling the next queue tiles."""
-
     LAYERS = (S2_B, S2_A, DW_B, DW_A)
 
     def __init__(self):
@@ -498,7 +413,7 @@ class _Prefetcher:
                 if not layer_path(tile_id, layer).exists():
                     fetch_layer(tile_id, layer, *bounds)
             except Exception:
-                pass  # the foreground get_layer retries and reports errors when the tile is opened
+                pass
             finally:
                 with self.lock:
                     self.pending.discard((tile_id, layer))
@@ -509,9 +424,6 @@ def get_prefetcher():
     return _Prefetcher()
 
 
-# ==========================================
-# CHANGE LOGIC (same as dw_tree_change.py / ls_export_masks.py)
-# ==========================================
 def drop_small(mask, min_px):
     if min_px <= 1 or not mask.any():
         return mask
@@ -525,7 +437,6 @@ def saved_path(tile_id):
 
 
 def write_tile_tif(tile_id, bounds):
-    """ground_truth_masks/<tile>.tif: 2 bands, forest gain 2017->2024 and ignore."""
     z = np.load(saved_path(tile_id))
     bands = [("gain", z["gain"]), ("ignore", z["ignore"])]
     with rasterio.open(
@@ -546,9 +457,6 @@ def write_tile_tif(tile_id, bounds):
     return int(z["gain"].sum())
 
 
-# ==========================================
-# TILE INDEX
-# ==========================================
 @st.cache_data
 def load_tile_index(path):
     if not Path(path).exists():
@@ -556,7 +464,6 @@ def load_tile_index(path):
     gdf = gpd.read_file(path)
     if gdf.crs is None:
         gdf = gdf.set_crs("EPSG:3035")
-    # Woodland-creation polygons count as gain just like HRL gain: the working gain_pct is the larger of the two.
     gdf["hrl_gain_pct"] = gdf["gain_pct"]
     if "woodland_pct" in gdf.columns:
         gdf["gain_pct"] = np.fmax(
@@ -574,7 +481,6 @@ def load_tile_index(path):
 
 @st.cache_data(show_spinner=False)
 def marker_geojson(path):
-    """Point GeoJSON for the map: one feature per tile with a precomputed colour and tooltip."""
     gdf = load_tile_index(path)
     gain = pd.to_numeric(gdf["gain_pct"], errors="coerce").fillna(0).to_numpy(float)
     t = np.clip(gain / 50.0, 0.0, 1.0)
@@ -611,7 +517,6 @@ COUNTRY_CACHE = CACHE_DIR / "tile_countries.json"
 
 @st.cache_data(show_spinner=False)
 def lookup_tile_countries(tile_ids, lon_values, lat_values):
-    """Assign countries in small server-side batches to stay below GEE query limits."""
     init_ee()
     countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
     result = {}
@@ -656,7 +561,6 @@ def lookup_tile_countries(tile_ids, lon_values, lat_values):
             props = row.get("properties", {})
             result[str(props.get("tile_id", ""))] = props.get("country") or "Unknown"
 
-        # If a join omits a point with no matching country, keep it in the output.
         for tid in ids:
             result.setdefault(str(tid), "Unknown")
 
@@ -664,7 +568,6 @@ def lookup_tile_countries(tile_ids, lon_values, lat_values):
 
 
 def ensure_country_column(gdf):
-    """Use a country attribute or locally cached LSIB lookup; defer new lookups until sampling."""
     for col in ("country", "COUNTRY_NA", "country_na", "Country", "COUNTRY"):
         if col in gdf.columns:
             gdf["country"] = gdf[col].fillna("Unknown").astype(str)
@@ -681,7 +584,6 @@ def ensure_country_column(gdf):
 
 
 def lookup_missing_countries(gdf):
-    """Fill uncached tile countries in one GEE LSIB spatial join, then persist the result."""
     if any(
         col in gdf.columns for col in ("COUNTRY_NA", "country_na", "Country", "COUNTRY")
     ):
@@ -718,13 +620,9 @@ gdf_projected = ensure_country_column(gdf_projected)
 if "selected_tile_id" not in st.session_state:
     st.session_state.selected_tile_id = gdf_projected["tile_id"].iloc[0]
 
-# A save (or map click) that moves to another tile is applied here, before any widget exists.
 for _k, _v in st.session_state.pop("_pending", {}).items():
     st.session_state[_k] = _v
 
-# ==========================================
-# WORK QUEUE (the stratified sample; a tile is "done" when its gain mask is saved)
-# ==========================================
 TILE_SET = set(gdf_projected["tile_id"])
 
 
@@ -746,12 +644,10 @@ SAVED = {p.name[: -len("_gain.npz")] for p in LABELS_DIR.glob("*_gain.npz")}
 
 
 def tile_status(t):
-    """1 = labelled (gain mask saved), 0 = to do."""
     return 1 if t in SAVED else 0
 
 
 def next_unlabelled(current, step=1):
-    """Next queue tile (in queue order, wrapping) that is still to do (not labelled)."""
     q = st.session_state["queue_ids"]
     if not q:
         return None
@@ -793,12 +689,9 @@ def on_select():
     go_to(st.session_state.tile_select)
 
 
-# ==========================================
-# SIDEBAR: NAVIGATION & SEARCH
-# ==========================================
+# Sidebar
 st.sidebar.title("🌲 Tile Navigation")
 st.sidebar.markdown(f"**Total Indexed Tiles:** {len(gdf_projected):,}")
-
 st.sidebar.text_input("Search Tile ID", "", key="search_id", on_change=on_search)
 
 queue_ids = st.session_state["queue_ids"]
@@ -822,13 +715,12 @@ if queue_ids:
     )
     tile_options = gdf_projected["tile_id"].tolist() if show_all else list(queue_ids)
     if st.session_state.selected_tile_id not in tile_options:
-        tile_options.insert(
-            0, st.session_state.selected_tile_id
-        )  # opened from the map / search
+        tile_options.insert(0, st.session_state.selected_tile_id)
     icons = {0: "⬜", 1: "✅"}
 else:
     tile_options = gdf_projected["tile_id"].tolist()
     icons = None
+
 st.session_state["tile_select"] = st.session_state.selected_tile_id
 st.sidebar.selectbox(
     ("Select Tile ID" if not queue_ids else "Tile (work queue: ⬜ to do · ✅ done)"),
@@ -839,9 +731,7 @@ st.sidebar.selectbox(
 )
 
 with st.sidebar.expander("🧪 Build a representative annotation sample", expanded=False):
-    st.caption(
-        "Randomly sample tiles within country × gain-percentage strata. Country is taken from an existing country field or looked up from GEE LSIB."
-    )
+    st.caption("Randomly sample tiles within country x gain-percentage strata.")
     sample_n = st.number_input(
         "Number of tiles",
         min_value=1,
@@ -854,19 +744,16 @@ with st.sidebar.expander("🧪 Build a representative annotation sample", expand
         "Random seed", min_value=0, max_value=2_147_483_647, value=42, step=1
     )
     new_queue = False
+
     if st.button("Generate stratified tile list"):
         try:
             gdf_projected = lookup_missing_countries(gdf_projected)
-            tile_row = gdf_projected[
-                gdf_projected["tile_id"] == st.session_state.selected_tile_id
-            ].iloc[0]
             edges = sorted(
                 set(float(x.strip()) for x in gain_bins_text.split(",") if x.strip())
             )
             if len(edges) < 2:
                 raise ValueError("Provide at least two numeric bin edges.")
             gains = pd.to_numeric(gdf_projected["gain_pct"], errors="coerce")
-            # tiles whose country could not be determined (centroid in water / not in LSIB) are not sampled
             known = gdf_projected["country"].notna() & ~gdf_projected["country"].astype(
                 str
             ).str.strip().str.lower().isin(["unknown", "", "nan", "none"])
@@ -890,7 +777,6 @@ with st.sidebar.expander("🧪 Build a representative annotation sample", expand
                 .rename("stratum_population")
             )
             strata = strata.sort_values("_random")
-            # Proportional allocation with at least one tile per stratum where possible.
             counts = populations.to_dict()
             allocation = {s: 0 for s in counts}
             remaining = min(int(sample_n), len(strata))
@@ -948,6 +834,7 @@ with st.sidebar.expander("🧪 Build a representative annotation sample", expand
             new_queue = True
         except Exception as exc:
             st.error(f"Could not generate sample: {exc}")
+
     if "tile_sample_csv" in st.session_state:
         st.download_button(
             "Download sample CSV",
@@ -960,6 +847,7 @@ with st.sidebar.expander("🧪 Build a representative annotation sample", expand
             use_container_width=True,
             hide_index=True,
         )
+
     st.caption(
         "Generating a sample makes it your work queue (saved to `annotation_queue.csv`). Or load an existing list with a `tile_id` column:"
     )
@@ -971,22 +859,21 @@ with st.sidebar.expander("🧪 Build a representative annotation sample", expand
         st.session_state["_queue_sig"] = (uploaded.name, uploaded.size)
         set_queue(pd.read_csv(uploaded)["tile_id"].astype(str))
         new_queue = True
+
     if st.session_state["queue_ids"] and st.button("Clear work queue"):
         st.session_state["queue_ids"] = []
         QUEUE_PATH.unlink(missing_ok=True)
         new_queue = True
+
 if new_queue:
-    st.rerun()  # so the tile selector / progress above pick up the new queue
+    st.rerun()
 
 basemap_name = st.sidebar.selectbox("Map background", list(BASEMAPS), index=0)
-recentre = st.sidebar.checkbox("Re-centre map when the tile changes", value=False)
 
 tile_id = st.session_state.selected_tile_id
 tile_row = gdf_projected[gdf_projected["tile_id"] == tile_id].iloc[0]
 BOUNDS = tuple(float(tile_row[k]) for k in ("x_min_m", "y_min_m", "x_max_m", "y_max_m"))
 
-# Link the selected tile to the ArcGIS Living Atlas Wayback viewer (a plain link; the app makes no Esri calls for it),
-# centered on the tile centroid (longitude, latitude) at a useful local zoom.
 tile_lon = float(tile_row["lon"])
 tile_lat = float(tile_row["lat"])
 esri_wayback_url = (
@@ -1014,9 +901,6 @@ with st.sidebar.expander("Dynamic World thresholds"):
     MIN_PX = st.slider("Smallest Dynamic World gain patch to propose (px)", 1, 50, 8)
 
 
-# ==========================================
-# COMPOSITING
-# ==========================================
 def _blend(base, rgb, alpha):
     a = np.asarray(alpha, dtype=np.float32)
     if a.ndim == 2:
@@ -1031,7 +915,6 @@ def _tint(mask, colour):
 
 
 def starting_masks(arrays):
-    """(gain, ignore) bool (256, 256) that the canvas edits start from."""
     blank = np.zeros((SIZE, SIZE), bool)
     if start_mode == "Previously saved" and is_saved:
         z = np.load(saved_path(tile_id))
@@ -1044,15 +927,11 @@ def starting_masks(arrays):
         a, b = arrays[DW_A][0], arrays[DW_B][0]
         valid = np.isfinite(a) & np.isfinite(b)
         cand = (np.nan_to_num(a) <= DW_THR) & (np.nan_to_num(b) > DW_THR) & valid
-        return (
-            drop_small(cand, MIN_PX),
-            blank,
-        )  # DW candidate: non-tree in 2017 and tree in 2024
+        return drop_small(cand, MIN_PX), blank
     return blank, blank
 
 
 def build_composite_layer(enabled, op):
-    """Returns (PIL image, errors, (start_gain, start_ignore))."""
     canvas = np.zeros((SIZE, SIZE, 3), dtype=np.float32)
     errors, arrays = [], {}
 
@@ -1064,25 +943,13 @@ def build_composite_layer(enabled, op):
             arrays[name] = arr
         return arrays[name]
 
-    # Dynamic World for the label year is always needed (starting mask); both years for the change layer
     need = {name for name, on in enabled.items() if on and name in LAYERS}
     if start_mode == "Dynamic World":
         need |= {DW_A, DW_B}
-    if enabled.get(DW_NT_A):
-        need.add(DW_A)
-    if enabled.get(DW_T_B):
-        need.add(DW_B)
-    if need & {S2_A, S2_B}:
-        need |= {
-            S2_A,
-            S2_B,
-        }  # both years are fetched so they can share one contrast stretch
     for name in LAYERS:
         if name in need:
             load(name)
 
-    # Fixed reflectance stretch (same convention as your notebook / GEE: 0-3000 of the 0-10000 SR scale,
-    # linear). A per-tile percentile stretch re-scales every tile to its own contrast, which looks oversaturated.
     s2_lo, s2_hi = S2_VMIN, S2_VMAX
     for name in (S2_A, S2_B):
         if enabled.get(name) and arrays.get(name) is not None:
@@ -1105,48 +972,78 @@ def build_composite_layer(enabled, op):
             colour = plt.get_cmap("viridis")(np.clip(np.nan_to_num(p), 0, 1))[..., :3]
             canvas = _blend(canvas, colour, op[name] * np.isfinite(p))
 
-    # Binary DW masks at the same threshold as the starting mask: 2017 non-tree (magenta), 2024 tree (cyan).
-    # Where both show, DW says the pixel went non-tree -> tree (a gain candidate).
-    for name, dw, want_tree, colour in (
-        (DW_NT_A, DW_A, False, (255, 0, 255)),
-        (DW_T_B, DW_B, True, (0, 255, 255)),
-    ):
-        if enabled.get(name) and arrays.get(dw) is not None:
-            p = arrays[dw][0]
-            valid = np.isfinite(p)
-            m = (
-                (np.nan_to_num(p) > DW_THR)
-                if want_tree
-                else (np.nan_to_num(p) <= DW_THR)
-            )
-            col, a = _tint(m & valid, colour)
-            canvas = _blend(canvas, col, a * op[name])
-
     if enabled.get(GAIN_RECORDS) and arrays.get(GAIN_RECORDS) is not None:
         g = np.nan_to_num(arrays[GAIN_RECORDS][0])
         colour = plt.get_cmap("Greens")(0.35 + 0.65 * np.clip(g / 100.0, 0, 1))[..., :3]
-        canvas = _blend(
-            canvas, colour, op[GAIN_RECORDS] * (g > 0)
-        )  # only where there is gain
+        canvas = _blend(canvas, colour, op[GAIN_RECORDS] * (g > 0))
 
     s_gain, s_ign = starting_masks(arrays)
-    if enabled.get(START):
-        for m, c in ((s_gain, (255, 220, 0)), (s_ign, (0, 120, 255))):
-            col, a = _tint(m, c)
-            canvas = _blend(canvas, col, a * op[START])
 
     img = Image.fromarray((np.clip(canvas, 0, 1) * 255).astype(np.uint8))
     return img.resize((CANVAS, CANVAS), Image.NEAREST), errors, (s_gain, s_ign)
 
 
-# ==========================================
-# MAIN APP INTERFACE
-# ==========================================
+def _png_from_masks(green_mask, yellow_mask):
+    h, w = green_mask.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[green_mask] = [0, 200, 0, 255]
+    rgba[yellow_mask] = [255, 208, 0, 255]
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _masks_from_png(data_url):
+    if not data_url:
+        empty = np.zeros((PAINT_RES, PAINT_RES), dtype=bool)
+        return empty, empty.copy()
+
+    rgba = decode_paint(data_url)
+    if rgba is None:
+        empty = np.zeros((PAINT_RES, PAINT_RES), dtype=bool)
+        return empty, empty.copy()
+
+    return paint_masks(rgba)
+
+
+def _canvas_state(tile_id):
+    store = st.session_state.setdefault("_paint_store", {})
+    store.setdefault(tile_id, {"paint": None, "dw": None})
+    return store[tile_id]
+
+
+def build_dw_overlay(tile_id):
+    state = _canvas_state(tile_id)
+
+    green_mask, _ = _masks_from_png(state.get("paint"))
+    fresh = np.zeros((SIZE, SIZE), dtype=bool)
+
+    arrays = {}
+    for name in (DW_A, DW_B):
+        arr, err = get_layer(tile_id, name, *BOUNDS)
+        if err:
+            continue
+        arrays[name] = arr
+
+    if arrays.get(DW_A) is not None and arrays.get(DW_B) is not None:
+        a, b = arrays[DW_A][0], arrays[DW_B][0]
+        valid = np.isfinite(a) & np.isfinite(b)
+        cand = (np.nan_to_num(a) <= DW_THR) & (np.nan_to_num(b) > DW_THR) & valid
+        fresh = drop_small(cand, MIN_PX)
+
+    fresh = np.asarray(
+        Image.fromarray(fresh.astype(np.uint8)).resize(
+            (PAINT_RES, PAINT_RES), Image.Resampling.NEAREST
+        ),
+        dtype=bool,
+    )
+    fresh &= ~green_mask
+
+    state["dw"] = _png_from_masks(np.zeros((PAINT_RES, PAINT_RES), dtype=bool), fresh)
+    return state["dw"]
+
+
 st.title("🗺️ EPSG:3035 Spatial Grid & Segmentation Labelling Suite")
-
-
-# Interactive Leaflet component: tile clicks return a tile ID to Streamlit.
-import streamlit.components.v1 as components
 
 with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
     try:
@@ -1158,7 +1055,6 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
         st.warning(f"Could not prepare Esri Wayback comparison imagery: {str(e)[:200]}")
 
     if imagery_2017_url and imagery_2024_url:
-        # Compact notice banner displaying the exact imagery dates
         st.markdown(
             f"""
             <div style="display: flex; justify-content: space-between; background-color: #262730; padding: 6px 12px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: #ffffff;">
@@ -1169,7 +1065,6 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
             unsafe_allow_html=True,
         )
 
-        # Create native Folium map centered on the selected tile
         m = folium.Map(
             location=[float(tile_row["lat"]), float(tile_row["lon"])],
             zoom_start=11,
@@ -1180,7 +1075,6 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
             ),
         )
 
-        # Add Esri Satellite basemap if selected
         if basemap_name == "Satellite (Esri)":
             folium.TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -1189,7 +1083,6 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
                 control=False,
             ).add_to(m)
 
-        # 2017 Tile Layer (Left side of swipe)
         layer_2017 = folium.TileLayer(
             tiles=imagery_2017_url,
             attr="2017 Imagery",
@@ -1200,7 +1093,6 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
         )
         layer_2017.add_to(m)
 
-        # 2024 Tile Layer (Right side of swipe)
         layer_2024 = folium.TileLayer(
             tiles=imagery_2024_url,
             attr="2024 Imagery",
@@ -1211,11 +1103,8 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
         )
         layer_2024.add_to(m)
 
-        # Native Folium Side-by-Side Swipe Plugin
         SideBySideLayers(layer_left=layer_2017, layer_right=layer_2024).add_to(m)
 
-        # All tile markers go in ONE GeoJSON layer (built once and cached) - thousands of individual
-        # folium.CircleMarker objects were the main reason every rerun was so slow.
         folium.GeoJson(
             marker_geojson(GEOJSON_PATH),
             marker=folium.CircleMarker(radius=4, fill=True, fill_opacity=0.9),
@@ -1226,7 +1115,8 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
             },
             tooltip=folium.GeoJsonTooltip(fields=["tip"], labels=False),
         ).add_to(m)
-        folium.CircleMarker(  # the selected tile, highlighted
+
+        folium.CircleMarker(
             location=[float(tile_row["lat"]), float(tile_row["lon"])],
             radius=8,
             color="#ffffff",
@@ -1237,12 +1127,10 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
             tooltip=f"{tile_id} (selected)",
         ).add_to(m)
 
-        # Render map natively in Streamlit and listen for clicks
         map_data = st_folium(
             m, width="100%", height=490, returned_objects=["last_active_drawing"]
         )
 
-        # Handle marker selection change
         if map_data and map_data.get("last_active_drawing"):
             clicked_id = (map_data["last_active_drawing"].get("properties") or {}).get(
                 "tile_id"
@@ -1261,8 +1149,6 @@ with st.expander("📍 Tile map (swipe 2017 / 2024 imagery)", expanded=True):
 
 st.markdown("---")
 
-# --- COMPACT ANNOTATION CONTROLS ---------------------------------------------------------------
-# Keep the canvas as the main full-width work surface. Layer controls are available on demand.
 with st.expander("🎛️ Layer compositor", expanded=False):
     default_on = {S2_B, START}
     default_op = {START: 0.4, GAIN_RECORDS: 0.7}
@@ -1289,175 +1175,44 @@ with st.expander("🎛️ Layer compositor", expanded=False):
             st.rerun()
 
 st.subheader("🛠️ Segmentation tools")
-st.caption(
-    "Yellow = starting gain mask. Green adds gain, red removes gain, and blue marks cloud / unclear areas to ignore."
-)
-tool_cols = st.columns([1.2, 1, 1, 1.5])
+tool_cols = st.columns([1.2, 1, 1, 1.5, 1, 1])
+
 with tool_cols[0]:
-    paint_class = st.selectbox("Class", list(CLASSES), key="paint_class")
-with tool_cols[1]:
     drawing_mode = st.selectbox(
-        "Tool", ["freedraw", "polygon", "rect", "point (fill)"], index=0, key="tool"
+        "Tool",
+        ["brush", "polygon", "rect", "fill", "eraser"],
+        key="tool",
     )
-with tool_cols[2]:
+
+with tool_cols[1]:
     stroke_width = st.slider("Brush", 1, 25, 6, key="brush")
-# Keep the user's canvas-size choice independently of the tile and canvas widget.
-# Streamlit may recreate the canvas component when the tile changes; this preference
-# must survive that remount and every navigation-triggered rerun.
-if "canvas_size_preference" not in st.session_state:
-    st.session_state["canvas_size_preference"] = int(
-        st.session_state.get("annotation_canvas_size", 768)
-    )
-if "annotation_canvas_size" not in st.session_state:
-    st.session_state["annotation_canvas_size"] = int(
-        st.session_state["canvas_size_preference"]
-    )
 
-
-def _remember_canvas_size():
-    st.session_state["canvas_size_preference"] = int(
-        st.session_state["annotation_canvas_size"]
-    )
-
-
-with tool_cols[3]:
+with tool_cols[2]:
     CANVAS = st.select_slider(
         "Canvas scale (pixels)",
         options=[512, 768, 1024, 1280],
         key="annotation_canvas_size",
-        on_change=_remember_canvas_size,
-        help="Choose one of the four square canvas sizes; saved masks remain 256 × 256.",
     )
+
+state = _canvas_state(tile_id)
+empty_mask = np.zeros((PAINT_RES, PAINT_RES), dtype=bool)
+
+with tool_cols[3]:
+    if st.button("Refresh DW", key=f"refresh_dw_{tile_id}", use_container_width=True):
+        state["dw_original"] = build_dw_overlay(tile_id)
+        state["dw"] = state["dw_original"]
+        state["canvas_revision"] = state.get("canvas_revision", 0) + 1
+        st.rerun()
+
+with tool_cols[4]:
+    if st.button("Remove DW", key=f"remove_dw_{tile_id}", use_container_width=True):
+        state["dw"] = _png_from_masks(empty_mask, empty_mask)
+        state["canvas_revision"] = state.get("canvas_revision", 0) + 1
+        st.rerun()
+
 CANVAS = int(CANVAS)
-rgb_c, hex_c = CLASSES[paint_class]
-canvas_drawing_mode = "point" if drawing_mode == "point (fill)" else drawing_mode
-fill_tolerance = 0
-if drawing_mode == "point (fill)":
-    st.caption(
-        "Fill: draw a closed outline, switch Tool to 'point (fill)', then click inside it. The fill stops at your drawn "
-        "lines (a gap lets it leak, and an over-large fill is refused). Each point uses the class selected when it was "
-        "clicked. A preview below the canvas shows what Save will add."
-    )
-    fill_tolerance = st.slider(
-        "Fill colour tolerance (0 = stop only at drawn lines; higher = also stop at colour edges in the image)",
-        0,
-        120,
-        0,
-        key="fill_tol",
-    )
 
 
-# --- strokes are stored in full-tile coordinates and rescaled when the canvas size changes -------------------------
-# Fabric.js objects are positioned by (left, top) and sized by (scaleX, scaleY); rescale those values while retaining
-# the underlying full-tile drawing geometry.
-def _remap_drawing(drawing, scale, ox, oy, to_view):
-    """Copy of a Fabric.js canvas JSON with every object moved/scaled between full-tile and view coordinates.
-    to_view=True : full-tile -> view   (p' = scale * (p - origin))
-    to_view=False: view -> full-tile   (p  = p' / scale + origin)"""
-    out = copy.deepcopy(drawing)
-    f = scale if to_view else 1.0 / scale
-    for obj in out.get("objects", []):
-        for key, o in (("left", ox), ("top", oy)):
-            if key in obj:
-                obj[key] = (obj[key] - o) * scale if to_view else obj[key] / scale + o
-        for key in ("scaleX", "scaleY"):
-            obj[key] = float(obj.get(key, 1.0)) * f
-        if obj.get("strokeUniform") and "strokeWidth" in obj:
-            obj["strokeWidth"] = (
-                float(obj["strokeWidth"]) * f
-            )  # not scaled with the object, so scale it by hand
-    return out
-
-
-# --- point (fill) support ----------------------------------------------------------------------------------------
-MAX_FILL_FRAC = 0.6  # a fill larger than this share of the canvas is refused (almost always an outline with a gap)
-
-
-def _class_of_fill(fill, default):
-    """Class whose colour is closest to a fabric 'rgba(r, g, b, a)' fill string."""
-    import re
-
-    nums = re.findall(r"\d+\.?\d*", str(fill))
-    if len(nums) >= 3:
-        rgb = np.array([float(n) for n in nums[:3]])
-        return min(
-            CLASSES, key=lambda c: float(np.sum((np.array(CLASSES[c][0]) - rgb) ** 2))
-        )
-    return default
-
-
-def _fill_seeds(drawn, scale):
-    """Point marks (fabric circles) of the canvas JSON, in click order: [(x, y, radius, class or None)] in image pixels."""
-    seeds = []
-    for o in (drawn or {}).get("objects", []):
-        if o.get("type") != "circle":
-            continue
-        r = float(o.get("radius", 0))
-        sx, sy = float(o.get("scaleX", 1)), float(o.get("scaleY", 1))
-        cx = float(o["left"]) + (0.0 if o.get("originX") == "center" else r * sx)
-        cy = float(o["top"]) + (0.0 if o.get("originY") == "center" else r * sy)
-        rad = r * max(sx, sy) + float(o.get("strokeWidth", 0) or 0) / 2 + 1.5
-        seeds.append(
-            (cx * scale, cy * scale, rad * scale, _class_of_fill(o.get("fill"), None))
-        )
-    return seeds
-
-
-def canvas_masks(canvas_result, bg_img, tolerance, default_class, canvas_px):
-    """(add, erase, ignore, warnings): bool masks in canvas-image pixels.
-    Coloured strokes are classified by colour; every point mark is a flood fill that stops at the drawn strokes (and, if
-    tolerance > 0, at colour edges of the background composite)."""
-    rgba = canvas_result.image_data
-    h, w = rgba.shape[:2]
-    r, g, b, a = (rgba[..., i].astype(np.int32) for i in range(4))
-    painted = a > 0
-    seeds = _fill_seeds(canvas_result.json_data, w / float(canvas_px))
-    yy, xx = np.ogrid[:h, :w]
-    discs = np.zeros((h, w), bool)
-    for cx, cy, rad, _ in seeds:
-        discs |= (xx - cx) ** 2 + (yy - cy) ** 2 <= rad**2
-    strokes = painted & ~discs  # the point marks themselves are not strokes
-    masks = {
-        "gain (add)": strokes & (g > r) & (g > b),
-        "not gain (erase)": strokes & (r > g) & (r > b),
-        "ignore": strokes & (b > r) & (b > g),
-    }
-    warnings = []
-    if seeds:
-        bg = np.asarray(
-            bg_img.convert("RGB").resize((w, h), Image.NEAREST), dtype=np.int16
-        )
-        for cx, cy, rad, cls in seeds:
-            px = int(np.clip(round(cx), 0, w - 1))
-            py = int(np.clip(round(cy), 0, h - 1))
-            allowed = ~strokes
-            if tolerance > 0:
-                dist = np.sqrt(((bg - bg[py, px]) ** 2).sum(axis=2))
-                allowed = allowed & (dist <= tolerance * np.sqrt(3.0))
-            labels, _ = ndimage.label(
-                allowed
-            )  # 4-connected, so thin drawn lines block it
-            lab = labels[py, px]
-            if lab == 0:
-                warnings.append(
-                    "A fill point landed on a drawn line (or outside the colour tolerance) and was ignored."
-                )
-                continue
-            region = labels == lab
-            if region.mean() > MAX_FILL_FRAC:
-                warnings.append(
-                    f"A fill covering {100 * region.mean():.0f}% of the tile was ignored: the outline probably has a gap."
-                )
-                continue
-            cls = cls or default_class
-            for name in masks:
-                masks[name] = masks[name] & ~region
-            masks[cls] = masks[cls] | region
-    return masks["gain (add)"], masks["not gain (erase)"], masks["ignore"], warnings
-
-
-# --- CANVAS DISPLAY ---
-# A fragment: drawing a stroke reruns only this panel instead of the whole page.
 @st.fragment
 def canvas_panel():
     st.subheader(f"🎨 Labelling forest gain {YEAR_A} → {YEAR_B}: `{tile_id}`")
@@ -1468,216 +1223,115 @@ def canvas_panel():
         init_ee()
         comp_key = (
             tile_id,
-            start_mode,
-            DW_THR,
-            MIN_PX,
             is_saved,
             tuple(layer_path(tile_id, l).exists() for l in LAYERS),
             json.dumps([enabled_layers, opacities], sort_keys=True),
         )
         memo = st.session_state.get("_comp_memo")
         if memo is not None and memo[0] == comp_key:
-            bg_img, errors, (start_gain, start_ign) = memo[1]
+            bg_img, errors, _ = memo[1]
         else:
             result = build_composite_layer(enabled_layers, opacities)
             st.session_state["_comp_memo"] = (comp_key, result)
-            bg_img, errors, (start_gain, start_ign) = result
+            bg_img, errors, _ = result
     except Exception as e:
         st.error(
             f"Earth Engine could not be started: {e}\n\nRun `earthengine authenticate` once, then restart the app."
         )
         st.stop()
+
     for err in errors:
         st.warning("Could not generate " + err)
 
-    # Always display the complete tile; canvas scaling changes only its display resolution.
-    canvas_bg_img = bg_img
+    state = _canvas_state(tile_id)
+    empty = np.zeros((PAINT_RES, PAINT_RES), dtype=bool)
 
-    canvas_state = json.dumps([tile_id, CANVAS])
-    canvas_key = "canvas_" + hashlib.md5(canvas_state.encode()).hexdigest()[:12]
+    if state.get("paint") is None:
+        state["paint"] = _png_from_masks(empty, empty)
+    if state.get("dw") is None:
+        state["dw"] = _png_from_masks(empty, empty)
 
-    stroke_store = st.session_state.setdefault(
-        "_strokes", {}
-    )  # tile_id -> drawing in full-tile coordinates at its recorded canvas size
-    size_store = st.session_state.setdefault("_stroke_canvas_sizes", {})
-    previous_size = int(size_store.get(tile_id, 512))
-    resize_scale = CANVAS / previous_size
+    green, _ = _masks_from_png(state["paint"])
+    _, yellow = _masks_from_png(state["dw"])
+    initial_canvas = _png_from_masks(green, yellow)
 
-    if st.session_state.get("_init_key") != canvas_key:
-        stored = stroke_store.get(tile_id)
-        if stored:
-            st.session_state["_init_payload"] = (
-                _remap_drawing(stored, resize_scale, 0, 0, to_view=True)
-                if resize_scale != 1
-                else copy.deepcopy(stored)
-            )
-        else:
-            st.session_state["_init_payload"] = None
-        st.session_state["_init_key"] = canvas_key
-    initial_draw_payload = st.session_state["_init_payload"]
+    canvas_token = f"{tile_id}:{CANVAS}:{state.get('canvas_revision', 0)}"
 
-    canvas_result = st_canvas(
-        initial_drawing=initial_draw_payload,
-        fill_color=f"rgba({rgb_c[0]}, {rgb_c[1]}, {rgb_c[2]}, 0.5)",
-        stroke_width=stroke_width,
-        stroke_color=hex_c,
-        background_image=canvas_bg_img,
-        update_streamlit=True,
-        height=CANVAS,
-        width=CANVAS,
-        drawing_mode=canvas_drawing_mode,
-        point_display_radius=max(2, stroke_width),
-        return_image_data=True,
-        key=canvas_key,
+    result = paint_canvas(
+        background=bg_img,
+        display_px=CANVAS,
+        tool=drawing_mode,
+        color="#00C800",
+        brush=stroke_width,
+        token=canvas_token,
+        initial_paint=initial_canvas,
+        key=f"paint_{tile_id}",
+        layer="paint",
     )
 
-    if "_canvas_payloads" not in st.session_state:
-        st.session_state["_canvas_payloads"] = {}
-
-    if canvas_result.image_data is not None:
-        st.session_state["_canvas_payloads"][tile_id] = {
-            "image_data": canvas_result.image_data,
-            "json_data": canvas_result.json_data,
-        }
-
-    if drawing_mode == "point (fill)" and canvas_result.image_data is not None:
-        pv_add, pv_erase, pv_ign, pv_warn = canvas_masks(
-            canvas_result, canvas_bg_img, fill_tolerance, paint_class, CANVAS
-        )
-        for wmsg in pv_warn:
-            st.warning(wmsg)
-        if pv_add.any() or pv_erase.any() or pv_ign.any():
-            ph, pw = pv_add.shape
-            pv = np.asarray(
-                canvas_bg_img.convert("RGB").resize((pw, ph)), dtype=np.float32
-            )
-            for m, name in (
-                (pv_add, "gain (add)"),
-                (pv_erase, "not gain (erase)"),
-                (pv_ign, "ignore"),
-            ):
-                pv[m] = 0.5 * pv[m] + 0.5 * np.array(CLASSES[name][0], dtype=np.float32)
-            st.image(
-                pv.astype(np.uint8),
-                caption="Fill preview: what Save will add (green gain, red erase, blue ignore)",
-            )
-
-    drawn = canvas_result.json_data
-    if drawn is not None and drawn.get("objects"):
-        stroke_store[tile_id] = copy.deepcopy(drawn)
-        size_store[tile_id] = CANVAS
-        st.session_state["_strokes_seen"] = canvas_key
-    elif (
-        drawn is not None
-        and st.session_state.get("_strokes_seen") == canvas_key
-        and not drawn.get("objects")
-    ):
-        # strokes were on this canvas and are now gone (undo / reset): forget them so a remount does not bring them
-        # back. (An empty report from a canvas that has not restored its strokes yet is ignored.)
-        stroke_store.pop(tile_id, None)
+    if result and result.get("token") == canvas_token and result.get("paint"):
+        green_mask, yellow_mask = _masks_from_png(result["paint"])
+        state["paint"] = _png_from_masks(green_mask, np.zeros_like(green_mask))
+        state["dw"] = _png_from_masks(np.zeros_like(yellow_mask), yellow_mask)
 
     if st.button("💾 Save forest gain mask", type="primary"):
-        from types import SimpleNamespace
+        green_mask, _ = _masks_from_png(state["paint"])
+        _, yellow_mask = _masks_from_png(state["dw"])
 
-        payload = st.session_state["_canvas_payloads"].get(tile_id)
+        visible_gain = green_mask | yellow_mask
+        gain_image = Image.fromarray(visible_gain.astype(np.uint8) * 255)
+        gain_image = gain_image.resize((SIZE, SIZE), Image.Resampling.BOX)
+        gain = np.asarray(gain_image, dtype=np.uint8) >= 64
 
-        if canvas_result.image_data is not None:
-            payload = {
-                "image_data": canvas_result.image_data,
-                "json_data": canvas_result.json_data,
-            }
-            st.session_state["_canvas_payloads"][tile_id] = payload
+        # ignore is effectively unused; keep it zeroed to avoid reintroducing stale DW data
+        ignore = np.zeros((SIZE, SIZE), dtype=bool)
 
-        if payload is None:
-            st.warning(
-                "Canvas has not returned image data yet. Please wait for it to load."
+        np.savez_compressed(saved_path(tile_id), gain=gain, ignore=ignore)
+        SAVED.add(tile_id)
+        write_tile_tif(tile_id, BOUNDS)
+
+        gain_pct = 100 * gain.mean()
+        with open(LABELS_DIR / f"{tile_id}_meta.json", "w") as f:
+            json.dump(
+                {
+                    "tile_id": tile_id,
+                    "x_min_m": BOUNDS[0],
+                    "y_min_m": BOUNDS[1],
+                    "x_max_m": BOUNDS[2],
+                    "y_max_m": BOUNDS[3],
+                    "hrl_gain_pct": float(
+                        tile_row.get("hrl_gain_pct", tile_row["gain_pct"])
+                    ),
+                    "woodland_pct": (
+                        None
+                        if pd.isna(tile_row.get("woodland_pct"))
+                        else float(tile_row.get("woodland_pct"))
+                    ),
+                    "gain_pct": float(tile_row["gain_pct"]),
+                    "country": str(tile_row.get("country", "Unknown")),
+                    "period": [YEAR_A, YEAR_B],
+                    "start": start_mode,
+                    "dw_thr": DW_THR,
+                    "min_px": MIN_PX,
+                },
+                f,
+                indent=2,
             )
+
+        msg = f"Saved: gain {gain_pct:.1f}% of tile ({int(gain.sum())} px)."
+        target = next_unlabelled(tile_id)
+        if target is None:
+            st.success(msg)
         else:
-            canvas_for_save = SimpleNamespace(
-                image_data=payload["image_data"],
-                json_data=payload["json_data"],
-            )
-
-            def to_tile(m):
-                # Area-average to the underlying mask grid. BOX resampling supports
-                # every canvas size (including non-multiples of 256) without changing
-                # the saved 256 x 256 mask resolution.
-                side = SIZE
-                mask_image = Image.fromarray((m.astype(np.uint8) * 255), mode="L")
-                reduced = mask_image.resize((side, side), Image.Resampling.BOX)
-                return np.asarray(reduced, dtype=np.uint8) >= 64
-
-            add_canvas, erase_canvas, ign_canvas, fill_warnings = canvas_masks(
-                canvas_for_save, canvas_bg_img, fill_tolerance, paint_class, CANVAS
-            )
-            for wmsg in fill_warnings:
-                st.warning(wmsg)
-            add_local = to_tile(add_canvas)
-            erase_local = to_tile(erase_canvas)
-            ign_local = to_tile(ign_canvas)
-            add, erase, ign = add_local, erase_local, ign_local
-            # When revisiting another quarter, start from the already-saved full-tile
-            # masks so edits elsewhere are retained. On the first save, use the chosen
-            # starting masks (Dynamic World / blank / previously saved).
-            existing_path = saved_path(tile_id)
-            if existing_path.exists():
-                with np.load(existing_path) as previous:
-                    gain_base = previous["gain"].astype(bool)
-                    ignore_base = previous["ignore"].astype(bool)
-            else:
-                gain_base, ignore_base = start_gain.copy(), start_ign.copy()
-            gain = (gain_base | add) & ~erase
-            ignore = (ignore_base | ign) & ~erase & ~add
-            gain &= ~ignore
-            np.savez_compressed(saved_path(tile_id), gain=gain, ignore=ignore)
-            SAVED.add(tile_id)
-            write_tile_tif(tile_id, BOUNDS)
-            with open(LABELS_DIR / f"{tile_id}_meta.json", "w") as f:
-                json.dump(
-                    {
-                        "tile_id": tile_id,
-                        "x_min_m": BOUNDS[0],
-                        "y_min_m": BOUNDS[1],
-                        "x_max_m": BOUNDS[2],
-                        "y_max_m": BOUNDS[3],
-                        "hrl_gain_pct": float(
-                            tile_row.get("hrl_gain_pct", tile_row["gain_pct"])
-                        ),
-                        "woodland_pct": (
-                            None
-                            if pd.isna(tile_row.get("woodland_pct"))
-                            else float(tile_row.get("woodland_pct"))
-                        ),
-                        "gain_pct": float(tile_row["gain_pct"]),
-                        "country": str(tile_row.get("country", "Unknown")),
-                        "period": [YEAR_A, YEAR_B],
-                        "start": start_mode,
-                        "dw_thr": DW_THR,
-                        "min_px": MIN_PX,
-                    },
-                    f,
-                    indent=2,
-                )
-            msg = (
-                f"Saved: gain {100 * gain.mean():.1f}% of tile ({int(gain.sum())} px), "
-                f"ignore {100 * ignore.mean():.1f}% (written to `{tile_id}.tif`)."
-            )
-            target = next_unlabelled(tile_id)
-            if target is None:
-                st.success(msg)
-            else:
-                # Auto-advance to the next unlabelled queue tile.
-                stroke_store.pop(tile_id, None)
-                st.session_state["_pending"] = {
-                    "selected_tile_id": target,
-                    "_flash": f"{msg} Next: `{target}`.",
-                }
-                st.rerun(scope="app")
+            st.session_state["_pending"] = {
+                "selected_tile_id": target,
+                "_flash": f"{msg} Next: `{target}`.",
+            }
+            st.rerun(scope="app")
 
 
 canvas_panel()
 
-# --- prefetch the next queue tiles' Earth Engine layers while you label this one ---
 upcoming, _t = [], tile_id
 for _ in range(PREFETCH_AHEAD):
     _t = next_unlabelled(_t)
