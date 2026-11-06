@@ -464,11 +464,35 @@ def _run(args: argparse.Namespace, **extra) -> dict:
 
 
 def losses(args: argparse.Namespace) -> list[dict]:
+    """Sweep loss functions using the model's confirmed configuration,
+    or train.py defaults if no confirmed configuration exists.
+    """
+    configs = load_confirmed_configs()
+    cfg = configs.get(args.model)
+
+    if cfg is None:
+        print(
+            f"WARNING: no confirmed configuration for {args.model}; "
+            "using train.py defaults.",
+            file=sys.stderr,
+        )
+        tuned = {}
+    else:
+        tuned = {
+            "learning_rate": cfg["learning_rate"],
+            "weight_decay": cfg["weight_decay"],
+            "model_opt": cfg["model_opt"],
+        }
+
+    def run(**kwargs):
+        return _run(args, **(tuned | kwargs))
+
     rows = []
+
     for name in ("bce", "dice"):
-        rows.append(_run(args, loss_name=name))
-    # Tune both standalone Focal Tversky and BCE + Focal Tversky, using a
-    # matched alpha/beta balance and focal exponent grid for both recipes.
+        rows.append(run(loss_name=name))
+
+    # Focal Tversky and BCE + Focal Tversky
     for name in ("focal_tversky", "bce_focal_tversky"):
         for alpha, gamma in itertools.product((0.3, 0.5, 0.7), (1.0, 1.33, 2.0)):
             opts = _opts(
@@ -478,33 +502,33 @@ def losses(args: argparse.Namespace) -> list[dict]:
                     "tversky.gamma": gamma,
                 }
             )
-            rows.append(_run(args, loss_name=name, loss_opt=opts))
-    # Plain focal loss: gamma 0 would be BCE; alpha 0.25 is the RetinaNet value
+            rows.append(run(loss_name=name, loss_opt=opts))
+
+    # Plain focal loss
     for gamma, alpha in itertools.product((1.0, 2.0, 3.0), (None, 0.25)):
         opts = _opts(**{"focal.gamma": gamma, "focal.alpha": alpha})
-        rows.append(_run(args, loss_name="focal", loss_opt=opts))
-    # Lovasz hinge: pooled over the batch / per tile, alone and added to BCE
+        rows.append(run(loss_name="focal", loss_opt=opts))
+
+    # Lovasz hinge: pooled / per tile, alone / added to BCE
     for name, per_tile in itertools.product(("lovasz", "bce_lovasz"), (False, True)):
         rows.append(
-            _run(
-                args,
+            run(
                 loss_name=name,
                 loss_opt=_opts(lovasz_per_image=True) if per_tile else None,
             )
         )
-    # OHEM on BCE-based losses.
+
+    # OHEM on BCE-based losses
     for name, thresh in itertools.product(("bce", "bce_focal_tversky"), (0.7, 0.9)):
         rows.append(
-            _run(
-                args,
+            run(
                 loss_name=name,
                 reweight="ohem",
                 loss_opt=_opts(**{"ohem.thresh": thresh}),
             )
         )
 
-    # Focal + OHEM: the Focal term must pass its per-pixel focal losses
-    # to OHEM (this experiment config alone is not sufficient).
+    # Focal + OHEM
     for gamma, alpha, thresh in itertools.product(
         (1.0, 2.0, 3.0), (None, 0.25), (0.7, 0.9)
     ):
@@ -516,13 +540,13 @@ def losses(args: argparse.Namespace) -> list[dict]:
             }
         )
         rows.append(
-            _run(
-                args,
+            run(
                 loss_name="focal",
                 reweight="ohem",
                 loss_opt=opts,
             )
         )
+
     return rows
 
 

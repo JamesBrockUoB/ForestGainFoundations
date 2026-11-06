@@ -306,13 +306,3 @@ All non-benchmark suites accept:
 The benchmark accepts `--trials`, `--startup-trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate`, `--weight-decay` and `--model-opt` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
 
 `train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
-
-## 7. Mask optimisation
-
-Run after selecting a checkpoint:
-
-```bash
-python mask_sweep.py checkpoints/<run>/<best>.ckpt --output results/mask_sweep.csv
-```
-
-The sweep needs no retraining. The CSV covers thresholding at `0.50`–`0.90`, removal and filling of connected components sized `1`, `2`, `5`, `10`, and `25` pixels, and maximum predicted-gain coverage at minimum positive-mask precision of `55`–`80%`. In this rare-event setting, precision is the relevant interpretation of positive-mask "accuracy"; `pixel_accuracy` is reported separately for completeness.
