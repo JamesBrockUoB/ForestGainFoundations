@@ -263,7 +263,7 @@ This is a parameter sweep rather than a full Bayesian search. After the initial 
 python experiments.py temporal --models tsvit sits_scd unet_lstm --seeds 0 1 2 --execute
 ```
 
-Compares first+last year (2017, 2024), 2017/2021/2024, 2017/2020/2022/2024, and the whole sequence (`--year-sets` overrides). The valid-pixel mask is taken over all years so the scored pixels stay consistent across frame subsets. This suite compares several models, so it does not take `--model-opt`; each model uses `train.py`'s architecture defaults and the shared `--learning-rate` / `--weight-decay`.
+Compares first+last year (2017, 2024), 2017/2021/2024, 2017/2020/2022/2024, and the whole sequence (`--year-sets` overrides). The valid-pixel mask is taken over all years so the scored pixels stay consistent across frame subsets. This suite compares several models, taking the optimal configurations for these models from the benchmarking experiments. If no configuration is found it uses the defaults of `train.py`.
 
 ## 6. Augmentation and sampling
 

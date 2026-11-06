@@ -192,20 +192,16 @@ def _make_storage(path: str):
     return optuna.storages.JournalStorage(backend)
 
 
-def load_confirmed_configs(
-    path="experiment_manifests/confirmed_configs.json",
-):
+def load_confirmed_configs(path="experiment_manifests/confirmed_configs.json") -> dict:
+    """Best confirmed configuration per model; {} if the file does not exist yet."""
     path = Path(path)
-
     if not path.exists():
-        raise SystemExit(
-            f"Confirmed configurations not found: {path}. "
-            "Run confirm_top_k.py aggregate first."
+        print(
+            f"WARNING: {path} not found; temporal suite falls back to train.py defaults for every model.",
+            file=sys.stderr,
         )
-
-    data = json.loads(path.read_text())
-
-    return data["models"]
+        return {}
+    return json.loads(path.read_text())["models"]
 
 
 def run_bayesian_benchmark(args: argparse.Namespace) -> None:
@@ -575,34 +571,35 @@ def hardness(args: argparse.Namespace) -> list[dict]:
 
 
 def temporal(args: argparse.Namespace) -> list[dict]:
-    """Compare temporal frame subsets using confirmed model configurations."""
-
+    """Compare temporal frame subsets, using the confirmed configuration of each model if there is one,
+    otherwise train.py's defaults (lr, weight decay, loss and model options are simply not passed).
+    """
     configs = load_confirmed_configs()
-
     year_sets = (
         [tuple(sorted(y)) for y in args.year_sets] if args.year_sets else YEAR_SETS
     )
-
     rows = []
-
     for model in args.models or [args.model]:
-
-        if model not in configs:
-            raise SystemExit(f"No confirmed configuration found for {model}.")
-
-        cfg = configs[model]
-
-        for years in year_sets:
-            row = _base(args, model, tuple(args.sources)) | {
+        cfg = configs.get(model)
+        if cfg is None:
+            print(
+                f"WARNING: no confirmed configuration for {model}; using train.py defaults.",
+                file=sys.stderr,
+            )
+            tuned = {}
+        else:
+            tuned = {
                 "learning_rate": cfg["learning_rate"],
                 "weight_decay": cfg["weight_decay"],
                 "loss_name": cfg["loss_name"],
                 "model_opt": cfg["model_opt"],
-                **({"years": list(years)} if years else {}),
             }
-
-            rows.append(row)
-
+        for years in year_sets:
+            rows.append(
+                _base(args, model, tuple(args.sources))
+                | tuned
+                | ({"years": list(years)} if years else {})
+            )
     return rows
 
 
