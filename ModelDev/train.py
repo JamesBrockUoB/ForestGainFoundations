@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -148,13 +149,32 @@ def parse_args(argv=None):
         "--min_gain_px",
         type=int,
         default=0,
-        help="Label cleaning: drop gain patches smaller than this many pixels. Train AND val labels; holdout evaluation is optional.",
+        help="Label cleaning: drop gain patches smaller than this many pixels. Training labels only unless --clean_val.",
     )
     g.add_argument(
         "--fill_holes_px",
         type=int,
         default=0,
         help="Label cleaning: fill holes smaller than this inside gain.",
+    )
+    g.add_argument(
+        "--conf_filter",
+        type=float,
+        default=None,
+        help="Label cleaning: ignore gain pixels with confidence (0-1) below this in the loss (valid=0).",
+    )
+    g.add_argument(
+        "--conf_harden",
+        type=float,
+        default=None,
+        help="Like --conf_filter, and retained gain pixels get weight 1 (binary). Differs from --conf_filter only "
+        "with --loss_type soft; label jitter defaults to 0 so the labels stay binary.",
+    )
+    g.add_argument(
+        "--clean_val",
+        action="store_true",
+        help="Also clean the VALIDATION labels (val_ap, early stopping). Default: raw validation labels, so every "
+        "cleaning variant is selected on the same target.",
     )
     g.add_argument(
         "--no_augment", action="store_true", help="Turn ALL augmentation off."
@@ -252,45 +272,60 @@ def build_loss_config(args, train_dirs) -> LossConfig:
     )
 
 
+MAX_RUN_NAME = (
+    200  # one path component must stay under the filesystem limit (255 bytes)
+)
+
+
+def _fit_name(head: str, tail: str) -> str:
+    """head + tail, shortened with a hash of the full head if it would be too long (keeps names unique)."""
+    name = f"{head}_{tail}"
+    if len(name) <= MAX_RUN_NAME:
+        return name
+    digest = hashlib.sha1(head.encode()).hexdigest()[:8]
+    keep = MAX_RUN_NAME - len(tail) - len(digest) - 2
+    return f"{head[:keep]}_{digest}_{tail}"
+
+
 def run_name(args, loss_cfg, years) -> str:
     slug = lambda opts: [
         re.sub(r"[^A-Za-z0-9.+-]", "", o.replace("=", "")) for o in opts or ()
     ]
-    return "_".join(
-        [
-            args.model_type,
-            "+".join(args.sources),
-            loss_cfg.confidence,
-            loss_cfg.name,
-            *([f"rw-{loss_cfg.reweight}"] if loss_cfg.reweight != "none" else []),
-            *slug(args.loss_opt),
-            *slug(args.model_opt),
-            *([f"y{len(years)}-{years[0]}-{years[-1]}"] if years else []),
-            f"crop{args.crop_size or 'full'}",
-            f"bs{args.batch_size}",
-            f"lr{args.learning_rate:g}",
-            f"wd{args.weight_decay:g}",
-            f"rep{args.repeats}",
-            *(["noaug"] if args.no_augment else []),
-            *(["nogeo"] if args.no_geo_aug and not args.no_augment else []),
-            *([f"gs{args.gain_sigma:g}"] if args.gain_sigma != 0.03 else []),
-            *([f"fs{args.frame_sigma:g}"] if args.frame_sigma != 0.01 else []),
-            *([f"fd{args.frame_drop_p:g}"] if args.frame_drop_p else []),
-            *([f"ls{args.label_sigma:g}"] if args.label_sigma is not None else []),
-            *([f"mmu{args.min_gain_px}"] if args.min_gain_px else []),
-            *([f"fill{args.fill_holes_px}"] if args.fill_holes_px else []),
-            *(
-                [f"pw{loss_cfg.pos_weight:g}"]
-                if loss_cfg.pos_weight is not None
-                else []
-            ),
-            f"seed{args.seed}",
-            datetime.now().strftime("%m%d-%H%M%S"),
-        ]
+    parts = [
+        args.model_type,
+        "+".join(args.sources),
+        loss_cfg.confidence,
+        loss_cfg.name,
+        *([f"rw-{loss_cfg.reweight}"] if loss_cfg.reweight != "none" else []),
+        *slug(args.loss_opt),
+        *slug(args.model_opt),
+        *([f"y{len(years)}-{years[0]}-{years[-1]}"] if years else []),
+        f"crop{args.crop_size or 'full'}",
+        f"bs{args.batch_size}",
+        f"lr{args.learning_rate:g}",
+        f"wd{args.weight_decay:g}",
+        f"rep{args.repeats}",
+        *(["noaug"] if args.no_augment else []),
+        *(["nogeo"] if args.no_geo_aug and not args.no_augment else []),
+        *([f"gs{args.gain_sigma:g}"] if args.gain_sigma != 0.03 else []),
+        *([f"fs{args.frame_sigma:g}"] if args.frame_sigma != 0.01 else []),
+        *([f"fd{args.frame_drop_p:g}"] if args.frame_drop_p else []),
+        *([f"ls{args.label_sigma:g}"] if args.label_sigma is not None else []),
+        *([f"mmu{args.min_gain_px}"] if args.min_gain_px else []),
+        *([f"fill{args.fill_holes_px}"] if args.fill_holes_px else []),
+        *([f"cf{args.conf_filter:g}"] if args.conf_filter is not None else []),
+        *([f"ch{args.conf_harden:g}"] if args.conf_harden is not None else []),
+        *(["cleanval"] if args.clean_val else []),
+        *([f"pw{loss_cfg.pos_weight:g}"] if loss_cfg.pos_weight is not None else []),
+    ]
+    return _fit_name(
+        "_".join(parts), f"seed{args.seed}_{datetime.now().strftime('%m%d-%H%M%S')}"
     )
 
 
 def train(args):
+    if args.conf_filter is not None and args.conf_harden is not None:
+        raise SystemExit("--conf_filter and --conf_harden are mutually exclusive")
     pl.seed_everything(args.seed, workers=True)
     sources = tuple(args.sources)
     years = tuple(sorted(args.years)) if args.years else None
@@ -329,7 +364,11 @@ def train(args):
         label_sigma=(
             args.label_sigma
             if args.label_sigma is not None
-            else (0.1 if loss_cfg.confidence == "soft" else 0.0)
+            else (
+                0.1
+                if loss_cfg.confidence == "soft" and args.conf_harden is None
+                else 0.0
+            )
         ),
         gain_sigma=args.gain_sigma,
         frame_sigma=args.frame_sigma,
@@ -337,15 +376,26 @@ def train(args):
         geo_aug=not args.no_geo_aug,
         min_gain_px=args.min_gain_px,
         fill_holes_px=args.fill_holes_px,
+        conf_filter=args.conf_filter,
+        conf_harden=args.conf_harden,
         years=years,
+    )
+    val_cleaning = (
+        dict(
+            min_gain_px=args.min_gain_px,
+            fill_holes_px=args.fill_holes_px,
+            conf_filter=args.conf_filter,
+            conf_harden=args.conf_harden,
+        )
+        if args.clean_val
+        else {}
     )
     val_ds = MultiTemporalGainDataset(
         val_dirs,
         sources=sources,
         crop_size=None,
-        min_gain_px=args.min_gain_px,
-        fill_holes_px=args.fill_holes_px,
         years=years,
+        **val_cleaning,
     )
 
     train_loader = DataLoader(
@@ -427,6 +477,32 @@ def train(args):
     )
     print(f"best checkpoint: {best} | val_ap: {best_score:.3f}")
 
+    cleaning = {
+        k: v
+        for k, v in dict(
+            min_gain_px=args.min_gain_px,
+            fill_holes_px=args.fill_holes_px,
+            conf_filter=args.conf_filter,
+            conf_harden=args.conf_harden,
+        ).items()
+        if v
+    }
+
+    # Validation tiles, best checkpoint: raw labels (val_eval_*) next to the cleaned labels of this variant
+    # (val_eval_clean_*), for comparison. val_ap itself (early stopping) uses the labels the validation loader had.
+    if best and (cleaning or args.suite == "maskclean"):
+        print("--- validation tiles, raw labels ---")
+        raw = evaluate_checkpoint(
+            best, test_dir=None, tile_dirs=val_dirs, crop_size=None
+        )
+        logger.log_metrics({f"val_eval_{k}": v for k, v in raw.items()})
+    if best and cleaning:
+        print("--- validation tiles, cleaned labels ---")
+        clean = evaluate_checkpoint(
+            best, test_dir=None, tile_dirs=val_dirs, crop_size=None, **cleaning
+        )
+        logger.log_metrics({f"val_eval_clean_{k}": v for k, v in clean.items()})
+
     # Holdout is not touched by experiment selection when --skip_test_eval is set.
     if best and not args.skip_test_eval:
         print("--- test set ---")
@@ -434,14 +510,10 @@ def train(args):
             best, test_dir=Path(args.holdout_dir), crop_size=None
         )
         logger.log_metrics({f"test_{k}": v for k, v in results.items()})
-        if args.min_gain_px or args.fill_holes_px:
+        if cleaning:
             print("--- test set, cleaned labels ---")
             clean = evaluate_checkpoint(
-                best,
-                test_dir=Path(args.holdout_dir),
-                crop_size=None,
-                min_gain_px=args.min_gain_px,
-                fill_holes_px=args.fill_holes_px,
+                best, test_dir=Path(args.holdout_dir), crop_size=None, **cleaning
             )
             logger.log_metrics({f"test_clean_{k}": v for k, v in clean.items()})
     elif args.skip_test_eval:

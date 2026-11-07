@@ -2,7 +2,7 @@
 
 Run commands from `ModelDev`. `experiments.py` writes a JSON manifest and prints the generated `train.py` commands. Except for the adaptive benchmark, it does not train unless `--execute` is supplied. Review the manifest before launching experiments.
 
-Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_sweep.py` (post-processing), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM launcher and arrays for the parallel benchmarks and the confirmation), `confirm_top_k.py` + `run_fg_confirm.sh` (multi-seed confirmation of the best benchmark trials, with holdout evaluation), `run_fg_data_sources.sh` (data-source sweep and confirmation of the top sources, with the best benchmark configuration of a model).
+Files: `experiments.py` (suites), `train.py` (training), `datasets.py` (data + augmentation), `mask_cleaning.py` (label-mask cleaning used in training), `report.py` (seed-averaged results from Weights & Biases), `run_fg_benchmark.sh` (SLURM launcher and arrays for the parallel benchmarks and the confirmation), `confirm_top_k.py` + `run_fg_confirm.sh` (multi-seed confirmation of the best benchmark trials, with holdout evaluation), `run_fg_data_sources.sh` (data-source sweep and confirmation of the top sources, with the best benchmark configuration of a model).
 
 ## Experiment tracking (Weights & Biases)
 
@@ -155,7 +155,7 @@ python confirm_top_k.py aggregate --group confirm_manual --out reports/confirm_m
 
 The studies in `CONFIRM_STUDIES` are separated by spaces and must not be quoted separately, because `run_fg_confirm.sh` expands the variable unquoted. Always run `select` first: it prints the selected trials and the exact `train.py` commands and writes `confirm_plan.json` to `experiment_manifests/<group>/`, without training. `run --index N` trains the N-th planned run (ranked trial-major: index = selection position × n_seeds + seed position); every SLURM task derives the same selection from the finished studies, so the tasks agree. An array larger than the plan is harmless: the extra tasks print "nothing to do" and exit. Options: `--top-k`, `--stratify-by`, `--seeds`, `--group`, `--wandb-project`, `--output-dir`. For a study created before trial configs were stored, the config is rebuilt from the trial's parameters using `--epochs/--patience/--batch-size/--data-dir/--holdout-dir/--split-seed`, which must match the benchmark's values.
 
-After choosing a winner, the checkpoints of its runs are listed in the `.runs.csv` for later work. Run `mask_sweep.py` (section 7) on a selected checkpoint.
+After choosing a winner, the checkpoints of its runs are listed in the `.runs.csv` for later work.
 
 **Holdout protection:** `experiments.py` adds `--skip_test_eval` to every generated training command (except the confirmation of the top data sources, section 2), and `train.py` supports that flag. This keeps the holdout untouched during tuning and ablations. The same applies to the loss, hardness, temporal and augmentation suites: if you want holdout numbers for their final choices, run the chosen configuration once per seed with `--skip_test_eval` off, as the confirmation step does. The Bayesian objective is validation AP, never holdout performance.
 
@@ -306,3 +306,32 @@ All non-benchmark suites accept:
 The benchmark accepts `--trials`, `--startup-trials`, `--models`, `--seed`, `--study-name`, `--storage-path`, `--worker-id`, `--output-dir`, `--epochs`, `--patience`, `--batch-size`, `--data-dir`, `--holdout-dir`, `--split-seed`, `--loss-type` and the W&B flags. It ignores `--learning-rate`, `--weight-decay` and `--model-opt` because those are searched, and it uses its own per-trial W&B group (the study name) instead of `--group`.
 
 `train.py` accepts `--skip_test_eval` to defer holdout evaluation, `--model_opt KEY=VAL ...` for architecture options, and `--loss_opt KEY=VAL ...` for loss parameters. Defaults for model options live in `train.py`; loss defaults live in `losses/config.py`. Models may ignore options that do not apply to them.
+
+## 7. Mask cleaning during training (`maskclean` suite)
+
+Trains on **cleaned training labels** with one fixed configuration (pass the best TSViT `--learning-rate`, `--weight-decay`, `--model-opt`, `--loss`), 3 seeds per run, to see how much label noise removal helps and how the model behaves on masks closer to a human annotation. Cleaning lives in `mask_cleaning.py` and is applied in `datasets.py` on the full tile before crop and augmentation.
+
+```bash
+python experiments.py maskclean --model tsvit --seeds 0 1 2 --loss-type soft --group maskclean_tsvit \
+  --learning-rate ... --weight-decay ... --model-opt ... --dry-run
+python experiments.py maskclean --mask-stage singles ...    # first the single methods; later --mask-stage combos
+```
+
+| Experiment | `train.py` flag | Values |
+|---|---|---|
+| Baseline | none | original masks |
+| Small-component removal | `--min_gain_px N` | 2, 5, 10, 25 px |
+| Hole filling | `--fill_holes_px N` | 2, 5, 10, 25 px |
+| Confidence filtering | `--conf_filter T` | 0.50-0.90, step 0.05 |
+| Confidence hardening | `--conf_harden T` | 0.50-0.90, step 0.05 |
+| Combinations (`--mask-stage combos`) | several of the above | morphology pairs (`--combo-morph`, default 5,5 and 10,10) alone and with filter / harden at `--combo-confs` (default 0.6, 0.7, 0.8) |
+
+Size 1 is a no-op (equal to the baseline) and is skipped (`--mask-keep-noop` runs it). With `--loss-type soft` the defaults give 41 configurations (123 runs with 3 seeds); with the hard loss the 9 hardening configurations and the harden combinations are skipped, because the hard loss only uses the binary mask and hardening would equal filtering.
+
+**Order and semantics.** Confidence step, then removal, then filling. Filtering/hardening ignore (valid=0) gain pixels whose confidence is below T; true zeros stay valid negatives. Hardening additionally sets retained gain weights to 1. Removal drops 8-connected patches smaller than N px; filling fills 4-connected holes smaller than N px that do not touch the tile border and contain only valid pixels. Hardening needs binary weights, so `--mask-label-sigma` (default 0) fixes label jitter for every maskclean run; this keeps variants matched.
+
+**Configuration.** Like the temporal and losses suites, the suite reads the model's best confirmed configuration (learning rate, weight decay, loss, `model_opt`) from `experiment_manifests/confirmed_configs.json` (`--model`, default `tsvit`), and falls back to `train.py` defaults with a warning if the file is missing. `--learning-rate`, `--weight-decay`, `--loss` and `--model-opt` are ignored by this suite.
+
+**Comparability.** Cleaning is applied to training labels only. Early stopping and `val_ap` use the raw validation masks for every variant, so all variants are selected on the same target; `--mask-clean-val` (`--clean_val`) cleans them too. This is a change from the earlier `--min_gain_px` behaviour, which cleaned validation as well. The holdout stays raw and untouched during the sweep (`--skip_test_eval`).
+
+**Raw and cleaned metrics side by side.** After training, `train.py` scores the best checkpoint on the validation tiles twice and logs both to W&B: `val_eval_*` (raw labels, every maskclean run including the baseline) and `val_eval_clean_*` (the cleaned labels of that variant). When the holdout is evaluated (confirmation runs) the same pair is logged as `test_*` and `test_clean_*`. Raw metrics are the comparable ones across variants. Cleaned metrics are scored on a different target per variant, so they show how well each model fits its own cleaned labels, not which variant is better. `eval.py` (`evaluate_checkpoint`, also its CLI) accepts `--min_gain_px --fill_holes_px --conf_filter --conf_harden` and a `tile_dirs` list for this.

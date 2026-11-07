@@ -11,6 +11,7 @@ python experiments.py data-sources --model tsvit --seeds 0 --loss bce_focal_tver
 python experiments.py losses --model tsvit --execute --max-runs 12
 python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
+python experiments.py maskclean --model tsvit --seeds 0 1 2 --loss-type soft --dry-run
 
 Suites
   benchmark     lr / weight decay / size search, S1+S2 (Optuna TPE; parallel workers can share one study)
@@ -22,6 +23,9 @@ Suites
   hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
   augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
+  maskclean     training-label cleaning (small-component removal, hole filling, confidence filtering / hardening)
+                and combinations of them, with the model's confirmed configuration; see mask_cleaning.py.
+                --mask-stage singles|combos|all
 --seeds repeats every run per seed (seeds are the outer loop, so --max-runs still covers every config).
 --model-opt passes architecture options to every run of data-sources, losses, hardness and augmentation (the temporal
 suite compares several models, so it does not use it).
@@ -46,6 +50,8 @@ import sys
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+
+from mask_cleaning import describe as describe_mask
 
 YEAR_SETS = (  # frame subsets for the temporal suite; "all" = the whole sequence (config.YEARS)
     (2017, 2024),
@@ -672,6 +678,80 @@ def augmentation(args: argparse.Namespace) -> list[dict]:
     return rows
 
 
+def maskclean(args: argparse.Namespace) -> list[dict]:
+    """Train on cleaned labels with the model's confirmed configuration (experiment_manifests/confirmed_configs.json,
+    as in the temporal suite; train.py defaults if there is none). Model, sources, loss, lr, wd are fixed.
+
+    Cleaning is applied by datasets.py to the TRAINING labels via mask_cleaning.clean_labels (order: confidence
+    step, small-component removal, hole filling). Early stopping and ``val_ap`` use the RAW validation masks, so every
+    variant is selected on the same target and stays comparable (--mask-clean-val cleans them too). After training,
+    train.py scores the best checkpoint on the validation tiles with raw labels (``val_eval_*``) and with the cleaned
+    labels of the same variant (``val_eval_clean_*``), and the same for the holdout when it is evaluated
+    (``test_*`` / ``test_clean_*``).
+    Size-1 morphology is a no-op (identical to the baseline) and is skipped unless --mask-keep-noop is given.
+    """
+    cfg = load_confirmed_configs().get(args.model)
+    if cfg is None:
+        print(
+            f"WARNING: no confirmed configuration for {args.model}; using train.py defaults.",
+            file=sys.stderr,
+        )
+        tuned = {}
+    else:
+        tuned = {
+            "learning_rate": cfg["learning_rate"],
+            "weight_decay": cfg["weight_decay"],
+            "loss_name": cfg["loss_name"],
+            "model_opt": cfg["model_opt"],
+        }
+    sizes = [n for n in args.mask_sizes if n > 1 or args.mask_keep_noop]
+    confs = list(args.mask_confs)
+    soft = args.loss_type == "soft"
+    if not soft:
+        print(
+            "WARNING: --loss-type is not 'soft', so hardening equals filtering (the hard loss only uses the binary "
+            "mask); harden runs are skipped. Use --loss-type soft to include them.",
+            file=sys.stderr,
+        )
+
+    def r(conf=None, harden=None, rm=0, fill=0):
+        extra = {}
+        if conf is not None:
+            extra["conf_filter"] = conf
+        if harden is not None:
+            extra["conf_harden"] = harden
+        if rm:
+            extra["min_gain_px"] = rm
+        if fill:
+            extra["fill_holes_px"] = fill
+        return (
+            _base(args, args.model, tuple(args.sources))
+            | tuned
+            | {"variant": describe_mask(conf, harden, rm, fill)}
+            # same label jitter for every variant (harden needs binary labels), soft loss only
+            | ({"label_sigma": args.mask_label_sigma} if soft else {})
+            | ({"clean_val": True} if args.mask_clean_val and extra else {})
+            | extra
+        )
+
+    rows = []
+    if args.mask_stage in ("singles", "all"):
+        rows.append(r())  # baseline: original masks
+        rows += [r(rm=n) for n in sizes]
+        rows += [r(fill=n) for n in sizes]
+        rows += [r(conf=c) for c in confs]
+        rows += [r(harden=c) for c in confs if soft]
+    if args.mask_stage in ("combos", "all"):
+        pairs = args.combo_morph  # (remove, fill) pairs
+        rows += [r(rm=a, fill=b) for a, b in pairs]  # morphology only
+        for c in args.combo_confs:  # confidence step + morphology
+            for a, b in pairs:
+                rows.append(r(conf=c, rm=a, fill=b))
+                if soft:
+                    rows.append(r(harden=c, rm=a, fill=b))
+    return rows
+
+
 def auto_variant(row: dict) -> str:
     """Seed-independent label for a configuration (used when a suite does not set `variant` itself)."""
     parts = [
@@ -708,6 +788,7 @@ SUITES = {
     "hardness": hardness,
     "temporal": temporal,
     "augmentation": augmentation,
+    "maskclean": maskclean,
 }
 
 
@@ -854,6 +935,58 @@ def main() -> None:
         default=None,
         help="Hardness suite: override the segmentation-head module the hardness branch mirrors "
         "(default per model: see HARDNESS_LAYERS).",
+    )
+    p.add_argument(
+        "--mask-stage",
+        choices=("singles", "combos", "all"),
+        default="all",
+        help="Maskclean suite: single-method runs, combined runs, or both (default all).",
+    )
+    p.add_argument(
+        "--mask-sizes",
+        type=int,
+        nargs="+",
+        default=[1, 2, 5, 10, 25],
+        help="Maskclean suite: sizes (px) for small-component removal and hole filling.",
+    )
+    p.add_argument(
+        "--mask-confs",
+        type=float,
+        nargs="+",
+        default=[round(0.5 + 0.05 * i, 2) for i in range(9)],
+        help="Maskclean suite: confidence thresholds for filtering and hardening (default 0.50-0.90, step 0.05).",
+    )
+    p.add_argument(
+        "--mask-keep-noop",
+        action="store_true",
+        help="Maskclean suite: also run size 1 (a no-op, identical to the baseline).",
+    )
+    p.add_argument(
+        "--mask-clean-val",
+        action="store_true",
+        help="Maskclean suite: also clean the validation labels (--clean_val). Default: raw validation labels.",
+    )
+    p.add_argument(
+        "--mask-label-sigma",
+        type=float,
+        default=0.0,
+        help="Maskclean suite, soft loss: label jitter for every run (0 keeps hardened labels binary and the "
+        "variants matched; train.py's soft default is 0.1).",
+    )
+    p.add_argument(
+        "--combo-confs",
+        type=float,
+        nargs="+",
+        default=[0.6, 0.7, 0.8],
+        help="Maskclean combos: confidence thresholds combined with morphology (filter and harden).",
+    )
+    p.add_argument(
+        "--combo-morph",
+        nargs="+",
+        type=lambda s: tuple(int(v) for v in s.split(",")),
+        default=[(5, 5), (10, 10)],
+        metavar="REMOVE,FILL",
+        help="Maskclean combos: (remove, fill) size pairs, e.g. 5,5 10,10.",
     )
     args = p.parse_args()
     # Confirmation runs (and only those) evaluate the holdout tiles; every other suite keeps it untouched.

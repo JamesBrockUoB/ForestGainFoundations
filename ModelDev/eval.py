@@ -30,22 +30,33 @@ def evaluate_checkpoint(
     num_workers: int = 2,
     min_gain_px: int = 0,
     fill_holes_px: int = 0,
+    conf_filter: float | None = None,
+    conf_harden: float | None = None,
+    tile_dirs=None,
 ):
-    """min_gain_px / fill_holes_px clean the test LABELS the same way as in training
-    (0 = raw labels). Keep them fixed across runs if you want comparable numbers.
+    """min_gain_px / fill_holes_px / conf_filter / conf_harden clean the evaluated LABELS the same way as in training
+    (defaults = raw labels). Keep them fixed across runs if you want comparable numbers.
+
+    tile_dirs: evaluate exactly these tile directories (e.g. the validation split) instead of every tile_* folder of
+    test_dir.
 
     If the checkpoint was trained with the soft loss, the main metrics use the gain confidences as pixel weights (see
     metrics.py); the plain binary numbers are returned as well, prefixed bin_ (comparable with hard-loss runs).
     """
-    test_dir = Path(test_dir)
-    test_dirs = sorted(
-        p for p in test_dir.iterdir() if p.is_dir() and p.name.startswith("tile_")
-    )
+    if tile_dirs is not None:
+        test_dirs = sorted(Path(p) for p in tile_dirs)
+        where = "given tile list"
+    else:
+        test_dir = Path(test_dir)
+        test_dirs = sorted(
+            p for p in test_dir.iterdir() if p.is_dir() and p.name.startswith("tile_")
+        )
+        where = str(test_dir)
 
     if not test_dirs:
-        raise ValueError(f"No tile_* directories found in {test_dir}")
+        raise ValueError(f"No tile_* directories found in {where}")
 
-    print(f"Evaluating {len(test_dirs)} tiles from {test_dir}")
+    print(f"Evaluating {len(test_dirs)} tiles from {where}")
 
     device = get_device()
 
@@ -60,7 +71,10 @@ def evaluate_checkpoint(
     sources = _checkpoint_sources(task)
     print(f"sources: {sources} | years: {_checkpoint_years(task) or 'all'}")
 
-    print(f"label cleaning: min_gain_px={min_gain_px} fill_holes_px={fill_holes_px}")
+    print(
+        f"label cleaning: min_gain_px={min_gain_px} fill_holes_px={fill_holes_px} "
+        f"conf_filter={conf_filter} conf_harden={conf_harden}"
+    )
     test_ds = MultiTemporalGainDataset(
         test_dirs,
         sources=sources,
@@ -68,6 +82,8 @@ def evaluate_checkpoint(
         crop_size=crop_size,
         min_gain_px=min_gain_px,
         fill_holes_px=fill_holes_px,
+        conf_filter=conf_filter,
+        conf_harden=conf_harden,
     )
     test_loader = DataLoader(
         test_ds,
@@ -176,6 +192,8 @@ if __name__ == "__main__":
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--min_gain_px", type=int, default=0)
     p.add_argument("--fill_holes_px", type=int, default=0)
+    p.add_argument("--conf_filter", type=float, default=None)
+    p.add_argument("--conf_harden", type=float, default=None)
     a = p.parse_args()
     evaluate_checkpoint(
         a.checkpoint,
@@ -183,4 +201,6 @@ if __name__ == "__main__":
         threshold=a.threshold,
         min_gain_px=a.min_gain_px,
         fill_holes_px=a.fill_holes_px,
+        conf_filter=a.conf_filter,
+        conf_harden=a.conf_harden,
     )

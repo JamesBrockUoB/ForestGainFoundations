@@ -17,7 +17,7 @@ from config import (
     VALID_MASK_BAND_INDEX,
     YEARS,
 )
-from scipy import ndimage
+from mask_cleaning import clean_labels
 from torch.utils.data import Dataset
 
 
@@ -29,36 +29,15 @@ def split_tile_dirs(data_dir, val_frac=0.2, seed=0):
 
 
 def clean_gain_mask(gain_mask, gain_weight, min_px=0, fill_px=0):
-    """Tidy a binary gain label.
-
-    1. Remove gain patches smaller than min_px pixels (salt). Patches are
-       8-connected, so diagonal neighbours count as one patch.
-    2. Fill background holes smaller than fill_px pixels (pepper). Holes are
-       4-connected, so a diagonal gap does not count as a hole.
-    Removing runs first, so a hole is never filled between patches that were
-    about to be dropped. Filled pixels get the mean confidence of the tile's
-    kept gain pixels (only matters for the soft loss). 0 disables a step.
-    Returns new (gain_mask, gain_weight); inputs are not modified."""
-    mask = gain_mask > 0.5
-    weight = gain_weight.copy()
-
-    if min_px > 1 and mask.any():
-        lab, _ = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
-        small = np.bincount(lab.ravel()) < min_px
-        small[0] = False
-        mask = mask & ~small[lab]
-
-    if fill_px > 1 and mask.any():
-        lab, _ = ndimage.label(~mask)  # default 4-connectivity
-        small = np.bincount(lab.ravel()) < fill_px
-        small[0] = False  # label 0 is the gain itself
-        holes = small[lab]
-        if holes.any():
-            weight[holes] = float(weight[mask].mean())
-            mask = mask | holes
-
-    weight = np.where(mask, weight, 0.0).astype(np.float32)
-    return mask.astype(np.float32), weight
+    """Backwards-compatible wrapper (no confidence step, every pixel valid). See mask_cleaning.clean_labels."""
+    mask, weight, _ = clean_labels(
+        gain_mask,
+        gain_weight,
+        np.ones(gain_mask.shape, dtype=bool),
+        min_px=min_px,
+        fill_px=fill_px,
+    )
+    return mask, weight
 
 
 def read_physical(path: Path, band_names, mask_nodata: bool = False) -> np.ndarray:
@@ -112,6 +91,8 @@ class MultiTemporalGainDataset(Dataset):
         geo_aug: bool = True,
         min_gain_px: int = 0,
         fill_holes_px: int = 0,
+        conf_filter: float | None = None,
+        conf_harden: float | None = None,
         years: tuple[int, ...] | None = None,
     ):
         """
@@ -125,8 +106,15 @@ class MultiTemporalGainDataset(Dataset):
         geo_aug: random 90-degree rotation + flip (only used when augment=True).
         min_gain_px: drop gain patches smaller than this many pixels (0 = off).
         fill_holes_px: fill holes smaller than this many pixels inside gain (0 = off).
-        Both run on the full tile before any crop or augmentation.
+        conf_filter: ignore gain pixels whose confidence (0-1) is below this in loss and metrics (valid=0).
+        conf_harden: like conf_filter, and retained gain pixels get weight 1.0 (matters for the soft loss only).
+        All cleaning runs on the full tile (confidence step, then removal, then filling), before crop/augmentation.
         """
+        if conf_filter is not None and conf_harden is not None:
+            raise ValueError("conf_filter and conf_harden are mutually exclusive")
+        for t in (conf_filter, conf_harden):
+            if t is not None and not 0.0 < t <= 1.0:
+                raise ValueError(f"confidence thresholds must be in (0, 1], got {t}")
         sources = tuple(sources)
         if not sources:
             raise ValueError("At least one source must be selected")
@@ -152,6 +140,8 @@ class MultiTemporalGainDataset(Dataset):
         self.geo_aug = geo_aug
         self.min_gain_px = min_gain_px
         self.fill_holes_px = fill_holes_px
+        self.conf_filter = conf_filter
+        self.conf_harden = conf_harden
 
         self.band_names = tuple(band for s in sources for band in SOURCES[s][1])
 
@@ -265,10 +255,22 @@ class MultiTemporalGainDataset(Dataset):
 
         gain_mask = (confidence > 0).astype(np.float32)
         gain_weight = np.clip(confidence / 100.0, 0.0, 1.0).astype(np.float32)
-        if self.min_gain_px > 1 or self.fill_holes_px > 1:
-            gain_mask, gain_weight = clean_gain_mask(
-                gain_mask, gain_weight, self.min_gain_px, self.fill_holes_px
+        if (
+            self.min_gain_px > 1
+            or self.fill_holes_px > 1
+            or self.conf_filter is not None
+            or self.conf_harden is not None
+        ):
+            gain_mask, gain_weight, valid = clean_labels(
+                gain_mask,
+                gain_weight,
+                combined_valid > 0.5,
+                conf_filter=self.conf_filter,
+                conf_harden=self.conf_harden,
+                min_px=self.min_gain_px,
+                fill_px=self.fill_holes_px,
             )
+            combined_valid = valid.astype(np.float32)
 
         pixels, gain_mask, gain_weight, combined_valid = self._crop(
             [pixels, gain_mask, gain_weight, combined_valid], train=self.augment
