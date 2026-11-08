@@ -488,9 +488,9 @@ def train(args):
         if v
     }
 
-    # Validation tiles, best checkpoint: raw labels (val_eval_*) next to the cleaned labels of this variant
-    # (val_eval_clean_*), for comparison. val_ap itself (early stopping) uses the labels the validation loader had.
-    if best and (cleaning or args.suite == "maskclean"):
+    # Validation tiles, best checkpoint, with the same metrics as the holdout: raw labels (val_eval_*), logged for
+    # cleaning runs and confirmation runs, next to the cleaned labels of this variant (val_eval_clean_*). val_ap itself (early stopping) uses the labels the validation loader had.
+    if best and (cleaning or args.suite == "maskclean" or not args.skip_test_eval):
         print("--- validation tiles, raw labels ---")
         raw = evaluate_checkpoint(
             best, test_dir=None, tile_dirs=val_dirs, crop_size=None

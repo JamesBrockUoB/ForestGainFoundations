@@ -242,7 +242,7 @@ def cmd_aggregate(args) -> None:
             for k, v in summary.items()
             if isinstance(v, (int, float))
             and not isinstance(v, bool)
-            and (k == "val_ap" or k.startswith("test_"))
+            and (k == "val_ap" or k.startswith(("test_", "val_eval_")))
         }
         # train.py logs the best-epoch validation AP as the summary key "val_ap.max".
         if isinstance(summary.get("val_ap.max"), (int, float)):
@@ -258,8 +258,10 @@ def cmd_aggregate(args) -> None:
                 **metrics,
             }
         )
-    keys = ["val_ap"] + sorted(
-        {k for rec in records for k in rec if k.startswith("test_")}
+    keys = (
+        ["val_ap"]
+        + sorted({k for rec in records for k in rec if k.startswith("val_eval_")})
+        + sorted({k for rec in records for k in rec if k.startswith("test_")})
     )
 
     by_variant: dict[str, list[dict]] = {}
