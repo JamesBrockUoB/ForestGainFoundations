@@ -23,7 +23,8 @@ Modes
 select     print the selected trials and write the planned runs (add --execute to train them serially, for local use)
 run        train ONE planned run, picked by --index (SLURM array task id); index 0 also writes the plan manifest
 aggregate  read the finished runs from Weights & Biases: mean +/- std over seeds of val_ap and every test_* metric,
-           ranked overall, plus the best configuration of every architecture
+           ranked overall, plus the best configuration of every architecture. Also writes confirmed_configs.json
+           (best variant per model) unless --no-confirmed-config is given: pass it for non-benchmark groups.
 
 Examples
 --------
@@ -44,148 +45,27 @@ import csv
 import json
 import statistics
 import subprocess
-import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NamedTuple
 
-from experiments import (
-    BENCHMARK_LOSS,
-    BENCHMARK_MODELS,
-    _base,
-    _make_storage,
-    _suggest_benchmark_trial,
+from experiments import (  # the selection / plan logic lives in experiments.py (benchmark --confirm)
+    candidates,
     command,
+    confirm_group,
+    confirm_row,
+    select_top,
 )
-
-# Short names accepted by --stratify-by for config / param keys.
-STRATIFY_ALIASES = {"loss": "loss_name"}
-
-
-class Cand(NamedTuple):
-    model: str
-    study: str
-    trial: object  # optuna FrozenTrial
-
-
-def parse_studies(specs) -> list[tuple[str, str, str]]:
-    out = []
-    for spec in specs:
-        parts = spec.split(",", 2)
-        if len(parts) != 3 or parts[0] not in BENCHMARK_MODELS:
-            raise SystemExit(
-                f"--studies entry '{spec}' must look like MODEL,STUDY_NAME,JOURNAL_PATH "
-                f"with MODEL in {BENCHMARK_MODELS}"
-            )
-        out.append((parts[0], parts[1], parts[2]))
-    return out
 
 
 def group_name(args) -> str:
-    return args.group or "confirm_" + "__".join(
-        name for _, name, _ in parse_studies(args.studies)
-    )
-
-
-def candidates(args) -> list[Cand]:
-    """All completed trials of all studies, best validation AP first.
-
-    Deterministic (ties by model, study, trial number), so every SLURM array task derives the same selection.
-    """
-    import optuna
-
-    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    cands: list[Cand] = []
-    for model, name, path in parse_studies(args.studies):
-        study = optuna.load_study(study_name=name, storage=_make_storage(path))
-        done = [
-            t
-            for t in study.get_trials(
-                deepcopy=False, states=[optuna.trial.TrialState.COMPLETE]
-            )
-            if t.value is not None
-        ]
-        print(f"study {name}: {len(done)} completed trials", flush=True)
-        cands += [Cand(model, name, t) for t in done]
-    cands.sort(key=lambda c: (-c.trial.value, c.model, c.study, c.trial.number))
-    return cands
-
-
-def stratum_of(c: Cand, key: str) -> str:
-    """Which pool a trial competes in for top-k selection."""
-    if key == "none":
-        return "all"
-    if key == "model":
-        return c.model
-    name = STRATIFY_ALIASES.get(key, key)
-    cfg = c.trial.user_attrs.get("config") or {}
-    if name in cfg:
-        return str(cfg[name])
-    if name in c.trial.params:
-        return str(c.trial.params[name])
-    return "unknown"
-
-
-def select_top(cands: list[Cand], top_k: int, stratify_by: str):
-    """Top-k per stratum as [(stratum, Cand)], strata in sorted order, each best first.
-
-    The order is deterministic: run index = position in this list * n_seeds + seed position.
-    """
-    strata: dict[str, list[Cand]] = {}
-    for c in cands:  # cands is sorted best first, so each stratum is too
-        strata.setdefault(stratum_of(c, stratify_by), []).append(c)
-    top = []
-    for s in sorted(strata):
-        top += [(s, c) for c in strata[s][:top_k]]
-    return top
-
-
-def variant_label(c: Cand, args) -> str:
-    """confirm-<model>-trialNN; uses the study name instead if one model has several studies (e.g. a loss search)."""
-    models = [m for m, _, _ in parse_studies(args.studies)]
-    key = c.model if len(set(models)) == len(models) else c.study
-    return f"confirm-{key}-trial{c.trial.number + 1:02d}"
-
-
-def confirm_row(c: Cand, args, seed: int) -> dict:
-    """Training config of a stored trial, re-labelled for confirmation and with holdout evaluation switched on."""
-    import optuna
-
-    model, trial = c.model, c.trial
-    cfg = trial.user_attrs.get("config")
-    if cfg is None:
-        # Study created before configs were stored: replay the params through the search-space function.
-        ns = argparse.Namespace(
-            epochs=args.epochs,
-            patience=args.patience,
-            batch_size=args.batch_size,
-            data_dir=args.data_dir,
-            holdout_dir=args.holdout_dir,
-            split_seed=args.split_seed,
-            suite="confirm",
-            group=group_name(args),
-            wandb_project=args.wandb_project,
-            loss_type=None,
-        )
-        cfg = (
-            _base(ns, model, ("s1", "s2"))
-            | _suggest_benchmark_trial(optuna.trial.FixedTrial(trial.params), model)
-            | {"loss_name": BENCHMARK_LOSS}
-        )
-    return dict(cfg) | {
-        "seed": seed,
-        "suite": "confirm",
-        "wandb_group": group_name(args),
-        "wandb_tags": ["confirm", model],
-        "variant": variant_label(c, args),
-        "skip_test_eval": False,  # evaluate the best checkpoint on the holdout tiles
-    }
+    return confirm_group(args)
 
 
 def build_plan(args):
     top = select_top(candidates(args), args.top_k, args.stratify_by)
-    rows = [confirm_row(c, args, seed) for _, c in top for seed in args.seeds]
+    rows = [
+        confirm_row(c, args) | {"seed": seed} for _, c in top for seed in args.seeds
+    ]
     return top, rows
 
 
@@ -407,12 +287,15 @@ def cmd_aggregate(args) -> None:
     for v in ranked:
         best_per_model.setdefault(by_variant[v][0].get("model") or "", v)
 
-    write_confirmed_configs(
-        best_per_model,
-        by_variant,
-        runs,
-        group,
-    )
+    if args.no_confirmed_config:
+        print("Not updating confirmed_configs.json (--no-confirmed-config).")
+    else:
+        write_confirmed_configs(
+            best_per_model,
+            by_variant,
+            runs,
+            group,
+        )
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -555,6 +438,12 @@ def main() -> None:
     agg.add_argument("--wandb-project", default="Forest-Gain-CD")
     agg.add_argument("--wandb-entity", default=None)
     agg.add_argument("--out", default="reports/confirm")
+    agg.add_argument(
+        "--no-confirmed-config",
+        action="store_true",
+        help="Do not overwrite experiment_manifests/confirmed_configs.json with the best variant per model. Use for "
+        "groups that are not the benchmark confirmation (data-source or loss confirmation).",
+    )
 
     args = p.parse_args()
     {"select": cmd_select, "run": cmd_run, "aggregate": cmd_aggregate}[args.mode](args)

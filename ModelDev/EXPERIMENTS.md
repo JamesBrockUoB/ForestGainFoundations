@@ -241,6 +241,39 @@ Parameter exploration includes:
 
 The suite uses one fixed model, source set, data split, and unspecified training defaults. Pass the best benchmark configuration with `--learning-rate`, `--weight-decay` and `--model-opt` (as for the data-source ablation) so that the architecture is not left at `train.py`'s defaults. It is a structured comparison, not a full Bayesian optimisation of every loss parameter. Use multiple seeds for shortlisted loss configurations.
 
+### Investigating the sweep and confirming the best of each loss
+
+```bash
+# 1. aggregate the sweep over seeds (validation AP only), baseline = plain BCE
+python report.py --group losses_tsvit_<sweep job id> --baseline tsvit_s1+s2_bce --out reports/losses_tsvit
+
+# 2. preview the best configuration per loss family, then the exact confirmation commands
+python experiments.py losses --model tsvit --confirm-from losses_tsvit_<sweep job id> --seeds 0 1 2 --dry-run
+
+# 3. confirm on SLURM: one task per (family, seed), holdout evaluated
+SUITE=losses SWEEP_GROUP=losses_tsvit_<sweep job id> sbatch run_fg_confirm_suite.sh
+python confirm_top_k.py aggregate --group losses-confirm_tsvit_<confirm job id> --out reports/losses_confirm_tsvit --no-confirmed-config
+```
+
+See "Confirmation and holdout" below for how this generalises to the other suites. A loss family is (loss, reweight): bce, dice, focal_tversky, bce_focal_tversky, focal, lovasz, bce_lovasz, and bce / bce_focal_tversky / focal with OHEM (10 families, so 30 tasks with 3 seeds). `--confirm-from` ranks every configuration in the sweep group by mean validation AP over its seeds (finished runs only), prints the full table per family with the selected one marked `*`, and retrains the winner with `--skip_test_eval` off, copying learning rate, weight decay, architecture and every loss option from the sweep run's own W&B config. Use `--confirm-top-k 2` to confirm the two best per family.
+
+Reading the sweep: treat differences smaller than the seed spread (about 0.005 validation AP for TSViT, more for several losses) as ties; check whether a family's best setting sits on the edge of its grid (e.g. Tversky alpha 0.7, gamma 2.0, OHEM threshold 0.9), in which case widen the grid and re-run that family; and compare families by their confirmed holdout numbers, not the sweep's best-of-many validation AP. AP is threshold-free, while precision, recall, F1 and IoU depend on the 0.5 threshold, which Tversky/Lovasz-type losses shift, so read the `test_*` threshold metrics alongside AP. Confirming with the sweep's seeds mostly replicates the sweep (same initialisation and sample order); pass other seeds (`SEEDS="3 4 5"`) for an independent estimate. As in section 1, choose on validation AP and report the holdout numbers without using them to choose.
+
+`aggregate` also writes `confirmed_configs.json` (best variant per model) unless `--no-confirmed-config` is given; use the flag for every group except the benchmark confirmation, otherwise it overwrites the confirmed TSViT entry with the best loss / data-source variant and drops `loss_opt` / `reweight`.
+
+### Confirmation and holdout (all suites)
+
+The holdout is only evaluated by confirmation runs, or by runs started with `--eval-holdout`:
+
+| Suite | Holdout | How |
+|---|---|---|
+| benchmark (Optuna search) | confirm best trials | `experiments.py benchmark --confirm --studies MODEL,STUDY,JOURNAL ... --top-k K --stratify-by model --seeds 0 1 2` (`--confirm-index N` for one array task) |
+| losses, hardness, maskclean | confirm best of each family | `experiments.py <suite> --confirm-from SWEEP_GROUP [--confirm-top-k K] [--confirm-index N]`; SLURM: `SUITE=<suite> SWEEP_GROUP=... sbatch run_fg_confirm_suite.sh` |
+| data-sources | confirm the top sources, or log for all | `--top-sources-from SWEEP_GROUP --top-k K`, or `--eval-holdout` on the sweep |
+| temporal, augmentation | log for every run (pure comparison) | `--eval-holdout` |
+
+Families: losses and hardness group by (loss, reweight), maskclean by cleaning method (baseline, rm, fill, conf, harden and their combinations). Whatever the route, choose configurations on validation AP and report holdout numbers next to it. `confirm_top_k.py` keeps its `select` / `run` / `aggregate` commands (the selection logic now lives in `experiments.py`), so `run_fg_confirm.sh` and the benchmark launcher keep working unchanged.
+
 ## 4. Pixel hardness
 
 ```bash

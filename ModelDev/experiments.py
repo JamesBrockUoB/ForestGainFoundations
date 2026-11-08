@@ -12,6 +12,8 @@ python experiments.py losses --model tsvit --execute --max-runs 12
 python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
 python experiments.py maskclean --model tsvit --seeds 0 1 2 --loss-type soft --dry-run
+python experiments.py losses --model tsvit --confirm-from losses_tsvit_<job id> --seeds 0 1 2 --dry-run
+python experiments.py benchmark --confirm --studies tsvit,forestgain_tsvit_1,j1.log --top-k 3 --seeds 0 1 2 --dry-run
 
 Suites
   benchmark     lr / weight decay / size search, S1+S2 (Optuna TPE; parallel workers can share one study)
@@ -30,7 +32,17 @@ Suites
 --model-opt passes architecture options to every run of data-sources, losses, hardness and augmentation (the temporal
 suite compares several models, so it does not use it).
 
-After a benchmark, confirm_top_k.py retrains the best trials over several seeds with holdout evaluation.
+Confirmation and holdout
+  Suites that sweep hyperparameter values select on validation AP, so their best configuration is retrained with
+  holdout evaluation (the holdout stays untouched during the sweep):
+    losses / hardness / maskclean   --confirm-from SWEEP_GROUP [--confirm-top-k K] [--confirm-index N]
+                                    best configuration of every family (e.g. loss + reweight) of a finished sweep
+    benchmark                       benchmark --confirm --studies MODEL,STUDY,JOURNAL ... [--top-k K --stratify-by model]
+                                    [--confirm-index N]   best Optuna trials, retrained over --seeds
+    data-sources                    --top-sources-from SWEEP_GROUP --top-k K
+  Suites that only compare settings (data-sources, temporal, augmentation) can log the holdout for every run with
+  --eval-holdout. Choose configurations on validation AP; report holdout numbers next to it. confirm_top_k.py
+  keeps the same select / run / aggregate commands (aggregate reads any W&B group).
 
 Every run is labelled for Weights & Biases: --wandb_group = one launch (suite + timestamp, or --group), --variant = the
 seed-independent configuration label, --wandb_tags = suite / model. Aggregate over seeds with report.py.
@@ -50,6 +62,7 @@ import sys
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from mask_cleaning import describe as describe_mask
 
@@ -425,6 +438,285 @@ def top_source_sets(args: argparse.Namespace) -> list[tuple[str, ...]]:
             f"  {'+'.join(s):<34} n={len(by_set[s])}  val_ap={statistics.fmean(by_set[s]):.4f}"
         )
     return ranked[: args.top_k]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Confirmation: retrain the best configuration of each family WITH holdout evaluation.
+#
+# Suites that sweep hyperparameter values (losses, hardness, maskclean, and the Optuna benchmark) select on validation
+# AP, so their best configuration is partly the luckiest; they are confirmed by retraining the best of each family and
+# scoring it on the holdout (--confirm-from GROUP; benchmark: --confirm --studies ...). Pure comparisons (data-sources,
+# temporal, augmentation) do not select anything, so they log the holdout for every run directly (--eval-holdout).
+# Holdout numbers are reported next to validation AP and must not be used to choose between configurations.
+# ---------------------------------------------------------------------------------------------------------------------
+
+# train.py arguments copied from the sweep's W&B run config into the confirmation command (exactly what the run used).
+CONFIRM_TRAIN_KEYS = (
+    "model_type", "sources", "years", "epochs", "patience", "batch_size", "data_dir", "holdout_dir", "split_seed",
+    "val_frac", "learning_rate", "weight_decay", "warmup_frac", "model_opt", "loss_name", "loss_type", "pos_weight",
+    "reweight", "hl_layer", "loss_opt", "crop_size", "repeats", "no_augment", "no_geo_aug", "gain_sigma",
+    "frame_sigma", "frame_drop_p", "label_sigma", "min_gain_px", "fill_holes_px", "conf_filter", "conf_harden",
+    "clean_val",
+)  # fmt: skip
+_ZERO_IS_DEFAULT = {"crop_size", "frame_drop_p", "min_gain_px", "fill_holes_px"}
+
+
+def _loss_family(cfg: dict) -> tuple:
+    return (cfg["loss_name"], cfg.get("reweight") or "none")
+
+
+def _mask_family(cfg: dict) -> tuple:
+    names = (
+        ("conf_filter", "conf"),
+        ("conf_harden", "harden"),
+        ("min_gain_px", "rm"),
+        ("fill_holes_px", "fill"),
+    )
+    return ("+".join(n for k, n in names if cfg.get(k)) or "baseline",)
+
+
+# suite -> how its sweep runs are grouped into families (the best configuration of each family is confirmed)
+CONFIRM_FAMILY = {
+    "losses": _loss_family,  # bce, dice, focal_tversky, ..., with / without OHEM
+    "hardness": _loss_family,  # bce / bce_focal_tversky x none | ohem | hardness
+    "maskclean": _mask_family,  # baseline, rm, fill, conf, harden and their combinations
+}
+
+
+def top_wandb_configs(args: argparse.Namespace, family) -> list[tuple]:
+    """Best configuration(s) of every family of a FINISHED sweep, by mean validation AP over its seeds.
+
+    Reads the sweep's W&B group (--confirm-from; finished runs only). The ranking is deterministic (ties by variant
+    name), so every SLURM array task derives the same selection. Returns (variant, mean, std, n, config) tuples.
+    """
+    import statistics
+
+    import wandb
+
+    api = wandb.Api()
+    project = args.wandb_project or "Forest-Gain-CD"
+    by_variant: dict[str, dict] = {}
+    for run in api.runs(
+        f"{api.default_entity}/{project}", filters={"group": args.confirm_from}
+    ):
+        if run.state != "finished":
+            continue
+        summary = dict(run.summary)
+        val = summary.get("val_ap.max", summary.get("val_ap"))
+        cfg = dict(run.config)
+        variant = cfg.get("variant")
+        if val is None or not variant or not cfg.get("loss_name"):
+            continue
+        by_variant.setdefault(variant, {"vals": [], "cfg": cfg})["vals"].append(
+            float(val)
+        )
+    if not by_variant:
+        raise SystemExit(
+            f"No finished runs with a validation AP in W&B group '{args.confirm_from}'."
+        )
+    families: dict[tuple, list] = {}
+    for variant, e in by_variant.items():
+        vals = e["vals"]
+        row = (
+            variant,
+            statistics.fmean(vals),
+            statistics.pstdev(vals) if len(vals) > 1 else 0.0,
+            len(vals),
+            e["cfg"],
+        )
+        families.setdefault(family(e["cfg"]), []).append(row)
+    selected = []
+    print(f"Families in '{args.confirm_from}' (mean validation AP over seeds):")
+    for key in sorted(families):
+        ranked = sorted(families[key], key=lambda r: (-r[1], r[0]))
+        print(f"\n{' / '.join(map(str, key))}  ({len(ranked)} configurations)")
+        for i, (variant, mean, std, n, _) in enumerate(ranked):
+            mark = "*" if i < args.confirm_top_k else " "
+            print(f" {mark} n={n} val_ap={mean:.4f} +/- {std:.4f}  {variant}")
+        selected += ranked[: args.confirm_top_k]
+    return selected
+
+
+def _take_index(rows: list[dict], args: argparse.Namespace) -> list[dict]:
+    """--confirm-index N: only the N-th confirmation run (one per SLURM array task); [] if beyond the plan."""
+    if args.confirm_index is None:
+        return rows
+    if not 0 <= args.confirm_index < len(rows):
+        print(
+            f"--confirm-index {args.confirm_index} is beyond the {len(rows)} planned confirmation runs; nothing to do."
+        )
+        return []
+    return [rows[args.confirm_index]]
+
+
+def wandb_confirm_rows(args: argparse.Namespace) -> list[dict]:
+    """Confirmation runs for a W&B-ranked sweep (losses, hardness, maskclean): the best configuration of each family,
+    rebuilt from the sweep run's own config, with the holdout evaluated (seeds are added by main).
+    """
+    rows = []
+    for variant, _mean, _std, _n, cfg in top_wandb_configs(
+        args, CONFIRM_FAMILY[args.suite]
+    ):
+        row = {
+            k: cfg[k]
+            for k in CONFIRM_TRAIN_KEYS
+            if cfg.get(k) is not None
+            and cfg.get(k) is not False
+            and not (k in _ZERO_IS_DEFAULT and cfg.get(k) == 0)
+        }
+        rows.append(
+            row
+            | {
+                "suite": args.suite,
+                "wandb_group": args.group,
+                "wandb_tags": [args.suite, "confirm", row.get("model_type", "")],
+                "variant": f"confirm-{variant}",
+                "skip_test_eval": False,  # evaluate the best checkpoint on the holdout tiles
+                **({"wandb_project": args.wandb_project} if args.wandb_project else {}),
+            }
+        )
+    return _take_index(rows, args)
+
+
+# ---- benchmark confirmation (Optuna studies), formerly confirm_top_k.py --------------------------------------------
+STRATIFY_ALIASES = {"loss": "loss_name"}
+
+
+class Cand(NamedTuple):
+    model: str
+    study: str
+    trial: object  # optuna FrozenTrial
+
+
+def parse_studies(specs) -> list[tuple[str, str, str]]:
+    out = []
+    for spec in specs:
+        parts = spec.split(",", 2)
+        if len(parts) != 3 or parts[0] not in BENCHMARK_MODELS:
+            raise SystemExit(
+                f"--studies entry '{spec}' must look like MODEL,STUDY_NAME,JOURNAL_PATH "
+                f"with MODEL in {BENCHMARK_MODELS}"
+            )
+        out.append((parts[0], parts[1], parts[2]))
+    return out
+
+
+def confirm_group(args) -> str:
+    return args.group or "confirm_" + "__".join(
+        name for _, name, _ in parse_studies(args.studies)
+    )
+
+
+def candidates(args) -> list[Cand]:
+    """All completed trials of all studies, best validation AP first.
+
+    Deterministic (ties by model, study, trial number), so every SLURM array task derives the same selection.
+    """
+    import optuna
+
+    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    cands: list[Cand] = []
+    for model, name, path in parse_studies(args.studies):
+        study = optuna.load_study(study_name=name, storage=_make_storage(path))
+        done = [
+            t
+            for t in study.get_trials(
+                deepcopy=False, states=[optuna.trial.TrialState.COMPLETE]
+            )
+            if t.value is not None
+        ]
+        print(f"study {name}: {len(done)} completed trials", flush=True)
+        cands += [Cand(model, name, t) for t in done]
+    cands.sort(key=lambda c: (-c.trial.value, c.model, c.study, c.trial.number))
+    return cands
+
+
+def stratum_of(c: Cand, key: str) -> str:
+    """Which pool a trial competes in for top-k selection."""
+    if key == "none":
+        return "all"
+    if key == "model":
+        return c.model
+    name = STRATIFY_ALIASES.get(key, key)
+    cfg = c.trial.user_attrs.get("config") or {}
+    if name in cfg:
+        return str(cfg[name])
+    if name in c.trial.params:
+        return str(c.trial.params[name])
+    return "unknown"
+
+
+def select_top(cands: list[Cand], top_k: int, stratify_by: str):
+    """Top-k per stratum as [(stratum, Cand)], strata in sorted order, each best first."""
+    strata: dict[str, list[Cand]] = {}
+    for c in cands:  # cands is sorted best first, so each stratum is too
+        strata.setdefault(stratum_of(c, stratify_by), []).append(c)
+    top = []
+    for s in sorted(strata):
+        top += [(s, c) for c in strata[s][:top_k]]
+    return top
+
+
+def variant_label(c: Cand, args) -> str:
+    """confirm-<model>-trialNN; uses the study name instead if one model has several studies (e.g. a loss search)."""
+    models = [m for m, _, _ in parse_studies(args.studies)]
+    key = c.model if len(set(models)) == len(models) else c.study
+    return f"confirm-{key}-trial{c.trial.number + 1:02d}"
+
+
+def confirm_row(c: Cand, args) -> dict:
+    """Training config of a stored trial, re-labelled for confirmation and with holdout evaluation switched on."""
+    import optuna
+
+    model, trial = c.model, c.trial
+    cfg = trial.user_attrs.get("config")
+    if cfg is None:
+        # Study created before configs were stored: replay the params through the search-space function.
+        ns = argparse.Namespace(
+            epochs=args.epochs,
+            patience=args.patience,
+            batch_size=args.batch_size,
+            data_dir=args.data_dir,
+            holdout_dir=args.holdout_dir,
+            split_seed=args.split_seed,
+            suite="confirm",
+            group=confirm_group(args),
+            wandb_project=args.wandb_project,
+            loss_type=None,
+        )
+        cfg = (
+            _base(ns, model, ("s1", "s2"))
+            | _suggest_benchmark_trial(optuna.trial.FixedTrial(trial.params), model)
+            | {"loss_name": BENCHMARK_LOSS}
+        )
+    return dict(cfg) | {
+        "suite": "confirm",
+        "wandb_group": confirm_group(args),
+        "wandb_tags": ["confirm", model],
+        "variant": variant_label(c, args),
+        "skip_test_eval": False,  # evaluate the best checkpoint on the holdout tiles
+    }
+
+
+def benchmark_confirm_plan(args):
+    """(top, rows): top-k trials per stratum of the pooled studies and their confirmation rows (seeds added later)."""
+    top = select_top(candidates(args), args.top_k, args.stratify_by)
+    if not top:
+        raise SystemExit("No completed trials in any study yet.")
+    print(
+        f"\nTop {args.top_k} per stratum (stratify-by '{args.stratify_by}'), single-seed validation AP:"
+    )
+    for s, c in top:
+        print(
+            f"  [{s}] {c.model:<10} trial {c.trial.number + 1:>3}  "
+            f"val_ap={c.trial.value:.5f}  {c.trial.params}"
+        )
+    return top, [confirm_row(c, args) for _, c in top]
+
+
+def benchmark_confirm_rows(args: argparse.Namespace) -> list[dict]:
+    return _take_index(benchmark_confirm_plan(args)[1], args)
 
 
 def data_sources(args: argparse.Namespace) -> list[dict]:
@@ -841,6 +1133,57 @@ def main() -> None:
         default=3,
         help="Number of source combinations for --top-sources-from.",
     )
+    p.add_argument(
+        "--confirm-from",
+        "--top-losses-from",
+        dest="confirm_from",
+        default=None,
+        metavar="WANDB_GROUP",
+        help="Losses / hardness / maskclean, confirmation step: rank a FINISHED sweep in this W&B group by mean "
+        "validation AP, and retrain the best configuration of every family WITH holdout evaluation.",
+    )
+    p.add_argument(
+        "--confirm-top-k",
+        "--losses-top-k",
+        dest="confirm_top_k",
+        type=int,
+        default=1,
+        help="Configurations per family for --confirm-from (default 1).",
+    )
+    p.add_argument(
+        "--confirm-index",
+        "--loss-index",
+        dest="confirm_index",
+        type=int,
+        default=None,
+        help="Confirmation: run only the N-th planned configuration (for parallel SLURM array tasks).",
+    )
+    p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Benchmark suite: confirm the best Optuna trials (--studies, --top-k, --stratify-by) over --seeds with "
+        "holdout evaluation, instead of running the search.",
+    )
+    p.add_argument(
+        "--studies",
+        nargs="+",
+        default=None,
+        metavar="MODEL,STUDY_NAME,JOURNAL",
+        help="Benchmark --confirm: one entry per Optuna study; the trials of all of them are pooled.",
+    )
+    p.add_argument(
+        "--stratify-by",
+        default="none",
+        metavar="none|model|KEY",
+        help="Benchmark --confirm: 'none' = one global top-k, 'model' = top-k per architecture, or the top-k per "
+        "distinct value of a config key / trial param (e.g. loss_name). --top-k is per stratum.",
+    )
+    p.add_argument(
+        "--eval-holdout",
+        action="store_true",
+        help="Score each run's best checkpoint on the holdout tiles. For suites that only compare settings "
+        "(data-sources, temporal, augmentation) and log the holdout for every run; never choose with it.",
+    )
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument(
         "--trials",
@@ -990,11 +1333,26 @@ def main() -> None:
     )
     args = p.parse_args()
     # Confirmation runs (and only those) evaluate the holdout tiles; every other suite keeps it untouched.
-    args.eval_holdout = bool(args.top_sources_from)
+    args.eval_holdout = bool(
+        args.eval_holdout
+        or args.top_sources_from
+        or args.confirm_from
+        or (args.suite == "benchmark" and args.confirm)
+    )
     args.group = (
         args.group or f"{args.suite}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
-    if args.suite == "benchmark":
+    if args.confirm and args.suite != "benchmark":
+        p.error(
+            "--confirm is for the benchmark suite; use --confirm-from for losses, hardness and maskclean"
+        )
+    if args.confirm and not args.studies:
+        p.error("--confirm needs --studies MODEL,STUDY_NAME,JOURNAL_PATH ...")
+    if args.confirm_from and args.suite not in CONFIRM_FAMILY:
+        p.error(
+            f"--confirm-from supports {sorted(CONFIRM_FAMILY)}; data-sources has --top-sources-from"
+        )
+    if args.suite == "benchmark" and not args.confirm:
         if args.trials < 1:
             p.error("--trials must be at least 1")
         if args.execute:
@@ -1053,7 +1411,12 @@ def main() -> None:
         print("python experiments.py benchmark --execute --trials", args.trials)
         return
 
-    rows = SUITES[args.suite](args)
+    if args.suite == "benchmark":  # --confirm
+        rows = benchmark_confirm_rows(args)
+    elif args.confirm_from:
+        rows = wandb_confirm_rows(args)
+    else:
+        rows = SUITES[args.suite](args)
     rows = [r | {"variant": r.get("variant") or auto_variant(r)} for r in rows]
     rows = [r | {"seed": seed} for seed in (args.seeds or [args.seed]) for r in rows]
     if args.max_runs:
