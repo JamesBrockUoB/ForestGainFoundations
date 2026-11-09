@@ -211,6 +211,12 @@ def parse_args(argv=None):
         help="Soft-label jitter (std). Default: 0.1 with --loss_type soft, else 0.",
     )
     g.add_argument(
+        "--val_metrics",
+        action="store_true",
+        help="Always score the best checkpoint on the validation tiles with the full metric set (val_eval_*), not only "
+        "AP. Cleaning, maskclean and confirmation runs do this regardless.",
+    )
+    g.add_argument(
         "--skip_test_eval",
         action="store_true",
         help="Do not evaluate holdout labels after training. Use during tuning/ablation; evaluate selected checkpoints once at the end.",
@@ -492,7 +498,12 @@ def train(args):
 
     # Validation tiles, best checkpoint, with the same metrics as the holdout: raw labels (val_eval_*), logged for
     # cleaning runs and confirmation runs, next to the cleaned labels of this variant (val_eval_clean_*). val_ap itself (early stopping) uses the labels the validation loader had.
-    if best and (cleaning or args.suite == "maskclean" or not args.skip_test_eval):
+    if best and (
+        args.val_metrics
+        or cleaning
+        or args.suite == "maskclean"
+        or not args.skip_test_eval
+    ):
         print("--- validation tiles, raw labels ---")
         raw = evaluate_checkpoint(
             best, test_dir=None, tile_dirs=val_dirs, crop_size=None

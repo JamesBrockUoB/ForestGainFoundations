@@ -111,6 +111,8 @@ def _base(args: argparse.Namespace, model: str, sources: tuple[str, ...]) -> dic
         "split_seed": args.split_seed,
         # Do not evaluate the final holdout during model/loss/source selection (only confirmation runs do).
         "skip_test_eval": not getattr(args, "eval_holdout", False),
+        # Log the full validation metric set (val_eval_*) for every run, not only val_ap.
+        "val_metrics": True,
         # Weights & Biases labelling
         "suite": args.suite,
         "wandb_group": args.group,
