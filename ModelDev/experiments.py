@@ -181,43 +181,43 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
     """
     lr = trial.suggest_float("learning_rate", 3e-5, 1e-3, log=True)
     wd = trial.suggest_float("weight_decay", 1e-5, 5e-2, log=True)
-    dropout = trial.suggest_float("dropout", 0.05, 0.35)
+    dropout = trial.suggest_float("dropout", 0.0, 0.4)
 
     if model == "tsvit":
         structure = dict(
             embed_dim=trial.suggest_categorical("embed_dim", [96, 128, 160, 192]),
-            num_heads=trial.suggest_categorical("num_heads", [4, 8]),
+            num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
             depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
-            depth_spatial=trial.suggest_int("depth_spatial", 2, 6),
-            patch_size=trial.suggest_categorical("patch_size", [16, 32]),
+            depth_spatial=trial.suggest_categorical("depth_spatial", [2, 4, 6]),
+            # Patch size 4 creates a very large spatial attention sequence.
+            patch_size=trial.suggest_categorical("patch_size", [8, 16, 32]),
             dropout=dropout,
             skip_channels=trial.suggest_categorical("skip_channels", [16, 24, 32, 48]),
         )
-        batch_size = trial.suggest_categorical("batch_size", [8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
 
     elif model == "sits_scd":
         structure = dict(
-            base_features=trial.suggest_categorical(
-                "base_features", [32, 48, 64, 96, 128]
-            ),
+            base_features=trial.suggest_categorical("base_features", [32, 48, 64, 96]),
             num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
             dropout=dropout,
             depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
-            convs_per_block=trial.suggest_int("convs_per_block", 1, 3),
+            convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [1, 2, 4])
 
-    else:  # unet_lstm
+    elif model == "unet_lstm":
         structure = dict(
-            base_features=trial.suggest_categorical(
-                "base_features", [24, 32, 48, 64, 96, 128]
-            ),
+            base_features=trial.suggest_categorical("base_features", [24, 32, 48, 64]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 2),
             lstm_kernel=trial.suggest_categorical("lstm_kernel", [3, 5]),
-            convs_per_block=trial.suggest_int("convs_per_block", 1, 3),
+            convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [1, 2])
+
+    else:
+        raise ValueError(f"Unknown benchmark model: {model}")
 
     return {
         "learning_rate": lr,
@@ -1582,33 +1582,32 @@ def main() -> None:
                 "common": {
                     "learning_rate": "log-uniform [3e-5, 1e-3]",
                     "weight_decay": "log-uniform [1e-5, 5e-2]",
-                    "dropout": "uniform [0.05, 0.35]",
+                    "dropout": "uniform [0.0, 0.4]",
                 },
                 "tsvit": {
                     "embed_dim": [96, 128, 160, 192],
-                    "num_heads": [4, 8],
-                    "depth_temporal": [1, 4],
-                    "depth_spatial": [2, 6],
-                    "patch_size": [16, 32],
-                    "skip_channels": [16, 24, 32, 48],
-                    "batch_size": [8, 16],
-                },
-                "sits_scd": {
-                    "base_features": [32, 48, 64, 96, 128],
                     "num_heads": [2, 4, 8],
                     "depth_temporal": [1, 4],
-                    "convs_per_block": [1, 3],
-                    "batch_size": [4, 8, 16],
+                    "depth_spatial": [2, 4, 6],
+                    "patch_size": [8, 16, 32],
+                    "skip_channels": [16, 24, 32, 48],
+                    "batch_size": [2, 4, 8],
+                },
+                "sits_scd": {
+                    "base_features": [32, 48, 64, 96],
+                    "num_heads": [2, 4, 8],
+                    "depth_temporal": [1, 4],
+                    "convs_per_block": [1, 2],
+                    "batch_size": [1, 2, 4],
                 },
                 "unet_lstm": {
-                    "base_features": [24, 32, 48, 64, 96, 128],
-                    "depth_temporal": [1, 4],
+                    "base_features": [24, 32, 48, 64],
+                    "depth_temporal": [1, 2],
                     "lstm_kernel": [3, 5],
-                    "convs_per_block": [1, 3],
-                    "batch_size": [4, 8, 16],
+                    "convs_per_block": [1, 2],
+                    "batch_size": [1, 2],
                 },
             },
-            "note": "This is adaptive: exact trial configs are chosen sequentially from prior validation AP results. Add --execute to run training.",
         }
         path = out / f"benchmark_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path.write_text(json.dumps(manifest, indent=2))
