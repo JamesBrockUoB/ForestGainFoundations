@@ -202,7 +202,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
             ),
             num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", [1, 4]),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 3),
         )
         batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
@@ -213,7 +213,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
                 "base_features", [24, 32, 48, 64, 96, 128]
             ),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", [1, 4]),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
             lstm_kernel=trial.suggest_categorical("lstm_kernel", [3, 5]),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 3),
         )
