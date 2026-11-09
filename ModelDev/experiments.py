@@ -172,58 +172,51 @@ def _default_structure(model: str) -> dict:
 
 
 def _suggest_benchmark_trial(trial, model: str) -> dict:
-    """Search optimiser and model-specific architectural parameters. EVERY suggested value is consumed by the model.
+    """Search optimiser and model-specific architectural parameters.
 
-    ``trial`` may be an Optuna Trial or a FixedTrial: confirm_row replays a stored trial's params through this
-    function to rebuild its exact training configuration. Categorical choice lists must stay static per parameter
-    name (Optuna requirement), so every width below is divisible by every head count offered.
+    Every suggested value is consumed by the model.
+
+    Categorical choice lists must stay static per parameter name,
+    and embedding/base widths are divisible by all offered head counts.
     """
-    lr = trial.suggest_float("learning_rate", 2e-5, 2e-3, log=True)
-    wd = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)
-    dropout = trial.suggest_float("dropout", 0.0, 0.4)
+    lr = trial.suggest_float("learning_rate", 3e-5, 1e-3, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-5, 5e-2, log=True)
+    dropout = trial.suggest_float("dropout", 0.05, 0.35)
+
     if model == "tsvit":
         structure = dict(
-            embed_dim=trial.suggest_categorical(
-                "embed_dim", [64, 96, 128, 160, 192, 256]
-            ),
-            num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 6),
-            depth_spatial=trial.suggest_int("depth_spatial", 1, 8),
-            patch_size=trial.suggest_categorical("patch_size", [8, 16, 32]),
+            embed_dim=trial.suggest_categorical("embed_dim", [96, 128, 160, 192]),
+            num_heads=trial.suggest_categorical("num_heads", [4, 8]),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
+            depth_spatial=trial.suggest_int("depth_spatial", 2, 6),
+            patch_size=trial.suggest_categorical("patch_size", [16, 32]),
             dropout=dropout,
-            skip_channels=trial.suggest_categorical(
-                "skip_channels", [0, 16, 24, 32, 48, 64]
-            ),
+            skip_channels=trial.suggest_categorical("skip_channels", [16, 24, 32, 48]),
         )
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [8, 16])
+
     elif model == "sits_scd":
         structure = dict(
-            base_features=trial.suggest_categorical(
-                "base_features", [24, 32, 48, 64, 96, 128]
-            ),
+            base_features=trial.suggest_categorical("base_features", [32, 48, 64, 96]),
             num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int(
-                "depth_temporal", 1, 4
-            ),  # stacked temporal attention layers / scale
-            convs_per_block=trial.suggest_int(
-                "convs_per_block", 1, 4
-            ),  # convs in each encoder/decoder block
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 3),
+            convs_per_block=trial.suggest_int("convs_per_block", 1, 3),
         )
-        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
-    else:
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+
+    else:  # unet_lstm
         structure = dict(
             base_features=trial.suggest_categorical(
-                "base_features", [16, 24, 32, 48, 64, 96]
+                "base_features", [24, 32, 48, 64, 96]
             ),
             dropout=dropout,
-            depth_temporal=trial.suggest_int(
-                "depth_temporal", 1, 3
-            ),  # stacked ConvLSTM layers
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 3),
             lstm_kernel=trial.suggest_categorical("lstm_kernel", [3, 5]),
-            convs_per_block=trial.suggest_int("convs_per_block", 1, 4),
+            convs_per_block=trial.suggest_int("convs_per_block", 1, 3),
         )
-        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+
     return {
         "learning_rate": lr,
         "weight_decay": wd,
@@ -1585,32 +1578,32 @@ def main() -> None:
             "loss": BENCHMARK_LOSS,
             "search_spaces": {
                 "common": {
-                    "learning_rate": "log-uniform [2e-5, 2e-3]",
-                    "weight_decay": "log-uniform [1e-6, 1e-1]",
-                    "dropout": "uniform [0, 0.4]",
+                    "learning_rate": "log-uniform [3e-5, 1e-3]",
+                    "weight_decay": "log-uniform [1e-5, 5e-2]",
+                    "dropout": "uniform [0.05, 0.35]",
                 },
                 "tsvit": {
-                    "embed_dim": [64, 96, 128, 160, 192, 256],
-                    "num_heads": [2, 4, 8],
-                    "depth_temporal": [1, 6],
-                    "depth_spatial": [1, 8],
-                    "patch_size": [8, 16, 32],
-                    "skip_channels": [0, 16, 24, 32, 48, 64],
-                    "batch_size": [4, 8, 16],
+                    "embed_dim": [96, 128, 160, 192],
+                    "num_heads": [4, 8],
+                    "depth_temporal": [1, 4],
+                    "depth_spatial": [2, 6],
+                    "patch_size": [16, 32],
+                    "skip_channels": [16, 24, 32, 48],
+                    "batch_size": [8, 16],
                 },
                 "sits_scd": {
-                    "base_features": [24, 32, 48, 64, 96, 128],
+                    "base_features": [32, 48, 64, 96],
                     "num_heads": [2, 4, 8],
-                    "depth_temporal": [1, 4],
-                    "convs_per_block": [1, 4],
-                    "batch_size": [2, 4, 8],
+                    "depth_temporal": [1, 3],
+                    "convs_per_block": [1, 3],
+                    "batch_size": [4, 8, 16],
                 },
                 "unet_lstm": {
-                    "base_features": [16, 24, 32, 48, 64, 96],
+                    "base_features": [24, 32, 48, 64, 96],
                     "depth_temporal": [1, 3],
                     "lstm_kernel": [3, 5],
-                    "convs_per_block": [1, 4],
-                    "batch_size": [2, 4, 8],
+                    "convs_per_block": [1, 3],
+                    "batch_size": [4, 8, 16],
                 },
             },
             "note": "This is adaptive: exact trial configs are chosen sequentially from prior validation AP results. Add --execute to run training.",
