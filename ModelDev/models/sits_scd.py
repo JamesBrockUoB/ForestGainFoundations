@@ -36,10 +36,13 @@ class _TemporalAttentionLayer(nn.Module):
 
 
 class TemporalAttentionModule(nn.Module):
-    """Multi-Head Temporal Attention Module for Satellite Image Time Series (SITS).
+    """Multi-Head Temporal Attention Module for Satellite Image Time Series.
 
-    Aggregates features across T timesteps per pixel/location with `depth` stacked
+    Aggregates features across T timesteps per pixel/location with stacked
     attention layers followed by attention-weighted pooling over T.
+
+    Spatial sequences are processed in chunks to avoid oversized
+    efficient-attention kernel batch dimensions.
     """
 
     def __init__(
@@ -50,31 +53,54 @@ class TemporalAttentionModule(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+
         if num_heads < 1 or in_channels % num_heads:
             raise ValueError(
-                f"in_channels ({in_channels}) must be divisible by num_heads ({num_heads})"
+                f"in_channels ({in_channels}) must be divisible by "
+                f"num_heads ({num_heads})"
             )
         if depth < 1:
             raise ValueError("depth (temporal) must be at least 1")
+
+        self.num_heads = num_heads
+
         self.layers = nn.ModuleList(
             _TemporalAttentionLayer(in_channels, num_heads, dropout)
             for _ in range(depth)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, T, C, H, W)
+        # x: (B, T, C, H, W)
         b, t, c, h, w = x.shape
 
-        # Per-pixel temporal sequence: (B * H * W, T, C)
+        # One independent temporal sequence per spatial location.
+        # (B, T, C, H, W) -> (B*H*W, T, C)
         out = x.permute(0, 3, 4, 1, 2).reshape(b * h * w, t, c)
-        for layer in self.layers:
-            out = layer(out)
 
-        # Attention-weighted sum over sequence dimension T -> 1
-        attn_weights = F.softmax(out.mean(dim=-1), dim=-1).unsqueeze(-1)  # (N, T, 1)
-        pooled = (out * attn_weights).sum(dim=1)  # (N, C)
+        n = out.shape[0]
 
-        return pooled.view(b, h, w, c).permute(0, 3, 1, 2)  # (B, C, H, W)
+        # Bound the effective attention batch, accounting for head count.
+        # The margin also avoids operating exactly at the kernel limit.
+        max_sequences = min(8192, 65535 // self.num_heads)
+
+        chunks = []
+
+        for start in range(0, n, max_sequences):
+            chunk = out[start : start + max_sequences]
+
+            for layer in self.layers:
+                chunk = layer(chunk)
+
+            chunks.append(chunk)
+
+        out = torch.cat(chunks, dim=0)
+
+        # Attention-weighted temporal pooling.
+        attn_weights = F.softmax(out.mean(dim=-1), dim=-1).unsqueeze(-1)
+
+        pooled = (out * attn_weights).sum(dim=1)
+
+        return pooled.view(b, h, w, c).permute(0, 3, 1, 2)
 
 
 class ConvBlock(nn.Module):
