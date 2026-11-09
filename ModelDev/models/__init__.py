@@ -31,12 +31,19 @@ def build_model(
         return UNetLSTM(
             in_channels=in_channels,
             base_features=kwargs.get("base_features", 64),
+            dropout=kwargs.get("dropout", 0.0),
+            depth_temporal=kwargs.get("depth_temporal", 1),
+            lstm_kernel=kwargs.get("lstm_kernel", 3),
+            convs_per_block=kwargs.get("convs_per_block", 2),
         )
     elif model_type == "sits_scd":
         return SitsSCD(
             in_channels=in_channels,
             base_features=kwargs.get("base_features", 64),
             num_heads=kwargs.get("num_heads", 4),
+            dropout=kwargs.get("dropout", 0.0),
+            depth_temporal=kwargs.get("depth_temporal", 1),
+            convs_per_block=kwargs.get("convs_per_block", 2),
         )
     else:
         raise ValueError(

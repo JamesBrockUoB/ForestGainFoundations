@@ -30,6 +30,8 @@ DEFAULT_MODEL_OPTS = {
     "depth_spatial": 4,
     "dropout": 0.1,
     "skip_channels": 32,
+    "convs_per_block": 2,  # sits_scd / unet_lstm
+    "lstm_kernel": 3,  # unet_lstm
 }
 
 
@@ -68,7 +70,7 @@ def parse_args(argv=None):
     g.add_argument(
         "--loss",
         dest="loss_name",
-        default="bce_focal_tversky",
+        default="bce_focal",
         choices=list(LOSS_NAMES),
     )
     g.add_argument(

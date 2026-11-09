@@ -3,9 +3,9 @@
 Examples
 --------
 python experiments.py benchmark --dry-run
-python experiments.py benchmark --models tsvit --execute --trials 50 --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
+python experiments.py benchmark --models tsvit --execute --trials 25 --search-seeds 0 1 2 --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
 python experiments.py data-sources --model tsvit --execute
-python experiments.py data-sources --model tsvit --seeds 0 --loss bce_focal_tversky --learning-rate 3.5e-4 \
+python experiments.py data-sources --model tsvit --seeds 0 --loss bce_focal --learning-rate 3.5e-4 \
     --weight-decay 5.8e-3 --model-opt embed_dim=160 num_heads=4 depth_temporal=3 depth_spatial=2 patch_size=8 \
     dropout=0.22 skip_channels=24 --dry-run
 python experiments.py losses --model tsvit --execute --max-runs 12
@@ -13,10 +13,12 @@ python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
 python experiments.py maskclean --model tsvit --seeds 0 1 2 --loss-type soft --dry-run
 python experiments.py losses --model tsvit --confirm-from losses_tsvit_<job id> --seeds 0 1 2 --dry-run
-python experiments.py benchmark --confirm --studies tsvit,forestgain_tsvit_1,j1.log --top-k 3 --seeds 0 1 2 --dry-run
+python experiments.py benchmark --confirm --studies tsvit,fg_tsvit,j1.log sits_scd,fg_sits,j2.log unet_lstm,fg_unet,j3.log \
+    --top-k 1 --stratify-by model --seeds 0 1 2 --dry-run
 
 Suites
-  benchmark     lr / weight decay / size search, S1+S2 (Optuna TPE; parallel workers can share one study)
+  benchmark     lr / weight decay / batch size / architecture search, S1+S2 (Optuna TPE; parallel workers can share one
+                study). Every trial is trained with --search-seeds (default 0 1 2) and scored by the MEAN validation AP.
   data-sources  every input-source combination (use the best benchmark configuration: --learning-rate, --weight-decay,
                 --loss, --model-opt; --source-index N runs only the N-th combination, for parallel SLURM tasks;
                 --top-sources-from GROUP --top-k K retrains the K best combinations of a finished sweep over the
@@ -38,7 +40,8 @@ Confirmation and holdout
     losses / hardness / maskclean   --confirm-from SWEEP_GROUP [--confirm-top-k K] [--confirm-index N]
                                     best configuration of every family (e.g. loss + reweight) of a finished sweep
     benchmark                       benchmark --confirm --studies MODEL,STUDY,JOURNAL ... [--top-k K --stratify-by model]
-                                    [--confirm-index N]   best Optuna trials, retrained over --seeds
+                                    [--confirm-index N]   best Optuna trials (by mean val AP), retrained over --seeds
+                                    (one winner per architecture: --top-k 1 --stratify-by model)
     data-sources                    --top-sources-from SWEEP_GROUP --top-k K
   Suites that only compare settings (data-sources, temporal, augmentation) can log the holdout for every run with
   --eval-holdout. Choose configurations on validation AP; report holdout numbers next to it. confirm_top_k.py
@@ -57,6 +60,7 @@ import argparse
 import itertools
 import json
 import re
+import statistics
 import subprocess
 import sys
 import warnings
@@ -92,7 +96,7 @@ SOURCE_SETS = (
 )
 
 BENCHMARK_MODELS = ("tsvit", "sits_scd", "unet_lstm")
-BENCHMARK_LOSS = "bce_focal_tversky"
+BENCHMARK_LOSS = "bce_focal"  # must exist in losses.LOSS_NAMES
 
 
 def _base(args: argparse.Namespace, model: str, sources: tuple[str, ...]) -> dict:
@@ -149,51 +153,81 @@ def _default_structure(model: str) -> dict:
             skip_channels=32,
         )
     if model == "sits_scd":
-        return dict(base_features=64, num_heads=4, dropout=0.1)
-    return dict(base_features=64, skip_channels=32, dropout=0.1)
+        return dict(
+            base_features=64,
+            num_heads=4,
+            dropout=0.1,
+            depth_temporal=1,
+            convs_per_block=2,
+        )
+    return dict(
+        base_features=64,
+        dropout=0.1,
+        depth_temporal=1,
+        lstm_kernel=3,
+        convs_per_block=2,
+    )
 
 
 def _suggest_benchmark_trial(trial, model: str) -> dict:
-    """Search optimiser and model-specific architectural parameters without redundant knobs.
+    """Search optimiser and model-specific architectural parameters. EVERY suggested value is consumed by the model.
 
-    ``trial`` may be an Optuna Trial or a FixedTrial: confirm_top_k.py replays a stored trial's params through this
-    function to rebuild its exact training configuration.
+    ``trial`` may be an Optuna Trial or a FixedTrial: confirm_row replays a stored trial's params through this
+    function to rebuild its exact training configuration. Categorical choice lists must stay static per parameter
+    name (Optuna requirement), so every width below is divisible by every head count offered.
     """
-    lr = trial.suggest_float("learning_rate", 3e-5, 1e-3, log=True)
-    wd = trial.suggest_float("weight_decay", 1e-5, 5e-2, log=True)
-    dropout = trial.suggest_float("dropout", 0.0, 0.35)
+    lr = trial.suggest_float("learning_rate", 2e-5, 2e-3, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)
+    dropout = trial.suggest_float("dropout", 0.0, 0.4)
     if model == "tsvit":
-        embed_dim = trial.suggest_categorical("embed_dim", [96, 128, 160])
-        # Restrict head counts to divisors of each candidate embedding dimension.
-        # (All current candidates divide by 4 and 8, so the search space is static.)
-        heads = [h for h in (4, 8) if embed_dim % h == 0]
         structure = dict(
-            embed_dim=embed_dim,
-            num_heads=trial.suggest_categorical("num_heads", heads),
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
-            depth_spatial=trial.suggest_int("depth_spatial", 2, 6),
+            embed_dim=trial.suggest_categorical(
+                "embed_dim", [64, 96, 128, 160, 192, 256]
+            ),
+            num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 6),
+            depth_spatial=trial.suggest_int("depth_spatial", 1, 8),
             patch_size=trial.suggest_categorical("patch_size", [8, 16, 32]),
             dropout=dropout,
-            skip_channels=trial.suggest_categorical("skip_channels", [16, 24, 32, 48]),
+            skip_channels=trial.suggest_categorical(
+                "skip_channels", [0, 16, 24, 32, 48, 64]
+            ),
         )
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
     elif model == "sits_scd":
         structure = dict(
-            base_features=trial.suggest_categorical("base_features", [32, 48, 64, 96]),
+            base_features=trial.suggest_categorical(
+                "base_features", [24, 32, 48, 64, 96, 128]
+            ),
             num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
-            depth_spatial=trial.suggest_int("depth_spatial", 2, 6),
+            depth_temporal=trial.suggest_int(
+                "depth_temporal", 1, 4
+            ),  # stacked temporal attention layers / scale
+            convs_per_block=trial.suggest_int(
+                "convs_per_block", 1, 4
+            ),  # convs in each encoder/decoder block
         )
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
     else:
         structure = dict(
             base_features=trial.suggest_categorical(
-                "base_features", [24, 32, 48, 64, 96]
+                "base_features", [16, 24, 32, 48, 64, 96]
             ),
-            skip_channels=trial.suggest_categorical("skip_channels", [16, 24, 32, 48]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 3),
+            depth_temporal=trial.suggest_int(
+                "depth_temporal", 1, 3
+            ),  # stacked ConvLSTM layers
+            lstm_kernel=trial.suggest_categorical("lstm_kernel", [3, 5]),
+            convs_per_block=trial.suggest_int("convs_per_block", 1, 4),
         )
-    return {"learning_rate": lr, "weight_decay": wd, "model_opt": _opts(**structure)}
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
+    return {
+        "learning_rate": lr,
+        "weight_decay": wd,
+        "batch_size": batch_size,
+        "model_opt": _opts(**structure),
+    }
 
 
 def _make_storage(path: str):
@@ -225,6 +259,7 @@ def load_confirmed_configs(path="experiment_manifests/confirmed_configs.json") -
 
 def run_bayesian_benchmark(args: argparse.Namespace) -> None:
     """Parallel-safe TPE: many workers share one study; each asks for trials until the total budget is claimed.
+    Each trial is trained once per seed in --search-seeds and the objective is the mean validation AP.
 
     Run a single worker (no --storage-path) for the original serial behaviour, or launch several processes with the
     same --study-name / --storage-path and different --worker-id values (e.g. a SLURM array).
@@ -244,6 +279,10 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
         raise SystemExit(
             "--storage-path/--study-name is per study: pass exactly one model in --models."
         )
+
+    search_seeds = tuple(args.search_seeds)
+    if not search_seeds:
+        raise SystemExit("--search-seeds needs at least one seed")
 
     # Random start-up trials before TPE models the objective: about a third of the budget, between 5 and 24.
     startup = (
@@ -295,49 +334,67 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
                     "variant": f"trial{index:02d}",
                 }
             )
-            # Store the exact training config so confirm_top_k.py can replay it.
+            # Store the exact training config so confirm_row can replay it.
             trial.set_user_attr("config", row)
-            cmd = command(row)
-            print(
-                f"\n[{model} trial {index}/{args.trials} worker {args.worker_id}] {' '.join(cmd)}",
-                flush=True,
-            )
-            proc = subprocess.run(
-                cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-            )
-            print(
-                proc.stdout, end="" if proc.stdout.endswith("\n") else "\n", flush=True
-            )
-            match = re.search(
-                r"best checkpoint:.*?val_ap:\s*([0-9]*\.?[0-9]+)", proc.stdout
-            )
+            trial.set_user_attr("seeds", list(search_seeds))
+            seed_runs, failed = [], None
+            for seed in search_seeds:
+                seed_row = row | {"seed": seed}
+                cmd = command(seed_row)
+                print(
+                    f"\n[{model} trial {index}/{args.trials} seed {seed} worker {args.worker_id}] {' '.join(cmd)}",
+                    flush=True,
+                )
+                proc = subprocess.run(
+                    cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                )
+                print(
+                    proc.stdout,
+                    end="" if proc.stdout.endswith("\n") else "\n",
+                    flush=True,
+                )
+                match = re.search(
+                    r"best checkpoint:.*?val_ap:\s*([0-9]*\.?[0-9]+)", proc.stdout
+                )
+                seed_runs.append(
+                    {
+                        "seed": seed,
+                        "command": cmd,
+                        "returncode": proc.returncode,
+                        "val_ap": float(match.group(1)) if match else None,
+                    }
+                )
+                if proc.returncode != 0 or not match:
+                    failed = (seed, proc.returncode)
+                    break  # a trial needs every seed; do not spend compute on the rest
+            aps = [r["val_ap"] for r in seed_runs if r["val_ap"] is not None]
             result = {
                 "model": model,
                 "trial": index,
                 "worker": args.worker_id,
                 "config": row,
-                "command": cmd,
-                "returncode": proc.returncode,
-                "val_ap": float(match.group(1)) if match else None,
+                "seeds": seed_runs,
+                "val_ap": statistics.fmean(aps) if failed is None else None,
+                "val_ap_std": (statistics.pstdev(aps) if len(aps) > 1 else 0.0),
             }
-            if proc.returncode != 0 or not match:
+            if failed is not None:
                 study.tell(trial, state=optuna.trial.TrialState.FAIL)
                 result["error"] = (
-                    "Training failed or best validation AP could not be parsed from train.py output."
+                    f"Seed {failed[0]} failed (exit {failed[1]}) or its best validation AP could not be parsed "
+                    "from train.py output; trial discarded."
                 )
-                if proc.returncode != 0:
-                    print(
-                        f"Trial {index} failed (exit {proc.returncode}); continuing.",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        "Could not parse best val_ap; check train.py's final checkpoint line.",
-                        file=sys.stderr,
-                    )
+                print(
+                    f"Trial {index} failed at seed {failed[0]}; continuing.",
+                    file=sys.stderr,
+                )
             else:
-                study.tell(trial, float(match.group(1)))
-                print(f"Trial {index} val_ap={match.group(1)}", flush=True)
+                trial.set_user_attr("val_ap_per_seed", aps)
+                study.tell(trial, result["val_ap"])
+                print(
+                    f"Trial {index} mean val_ap={result['val_ap']:.5f} over seeds {list(search_seeds)} "
+                    f"(per seed {aps})",
+                    flush=True,
+                )
             model_results.append(result)
             (out / f"benchmark_{model}_worker{args.worker_id:02d}.json").write_text(
                 json.dumps(
@@ -346,7 +403,8 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
                         "model": model,
                         "worker": args.worker_id,
                         "study": study.study_name,
-                        "objective": "validation val_ap (max)",
+                        "objective": f"mean validation val_ap over seeds {list(search_seeds)} (max)",
+                        "search_seeds": list(search_seeds),
                         "sampler": "Optuna TPE (multivariate, constant liar)",
                         "trials_requested": args.trials,
                         "startup_trials": min(startup, args.trials),
@@ -362,7 +420,7 @@ def run_bayesian_benchmark(args: argparse.Namespace) -> None:
         if done:
             print(
                 f"\nBEST so far ({model}): trial {study.best_trial.number + 1}, "
-                f"val_ap={study.best_value:.5f}, params={study.best_trial.params}"
+                f"mean val_ap={study.best_value:.5f}, params={study.best_trial.params}"
             )
         else:
             print(
@@ -705,12 +763,12 @@ def benchmark_confirm_plan(args):
     if not top:
         raise SystemExit("No completed trials in any study yet.")
     print(
-        f"\nTop {args.top_k} per stratum (stratify-by '{args.stratify_by}'), single-seed validation AP:"
+        f"\nTop {args.top_k} per stratum (stratify-by '{args.stratify_by}'), mean validation AP over the search seeds:"
     )
     for s, c in top:
         print(
             f"  [{s}] {c.model:<10} trial {c.trial.number + 1:>3}  "
-            f"val_ap={c.trial.value:.5f}  {c.trial.params}"
+            f"mean val_ap={c.trial.value:.5f}  {c.trial.params}"
         )
     return top, [confirm_row(c, args) for _, c in top]
 
@@ -761,17 +819,93 @@ def _run(args: argparse.Namespace, **extra) -> dict:
     }
 
 
-def losses(args: argparse.Namespace) -> list[dict]:
-    """Sweep loss functions using the model's confirmed configuration,
-    or train.py defaults if no confirmed configuration exists.
-    """
-    configs = load_confirmed_configs()
-    cfg = configs.get(args.model)
+CARRY_CANDIDATES = ("bce_focal", "bce_focal_tversky")
 
+
+def pick_carry(args: argparse.Namespace) -> dict:
+    """Better of the two BCE + focal-type losses (bce_focal, bce_focal_tversky) in a FINISHED base-stage sweep.
+
+    Ranked by mean validation AP over seeds among un-reweighted runs; the winner's best loss_opt / pos_weight are
+    returned too, so later stages (OHEM, hardness) build on its best setting. Deterministic (ties by variant name).
+    """
+    import statistics
+
+    import wandb
+
+    api = wandb.Api()
+    project = args.wandb_project or "Forest-Gain-CD"
+    by: dict[str, dict] = {}
+    for run in api.runs(
+        f"{api.default_entity}/{project}", filters={"group": args.carry_from}
+    ):
+        if run.state != "finished":
+            continue
+        cfg, summary = dict(run.config), dict(run.summary)
+        val = summary.get("val_ap.max", summary.get("val_ap"))
+        variant = cfg.get("variant")
+        if (
+            val is None
+            or not variant
+            or cfg.get("loss_name") not in CARRY_CANDIDATES
+            or (cfg.get("reweight") or "none") != "none"
+        ):
+            continue
+        by.setdefault(variant, {"vals": [], "cfg": cfg})["vals"].append(float(val))
+    if not by:
+        raise SystemExit(
+            f"No finished {CARRY_CANDIDATES} runs with a validation AP in W&B group '{args.carry_from}'."
+        )
+    ranked = sorted(
+        ((statistics.fmean(v["vals"]), name, v["cfg"]) for name, v in by.items()),
+        key=lambda r: (-r[0], r[1]),
+    )
+    best: dict[str, tuple] = {}
+    for mean, variant, cfg in ranked:  # best configuration of each candidate loss
+        best.setdefault(cfg["loss_name"], (mean, variant, cfg))
+    print(
+        f"Carry-over candidates in '{args.carry_from}' (best configuration, mean validation AP over seeds):"
+    )
+    for name, (mean, variant, _) in best.items():
+        print(f"  {name:<20} val_ap={mean:.4f}  {variant}")
+    winner = max(best, key=lambda n: best[n][0])
+    cfg = best[winner][2]
+    print(f"-> carrying {winner} into the later stages")
+    carry = {"loss_name": winner}
+    if cfg.get("loss_opt"):
+        carry["loss_opt"] = list(cfg["loss_opt"])
+    if cfg.get("pos_weight") is not None:
+        carry["pos_weight"] = cfg["pos_weight"]
+    return carry
+
+
+def resolve_carry(args: argparse.Namespace, required: bool) -> dict | None:
+    """The loss added to the later stages: --carry-loss (manual) or the winner of --carry-from (W&B)."""
+    if args.carry_loss:
+        return {
+            "loss_name": args.carry_loss,
+            **({"loss_opt": list(args.carry_opt)} if args.carry_opt else {}),
+        }
+    if args.carry_from:
+        return pick_carry(args)
+    if required:
+        raise SystemExit(
+            "--loss-stage reweight needs --carry-from BASE_GROUP (or --carry-loss NAME [--carry-opt ...])."
+        )
+    return None
+
+
+def losses(args: argparse.Namespace) -> list[dict]:
+    """Loss sweep with the model's confirmed configuration (or train.py defaults), in two stages.
+
+    base      un-reweighted families. Coordinate sweeps around each default (one parameter at a time) rather than the
+              full grid, so the space is wider at about the same cost. Includes bce_focal (the default loss).
+    reweight  OHEM on BCE, on Focal, and on the better of bce_focal / bce_focal_tversky from the finished base stage
+              (--carry-from BASE_GROUP, or --carry-loss), using that winner's best parameters.
+    """
+    cfg = load_confirmed_configs().get(args.model)
     if cfg is None:
         print(
-            f"WARNING: no confirmed configuration for {args.model}; "
-            "using train.py defaults.",
+            f"WARNING: no confirmed configuration for {args.model}; using train.py defaults.",
             file=sys.stderr,
         )
         tuned = {}
@@ -780,71 +914,89 @@ def losses(args: argparse.Namespace) -> list[dict]:
             "learning_rate": cfg["learning_rate"],
             "weight_decay": cfg["weight_decay"],
             "model_opt": cfg["model_opt"],
+            **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
         }
 
     def run(**kwargs):
         return _run(args, **(tuned | kwargs))
 
+    def uniq(points):
+        return list(dict.fromkeys(points))
+
     rows = []
+    if args.loss_stage in ("base", "all"):
+        # BCE / Dice; BCE positive-class weight (none vs sqrt(neg/pos))
+        rows += [
+            run(loss_name="bce"),
+            run(loss_name="bce", pos_weight="auto"),
+            run(loss_name="dice"),
+        ]
 
-    for name in ("bce", "dice"):
-        rows.append(run(loss_name=name))
-
-    # Focal Tversky and BCE + Focal Tversky
-    for name in ("focal_tversky", "bce_focal_tversky"):
-        for alpha, gamma in itertools.product((0.3, 0.5, 0.7), (1.0, 1.33, 2.0)):
-            opts = _opts(
-                **{
-                    "tversky.alpha": alpha,
-                    "tversky.beta": round(1 - alpha, 2),
-                    "tversky.gamma": gamma,
-                }
-            )
-            rows.append(run(loss_name=name, loss_opt=opts))
-
-    # Plain focal loss
-    for gamma, alpha in itertools.product((1.0, 2.0, 3.0), (None, 0.25)):
-        opts = _opts(**{"focal.gamma": gamma, "focal.alpha": alpha})
-        rows.append(run(loss_name="focal", loss_opt=opts))
-
-    # Lovasz hinge: pooled / per tile, alone / added to BCE
-    for name, per_tile in itertools.product(("lovasz", "bce_lovasz"), (False, True)):
-        rows.append(
-            run(
-                loss_name=name,
-                loss_opt=_opts(lovasz_per_image=True) if per_tile else None,
-            )
+        # Tversky-based: alpha at gamma 1, gamma at alpha 0.5 (beta = 1 - alpha)
+        tversky = uniq(
+            [(a, 1.0) for a in (0.3, 0.4, 0.5, 0.6, 0.7)]
+            + [(0.5, g) for g in (0.75, 1.33, 1.67, 2.0)]
         )
+        for name in ("focal_tversky", "bce_focal_tversky"):
+            for alpha, gamma in tversky:
+                opts = _opts(
+                    **{
+                        "tversky.alpha": alpha,
+                        "tversky.beta": round(1 - alpha, 2),
+                        "tversky.gamma": gamma,
+                    }
+                )
+                rows.append(run(loss_name=name, loss_opt=opts))
 
-    # OHEM on BCE-based losses
-    for name, thresh in itertools.product(("bce", "bce_focal_tversky"), (0.7, 0.9)):
-        rows.append(
-            run(
-                loss_name=name,
-                reweight="ohem",
-                loss_opt=_opts(**{"ohem.thresh": thresh}),
+        # Focal and BCE + Focal: gamma with alpha unset, alpha at gamma 2
+        focal = uniq(
+            [(g, None) for g in (0.5, 1.0, 2.0, 3.0, 5.0)]
+            + [(2.0, a) for a in (0.25, 0.75)]
+        )
+        for name in ("focal", "bce_focal"):
+            for gamma, alpha in focal:
+                rows.append(
+                    run(
+                        loss_name=name,
+                        loss_opt=_opts(**{"focal.gamma": gamma, "focal.alpha": alpha}),
+                    )
+                )
+        rows.append(run(loss_name="bce_focal", pos_weight="auto"))
+
+        # Lovasz hinge: pooled / per tile, alone / added to BCE
+        for name, per_tile in itertools.product(
+            ("lovasz", "bce_lovasz"), (False, True)
+        ):
+            rows.append(
+                run(
+                    loss_name=name,
+                    loss_opt=_opts(lovasz_per_image=True) if per_tile else None,
+                )
             )
-        )
 
-    # Focal + OHEM
-    for gamma, alpha, thresh in itertools.product(
-        (1.0, 2.0, 3.0), (None, 0.25), (0.7, 0.9)
-    ):
-        opts = _opts(
-            **{
-                "focal.gamma": gamma,
-                "focal.alpha": alpha,
-                "ohem.thresh": thresh,
-            }
-        )
-        rows.append(
-            run(
-                loss_name="focal",
-                reweight="ohem",
-                loss_opt=opts,
-            )
-        )
+    if args.loss_stage in ("reweight", "all"):
+        carry = resolve_carry(args, required=True)
+        carry_opts = carry.get("loss_opt", [])
+        carry_extra = {
+            k: v for k, v in carry.items() if k != "loss_opt"
+        }  # loss_name (+ pos_weight)
 
+        # OHEM threshold at the default min_kept, then min_kept at threshold 0.9
+        ohem = [(t, 4096) for t in (0.6, 0.7, 0.8, 0.9)] + [(0.9, 1024), (0.9, 16384)]
+        for t, k in ohem:
+            o = _opts(**{"ohem.thresh": t, "ohem.min_kept": k})
+            rows.append(run(loss_name="bce", reweight="ohem", loss_opt=o))
+            rows.append(run(**carry_extra, reweight="ohem", loss_opt=carry_opts + o))
+
+        # Focal + OHEM: gamma and alpha at threshold 0.9, threshold at the default focal
+        pts = uniq(
+            [(g, None, 0.9) for g in (1.0, 2.0, 3.0)]
+            + [(2.0, a, 0.9) for a in (0.25, 0.75)]
+            + [(2.0, None, t) for t in (0.6, 0.7, 0.8, 0.9)]
+        )
+        for gamma, alpha, t in pts:
+            o = _opts(**{"focal.gamma": gamma, "focal.alpha": alpha, "ohem.thresh": t})
+            rows.append(run(loss_name="focal", reweight="ohem", loss_opt=o))
     return rows
 
 
@@ -861,20 +1013,32 @@ HARDNESS_LAYERS = {
 def hardness(args: argparse.Namespace) -> list[dict]:
     """Compare no reweighting, OHEM, and learned hardness on identical BCE-based recipes.
     Sweeps hardness offset c, auxiliary-loss alpha and (TSViT only) the segmentation head the branch mirrors.
-    --hl-layer overrides the per-model layers above.
+    --hl-layer overrides the per-model layers above. The second loss is bce_focal, or the winner of the loss sweep
+    when --carry-from / --carry-loss is given (with that winner's best parameters).
     """
     layers = (args.hl_layer,) if args.hl_layer else HARDNESS_LAYERS[args.model]
+    carry = resolve_carry(args, required=False)
+    second = carry["loss_name"] if carry else "bce_focal"
+    carry_opts = carry.get("loss_opt", []) if carry else []
+    carry_extra = {
+        k: v for k, v in (carry or {}).items() if k not in ("loss_opt", "loss_name")
+    }
     rows = []
-    for name in ("bce", "bce_focal_tversky"):
+    for name in ("bce", second):
+        pre = carry_opts if name == second else []
+        extra = carry_extra if name == second else {}
         # Matched controls: same recipe, split, seed, model and optimiser.
-        rows.append(_run(args, loss_name=name, reweight="none"))
+        rows.append(
+            _run(args, loss_name=name, reweight="none", loss_opt=pre or None, **extra)
+        )
         for thresh in (0.7, 0.9):
             rows.append(
                 _run(
                     args,
                     loss_name=name,
                     reweight="ohem",
-                    loss_opt=_opts(**{"ohem.thresh": thresh}),
+                    loss_opt=pre + _opts(**{"ohem.thresh": thresh}),
+                    **extra,
                 )
             )
         for layer, c, alpha in itertools.product(
@@ -886,7 +1050,8 @@ def hardness(args: argparse.Namespace) -> list[dict]:
                     loss_name=name,
                     reweight="hardness",
                     hl_layer=layer,
-                    loss_opt=_opts(**{"hardness.c": c, "hardness.alpha": alpha}),
+                    loss_opt=pre + _opts(**{"hardness.c": c, "hardness.alpha": alpha}),
+                    **extra,
                 )
             )
     return rows
@@ -915,6 +1080,7 @@ def temporal(args: argparse.Namespace) -> list[dict]:
                 "weight_decay": cfg["weight_decay"],
                 "loss_name": cfg["loss_name"],
                 "model_opt": cfg["model_opt"],
+                **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
             }
         for years in year_sets:
             rows.append(
@@ -995,6 +1161,7 @@ def maskclean(args: argparse.Namespace) -> list[dict]:
             "weight_decay": cfg["weight_decay"],
             "loss_name": cfg["loss_name"],
             "model_opt": cfg["model_opt"],
+            **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
         }
     sizes = [n for n in args.mask_sizes if n > 1 or args.mask_keep_noop]
     confs = list(args.mask_confs)
@@ -1053,6 +1220,7 @@ def auto_variant(row: dict) -> str:
         row.get("reweight") if row.get("reweight") not in (None, "none") else None,
         row.get("hl_layer"),
         *(row.get("loss_opt") or ()),
+        f"pw{row['pos_weight']}" if row.get("pos_weight") is not None else None,
         "y" + "-".join(map(str, row["years"])) if row.get("years") else None,
     ]
     return "_".join(p for p in parts if p)
@@ -1188,8 +1356,16 @@ def main() -> None:
     p.add_argument(
         "--trials",
         type=int,
-        default=50,
-        help="Bayesian benchmark TOTAL trials PER MODEL, shared across parallel workers (default 50).",
+        default=25,
+        help="Bayesian benchmark TOTAL trials PER MODEL, shared across parallel workers (default 25).",
+    )
+    p.add_argument(
+        "--search-seeds",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2],
+        help="Benchmark search: every trial is trained once per seed; the objective is the mean validation AP "
+        "(default 0 1 2, i.e. trials x 3 training runs per model).",
     )
     p.add_argument(
         "--startup-trials",
@@ -1243,8 +1419,34 @@ def main() -> None:
     )
     p.add_argument(
         "--loss",
-        default="bce_focal_tversky",
+        default="bce_focal",
         help="Loss for the temporal and data-sources suites (the losses and hardness suites set their own).",
+    )
+    p.add_argument(
+        "--loss-stage",
+        choices=("base", "reweight", "all"),
+        default="base",
+        help="Losses suite: base = un-reweighted families (run first); reweight = OHEM stage built on the better of "
+        "bce_focal / bce_focal_tversky (needs --carry-from or --carry-loss); all = both.",
+    )
+    p.add_argument(
+        "--carry-from",
+        default=None,
+        metavar="BASE_GROUP",
+        help="Losses (reweight stage) / hardness: W&B group of a FINISHED base-stage sweep; the better of bce_focal and "
+        "bce_focal_tversky (by mean validation AP) and its best parameters are used.",
+    )
+    p.add_argument(
+        "--carry-loss",
+        default=None,
+        help="Losses / hardness: name the carried loss manually.",
+    )
+    p.add_argument(
+        "--carry-opt",
+        nargs="+",
+        default=None,
+        metavar="KEY=VAL",
+        help="Loss options for --carry-loss.",
     )
     p.add_argument(
         "--models",
@@ -1365,8 +1567,12 @@ def main() -> None:
         manifest = {
             "suite": "benchmark",
             "sampler": "Optuna TPE Bayesian optimisation (multivariate, constant liar)",
-            "objective": "maximise validation val_ap",
+            "objective": f"maximise MEAN validation val_ap over seeds {list(args.search_seeds)}",
+            "search_seeds": list(args.search_seeds),
             "trials_per_model": args.trials,
+            "training_runs_total": args.trials * len(models) * len(args.search_seeds),
+            "confirmation": "best trial per model retrained over seeds with holdout evaluation: "
+            "benchmark --confirm --studies ... --top-k 1 --stratify-by model --seeds 0 1 2",
             "startup_trials": (
                 args.startup_trials
                 if args.startup_trials is not None
@@ -1377,28 +1583,32 @@ def main() -> None:
             "loss": BENCHMARK_LOSS,
             "search_spaces": {
                 "common": {
-                    "learning_rate": "log-uniform [3e-5, 1e-3]",
-                    "weight_decay": "log-uniform [1e-5, 5e-2]",
-                    "dropout": "uniform [0, 0.35]",
+                    "learning_rate": "log-uniform [2e-5, 2e-3]",
+                    "weight_decay": "log-uniform [1e-6, 1e-1]",
+                    "dropout": "uniform [0, 0.4]",
                 },
                 "tsvit": {
-                    "embed_dim": [96, 128, 160],
-                    "num_heads": [4, 8],
-                    "depth_temporal": [1, 4],
-                    "depth_spatial": [2, 6],
+                    "embed_dim": [64, 96, 128, 160, 192, 256],
+                    "num_heads": [2, 4, 8],
+                    "depth_temporal": [1, 6],
+                    "depth_spatial": [1, 8],
                     "patch_size": [8, 16, 32],
-                    "skip_channels": [16, 24, 32, 48],
+                    "skip_channels": [0, 16, 24, 32, 48, 64],
+                    "batch_size": [4, 8, 16],
                 },
                 "sits_scd": {
-                    "base_features": [32, 48, 64, 96],
+                    "base_features": [24, 32, 48, 64, 96, 128],
                     "num_heads": [2, 4, 8],
                     "depth_temporal": [1, 4],
-                    "depth_spatial": [2, 6],
+                    "convs_per_block": [1, 4],
+                    "batch_size": [2, 4, 8],
                 },
                 "unet_lstm": {
-                    "base_features": [24, 32, 48, 64, 96],
-                    "skip_channels": [16, 24, 32, 48],
+                    "base_features": [16, 24, 32, 48, 64, 96],
                     "depth_temporal": [1, 3],
+                    "lstm_kernel": [3, 5],
+                    "convs_per_block": [1, 4],
+                    "batch_size": [2, 4, 8],
                 },
             },
             "note": "This is adaptive: exact trial configs are chosen sequentially from prior validation AP results. Add --execute to run training.",
@@ -1406,9 +1616,15 @@ def main() -> None:
         path = out / f"benchmark_plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         path.write_text(json.dumps(manifest, indent=2))
         print(
-            f"Wrote Bayesian benchmark plan ({args.trials} trials/model; {args.trials * len(models)} total) to {path}"
+            f"Wrote Bayesian benchmark plan ({args.trials} trials/model x {len(args.search_seeds)} seeds; "
+            f"{args.trials * len(models) * len(args.search_seeds)} training runs total) to {path}"
         )
-        print("python experiments.py benchmark --execute --trials", args.trials)
+        print(
+            "python experiments.py benchmark --execute --trials",
+            args.trials,
+            "--search-seeds",
+            *args.search_seeds,
+        )
         return
 
     if args.suite == "benchmark":  # --confirm

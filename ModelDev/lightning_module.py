@@ -35,10 +35,7 @@ class GainDetectionTask(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        if loss is None:  # checkpoint from before the loss refactor
-            loss_cfg, model_kwargs = LossConfig.from_legacy(model_kwargs)
-        else:
-            loss_cfg = LossConfig.from_dict(loss)
+        loss_cfg = LossConfig.from_dict(loss)
         self.loss_cfg = loss_cfg
 
         self.lr = lr

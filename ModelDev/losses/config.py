@@ -16,6 +16,7 @@ RECIPES: dict[str, tuple[str, ...]] = {
     "dice": ("dice",),
     "focal_tversky": ("tversky",),
     "bce_focal_tversky": ("bce", "tversky"),
+    "bce_focal": ("bce", "focal"),
     "focal": ("focal",),
     "lovasz": ("lovasz",),
     "bce_lovasz": ("bce", "lovasz"),
@@ -78,7 +79,7 @@ class HardnessConfig:
 
 @dataclass(frozen=True)
 class LossConfig:
-    name: str = "bce_focal_tversky"
+    name: str = "bce_focal"
     confidence: str = (
         "hard"  # 'soft': gain pixels count with their confidence weight (validation metrics too)
     )
@@ -143,45 +144,6 @@ class LossConfig:
                 raise ValueError(f"loss option '{opt}' must look like key=value")
             cfg = _set(cfg, key.split("."), raw)
         return cfg
-
-    @classmethod
-    def from_legacy(cls, kwargs: dict) -> tuple["LossConfig", dict]:
-        """Build a config from the flat hyperparameters of checkpoints saved before this refactor.
-        Returns (config, the remaining kwargs)."""
-        kw = dict(kwargs)
-        take = lambda k, default=None: kw.pop(k, default)  # noqa: E731
-        reweight = (
-            "hardness"
-            if take("hardness", False)
-            else "ohem" if take("ohem", False) else "none"
-        )
-        cfg = cls(
-            name=take("loss_name", "bce_focal_tversky"),
-            confidence=take("loss_type", "hard"),
-            pos_weight=take("pos_weight"),
-            lovasz_per_image=take("lovasz_per_image", False),
-            reweight=reweight,
-            tversky=TverskyConfig(
-                alpha=take("tversky_alpha", 0.5),
-                beta=take("tversky_beta", 0.5),
-                gamma=take("tversky_gamma", 1.0),
-            ),
-            focal=FocalConfig(
-                gamma=take("focal_gamma", 2.0), alpha=take("focal_alpha")
-            ),
-            ohem=OhemConfig(
-                thresh=take("ohem_thresh", 0.7), min_kept=take("ohem_min_kept", 4096)
-            ),
-            hardness=HardnessConfig(
-                layer=take("hl_layer"),
-                c=take("hl_c", 0.1),
-                alpha=take("hl_alpha", 0.01),
-            ),
-        )
-        kw.pop("hl_channels", None)
-        kw.pop("ohem", None)
-        kw.pop("hardness", None)
-        return cfg, kw
 
 
 _SECTIONS = {
