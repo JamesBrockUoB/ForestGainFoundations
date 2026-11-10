@@ -194,27 +194,27 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
             dropout=dropout,
             skip_channels=trial.suggest_categorical("skip_channels", [16, 24, 32, 48]),
         )
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
 
     elif model == "sits_scd":
         structure = dict(
-            base_features=trial.suggest_categorical("base_features", [32, 48, 64, 96]),
+            base_features=trial.suggest_categorical("base_features", [24, 32, 48, 64]),
             num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 3),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
 
     elif model == "unet_lstm":
         structure = dict(
             base_features=trial.suggest_categorical("base_features", [24, 32, 48, 64]),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 2),
+            depth_temporal=trial.suggest_int("depth_temporal", 1, 3),
             lstm_kernel=trial.suggest_categorical("lstm_kernel", [3, 5]),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
-        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
+        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
 
     else:
         raise ValueError(f"Unknown benchmark model: {model}")
@@ -1591,21 +1591,21 @@ def main() -> None:
                     "depth_spatial": [2, 4, 6],
                     "patch_size": [8, 16, 32],
                     "skip_channels": [16, 24, 32, 48],
-                    "batch_size": [4, 8, 16],
+                    "batch_size": [2, 4, 8],
                 },
                 "sits_scd": {
-                    "base_features": [32, 48, 64, 96],
+                    "base_features": [24, 32, 48, 64],
                     "num_heads": [2, 4, 8],
-                    "depth_temporal": [1, 4],
+                    "depth_temporal": [1, 3],
                     "convs_per_block": [1, 2],
-                    "batch_size": [4, 8, 16],
+                    "batch_size": [2, 4, 8],
                 },
                 "unet_lstm": {
                     "base_features": [24, 32, 48, 64],
-                    "depth_temporal": [1, 2],
+                    "depth_temporal": [1, 3],
                     "lstm_kernel": [3, 5],
                     "convs_per_block": [1, 2],
-                    "batch_size": [4, 8, 16],
+                    "batch_size": [2, 4, 8],
                 },
             },
         }
