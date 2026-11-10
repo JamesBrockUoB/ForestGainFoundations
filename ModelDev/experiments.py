@@ -194,7 +194,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
             dropout=dropout,
             skip_channels=trial.suggest_categorical("skip_channels", [16, 24, 32, 48]),
         )
-        batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
 
     elif model == "sits_scd":
         structure = dict(
@@ -204,7 +204,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
             depth_temporal=trial.suggest_int("depth_temporal", 1, 4),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
-        batch_size = trial.suggest_categorical("batch_size", [1, 2, 4])
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
 
     elif model == "unet_lstm":
         structure = dict(
@@ -214,7 +214,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
             lstm_kernel=trial.suggest_categorical("lstm_kernel", [3, 5]),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
-        batch_size = trial.suggest_categorical("batch_size", [1, 2])
+        batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
 
     else:
         raise ValueError(f"Unknown benchmark model: {model}")
@@ -1591,21 +1591,21 @@ def main() -> None:
                     "depth_spatial": [2, 4, 6],
                     "patch_size": [8, 16, 32],
                     "skip_channels": [16, 24, 32, 48],
-                    "batch_size": [2, 4, 8],
+                    "batch_size": [4, 8, 16],
                 },
                 "sits_scd": {
                     "base_features": [32, 48, 64, 96],
                     "num_heads": [2, 4, 8],
                     "depth_temporal": [1, 4],
                     "convs_per_block": [1, 2],
-                    "batch_size": [1, 2, 4],
+                    "batch_size": [4, 8, 16],
                 },
                 "unet_lstm": {
                     "base_features": [24, 32, 48, 64],
                     "depth_temporal": [1, 2],
                     "lstm_kernel": [3, 5],
                     "convs_per_block": [1, 2],
-                    "batch_size": [1, 2],
+                    "batch_size": [4, 8, 16],
                 },
             },
         }
