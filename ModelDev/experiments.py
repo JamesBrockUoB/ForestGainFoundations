@@ -5,7 +5,7 @@ Examples
 python experiments.py benchmark --dry-run
 python experiments.py benchmark --models tsvit --execute --trials 25 --search-seeds 0 1 2 --study-name fg_tsvit --storage-path optuna_journal.log --worker-id 0
 python experiments.py data-sources --model tsvit --execute
-python experiments.py data-sources --model tsvit --seeds 0 --loss bce_focal --learning-rate 3.5e-4 \
+python experiments.py data-sources --model tsvit --seeds 0 --loss bce_focal_tversky --learning-rate 3.5e-4 \
     --weight-decay 5.8e-3 --model-opt embed_dim=160 num_heads=4 depth_temporal=3 depth_spatial=2 patch_size=8 \
     dropout=0.22 skip_channels=24 --dry-run
 python experiments.py losses --model tsvit --execute --max-runs 12
@@ -96,7 +96,7 @@ SOURCE_SETS = (
 )
 
 BENCHMARK_MODELS = ("tsvit", "sits_scd", "unet_lstm")
-BENCHMARK_LOSS = "bce_focal"  # must exist in losses.LOSS_NAMES
+BENCHMARK_LOSS = "bce_focal_tversky"  # must exist in losses.LOSS_NAMES
 
 
 def _base(args: argparse.Namespace, model: str, sources: tuple[str, ...]) -> dict:
@@ -895,7 +895,7 @@ def losses(args: argparse.Namespace) -> list[dict]:
     """Loss sweep with the model's confirmed configuration (or train.py defaults), in two stages.
 
     base      un-reweighted families. Coordinate sweeps around each default (one parameter at a time) rather than the
-              full grid, so the space is wider at about the same cost. Includes bce_focal (the default loss).
+              full grid, so the space is wider at about the same cost. Includes bce_focal_tversky (the default loss).
     reweight  OHEM on BCE, on Focal, and on the better of bce_focal / bce_focal_tversky from the finished base stage
               (--carry-from BASE_GROUP, or --carry-loss), using that winner's best parameters.
     """
@@ -1416,7 +1416,7 @@ def main() -> None:
     )
     p.add_argument(
         "--loss",
-        default="bce_focal",
+        default="bce_focal_tversky",
         help="Loss for the temporal and data-sources suites (the losses and hardness suites set their own).",
     )
     p.add_argument(

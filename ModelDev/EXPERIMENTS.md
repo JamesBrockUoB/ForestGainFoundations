@@ -37,7 +37,7 @@ Tessera tiles can contain corrupt values that the export checks did not catch: f
 
 ## 1. Model and optimiser benchmark
 
-The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and the `bce_focal` loss (BCE + focal), and maximises the **mean validation average precision (`val_ap`) over 3 seeds**. `--trials` is the **total budget per model** and is shared across parallel workers (default 25; there is no upper cap). Every trial is trained once per seed in `--search-seeds` (default `0 1 2`), so the default budget is 25 trials × 3 seeds × 3 models = **225 training runs**. The budget is exact: a worker that claims a slot beyond `--trials` hands it back without training.
+The benchmark uses **Optuna TPE Bayesian optimisation**, not a fixed Cartesian grid. It searches each architecture separately using S1 + S2 and the `bce_focal_tversky` loss (BCE + focal_tversky), and maximises the **mean validation average precision (`val_ap`) over 3 seeds**. `--trials` is the **total budget per model** and is shared across parallel workers (default 25; there is no upper cap). Every trial is trained once per seed in `--search-seeds` (default `0 1 2`), so the default budget is 25 trials × 3 seeds × 3 models = **225 training runs**. The budget is exact: a worker that claims a slot beyond `--trials` hands it back without training.
 
 ```bash
 # Write the search plan only (default: 25 trials per model, 3 seeds per trial)
@@ -54,7 +54,7 @@ A trial is scored only if **every** seed finishes with a parseable validation AP
 - **Random start-up:** the first `--startup-trials` trials are random (default: a third of `--trials`, between 5 and 24, so 8 for 25 trials). With parallel workers, trials that start before any result exists are effectively random too.
 - **Multivariate TPE:** parameters are modelled jointly, so interactions such as "the best learning rate depends on model size" are captured.
 - **Constant liar:** in-flight trials count as poor results, so concurrent workers don't pile onto the same region.
-- Failed trials (`FAIL`) are ignored by TPE but still use up budget. Check the failure rate, especially out-of-memory failures on large configurations (TSViT `patch_size=8` with a large `embed_dim` and deep spatial depth; SITS-SCD with 128 base features at a large batch size, because its temporal attention runs per pixel at full resolution): TPE cannot learn to avoid configs it never sees a score for. With only 25 trials, each failure matters.
+- Failed trials (`FAIL`) are ignored by TPE but still use up budget. Check the failure rate, especially out-of-memory failures on large configurations (TSViT `patch_size=8` with a large `embed_dim` and deep spatial depth; SITS-SCD with 64 base features, temporal depth 3 and batch size 8, because its temporal attention runs per pixel at full resolution): TPE cannot learn to avoid configs it never sees a score for. With only 25 trials, each failure matters.
 
 ### Running trials in parallel (SLURM): benchmark, then confirmation
 
@@ -116,10 +116,10 @@ Each trial's W&B group is the study name and its variant is `trialNN`, where NN 
 
 ### Search spaces
 
-- **All models:** learning rate `2e-5`–`2e-3` (log scale), weight decay `1e-6`–`1e-1` (log scale), dropout `0`–`0.4`, batch size (TSViT `{4,8,16}`, the CNN models `{2,4,8}`). Every searched value is consumed by the model.
-- **TSViT:** embedding dimension `{64,96,128,160,192,256}`, attention heads `{2,4,8}`, temporal depth `1`–`6`, spatial depth `1`–`8`, patch size `{8,16,32}`, skip channels `{0,16,24,32,48,64}` (0 turns the full-resolution skip branch off).
-- **SITS_SCD:** base features `{24,32,48,64,96,128}`, attention heads `{2,4,8}`, temporal depth `1`–`4` (stacked pre-norm residual temporal attention layers per scale), `convs_per_block` `1`–`4` (convolutions in every encoder, bottleneck and decoder block). Dropout is Dropout2d in the conv blocks and attention / residual dropout in the temporal layers.
-- **U-Net_LSTM:** base features `{16,24,32,48,64,96}`, temporal depth `1`–`3` (stacked ConvLSTM layers), `lstm_kernel` `{3,5}`, `convs_per_block` `1`–`4`. Dropout is Dropout2d in the conv blocks and between ConvLSTM layers. `skip_channels` no longer exists for this model.
+- **All models:** learning rate `3e-5`–`1e-3` (log scale), weight decay `1e-5`–`5e-2` (log scale), dropout `0`–`0.4`, batch size `{2,4,8}`. Every searched value is consumed by the model.
+- **TSViT:** embedding dimension `{96,128,160,192}`, attention heads `{2,4,8}`, temporal depth `1`–`4`, spatial depth `{2,4,6}`, patch size `{8,16,32}`, skip channels `{16,24,32,48}`. Patch size 4 is excluded because its spatial attention sequence is far too long.
+- **SITS_SCD:** base features `{24,32,48,64}`, attention heads `{2,4,8}`, temporal depth `1`–`3` (stacked pre-norm residual temporal attention layers per scale), `convs_per_block` `1`–`2` (convolutions in every encoder, bottleneck and decoder block). Dropout is Dropout2d in the conv blocks and attention / residual dropout in the temporal layers.
+- **U-Net_LSTM:** base features `{24,32,48,64}`, temporal depth `1`–`3` (stacked ConvLSTM layers), `lstm_kernel` `{3,5}`, `convs_per_block` `1`–`2`. Dropout is Dropout2d in the conv blocks and between ConvLSTM layers. `skip_channels` no longer exists for this model.
 
 Categorical choice lists must stay static per parameter name (Optuna requirement), so every width is divisible by every head count offered. If you change a list, keep that true.
 
@@ -175,7 +175,7 @@ After choosing a winner, the checkpoints of its runs are listed in the `.runs.cs
 
 Use one selected/frozen model and training configuration for all 15 source combinations (every non-empty subset of S1, S2, AlphaEarth and Tessera). The configuration is the best benchmark trial of the chosen model, so that only the data source changes. There are two steps: a **sweep** over all sources (validation AP only), then a **confirmation** of the top sources on the holdout.
 
-**The trial numbers and parameter values quoted in this section (trial 28 / 33 / 45, the learning rate, weight decay and `--model-opt` in the direct example) come from the previous benchmark** (single seed, `bce_focal_tversky`, the old search space). After the new benchmark has run, update the launcher defaults (`LR`, `WD`, `MODEL_OPT`, `LOSS=bce_focal`) to the new winners, or pass them via `--export`.
+**The trial numbers and parameter values quoted in this section (trial 28 / 33 / 45, the learning rate, weight decay and `--model-opt` in the direct example) come from the benchmark** (single seed, `bce_focal_tversky`). After the new benchmark has run, update the launcher defaults (`LR`, `WD`, `MODEL_OPT`, `LOSS=bce_focal_tversky`) to the new winners, or pass them via `--export`.
 
 ```bash
 # 1. sweep: 15 source sets x 3 seeds = 45 runs, one per array task, at most 20 at once
@@ -185,7 +185,7 @@ sbatch --export=ALL,MODEL=sits_scd run_fg_data_sources.sh      # sits_scd
 
 # when the sweep has finished: rank the sources (validation AP, mean over seeds)
 python report.py --group data-sources_tsvit_<sweep job id> --metric val_ap \
-    --baseline tsvit_s1+s2_bce_focal --out reports/data_sources_tsvit
+    --baseline tsvit_s1+s2_bce_focal_tversky --out reports/data_sources_tsvit
 
 # 2. confirmation: the top 3 sources x 3 seeds = 9 runs WITH holdout evaluation
 sbatch --array=0-8 --export=ALL,MODEL=tsvit,CONFIRM_FROM=data-sources_tsvit_<sweep job id> run_fg_data_sources.sh
@@ -209,7 +209,7 @@ To run it directly, pass the configuration explicitly; without `--model-opt` the
 
 ```bash
 python experiments.py data-sources --model tsvit --seeds 0 1 2 --group data_sources_tsvit \
-  --learning-rate 0.00034779544459228077 --weight-decay 0.005786816724872467 --loss bce_focal \
+  --learning-rate 0.00034779544459228077 --weight-decay 0.005786816724872467 --loss bce_focal_tversky \
   --model-opt embed_dim=160 num_heads=4 depth_temporal=3 depth_spatial=2 patch_size=8 dropout=0.22185365097777363 skip_channels=24 \
   --dry-run
 python experiments.py data-sources --model tsvit --seeds 0 1 2 --top-sources-from data_sources_tsvit --top-k 3 \
@@ -239,7 +239,7 @@ python experiments.py losses --model tsvit --seeds 0 1 2 --loss-stage reweight -
 
 The suite uses the **optimal TSViT**: learning rate, weight decay, architecture (`model_opt`) and batch size are read from `experiment_manifests/confirmed_configs.json`, i.e. the winner of the benchmark confirmation (section 1), exactly as in the temporal and maskclean suites. If the file is missing it warns and falls back to `train.py` defaults, which would make the whole comparison use an untuned model, so run the benchmark confirmation first. `--learning-rate`, `--weight-decay`, `--batch-size` and `--model-opt` are ignored by this suite.
 
-The default training loss is **`bce_focal`** (BCE + focal, recipe `("bce", "focal")` in `losses/config.py`, also the `LossConfig` default). Parameters are varied **one at a time around their default**, not as a full grid, so the space is wider at a similar cost.
+The default training loss is **`bce_focal_tversky`** (BCE + focal_tversky, recipe `("bce", "focal_tversky")` in `losses/config.py`, also the `LossConfig` default). Parameters are varied **one at a time around their default**, not as a full grid, so the space is wider at a similar cost.
 
 **Stage 1 (`--loss-stage base`): 40 configurations**
 
@@ -368,7 +368,7 @@ All non-benchmark suites accept:
 - `--group NAME`: W&B group for the launch (default `<suite>_<timestamp>`); `--wandb-project NAME`: W&B project.
 - `--match-steps` / `--no-match-steps`: augmentation suite only, see section 6.
 - `--model-opt KEY=VAL ...`: architecture options passed to every run of the data-sources, losses, hardness and augmentation suites (use the best benchmark configuration).
-- `--loss NAME`: loss for the data-sources and temporal suites (default `bce_focal`, the benchmark loss).
+- `--loss NAME`: loss for the data-sources and temporal suites (default `bce_focal_tversky`, the benchmark loss).
 - `--source-index N`: data-sources suite, run only the N-th source combination, 0-14 (for parallel SLURM tasks).
 - `--top-sources-from GROUP` and `--top-k K`: data-sources suite, confirmation of the K best combinations of a finished sweep, with holdout evaluation (section 2).
 - `--epochs`, `--patience`, `--batch-size`, `--learning-rate`, `--weight-decay`, `--data-dir`, `--holdout-dir`, `--split-seed`.

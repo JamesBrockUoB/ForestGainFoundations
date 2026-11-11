@@ -34,7 +34,8 @@ dependencies = [
     "wandb",
     "pytorch-lightning",
     "pytest",
-    "streamlit-drawable-canvas",
+    "optuna",
+    "umap-learn",
 ]
 
 

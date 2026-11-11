@@ -52,4 +52,6 @@ tmp_requirements.txt
 
 ground_truth_masks/
 
-*analysis*
+*ModelDev/analysis*
+
+*analysis_results*
