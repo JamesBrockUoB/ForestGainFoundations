@@ -42,30 +42,6 @@ class Pixels:
         return bool(self.valid.any())
 
 
-# ---- Lovasz hinge (Berman et al. 2018; same as mmsegmentation) --------------------------------------
-def lovasz_grad(gt_sorted):
-    """Gradient of the Lovasz extension of the Jaccard loss w.r.t. sorted errors (Berman et al. 2018, Alg. 1)."""
-    p = len(gt_sorted)
-    gts = gt_sorted.sum()
-    intersection = gts - gt_sorted.float().cumsum(0)
-    union = gts + (1 - gt_sorted).float().cumsum(0)
-    jaccard = 1.0 - intersection / union
-    if p > 1:  # cover 1-pixel case
-        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
-    return jaccard
-
-
-def lovasz_hinge_flat(logits, labels):
-    """Binary Lovasz hinge loss on flat valid pixels. logits [P] (raw), labels [P] in {0, 1}."""
-    if len(labels) == 0:
-        return logits.sum() * 0.0  # only void pixels: zero gradient
-    signs = 2.0 * labels.float() - 1.0
-    errors = 1.0 - logits * signs
-    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
-    gt_sorted = labels[perm.data]
-    return torch.dot(F.relu(errors_sorted), lovasz_grad(gt_sorted))
-
-
 # ---- terms ------------------------------------------------------------------------------------------
 class Bce(nn.Module):
     """Weighted BCE. How pixels are re-weighted (none / OHEM / learned hardness) is the reweighter's job.
@@ -145,23 +121,3 @@ class Dice(nn.Module):
     def forward(self, px: Pixels):
         tp, fp, fn = _confusion(px)
         return 1.0 - (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
-
-
-class Lovasz(nn.Module):
-    """Lovasz hinge on binary labels (ignores the soft confidence weights)."""
-
-    def __init__(self, per_image: bool = False):
-        super().__init__()
-        self.per_image = per_image
-
-    def forward(self, px: Pixels):
-        logits, valid = px.logits2d, px.valid
-        y = (px.mask2d > 0.5).float()
-        if not self.per_image:
-            return lovasz_hinge_flat(logits[valid], y[valid])
-        per_tile = [
-            lovasz_hinge_flat(logits[b][valid[b]], y[b][valid[b]])
-            for b in range(logits.shape[0])
-            if valid[b].any()
-        ]
-        return torch.stack(per_tile).mean()

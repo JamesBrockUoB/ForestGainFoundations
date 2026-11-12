@@ -29,7 +29,10 @@ class GainDetectionTask(pl.LightningModule):
         sources: tuple[str, ...] = ("s1", "s2"),
         years: (
             tuple[int, ...] | None
-        ) = None,  # frames the model sees (None = all of config.YEARS)
+        ) = None,  # frames the model sees (None = all of config.YEARS),
+        indices: (
+            tuple[str, ...] | None
+        ) = None,  # which spectral indices to use for training (None = just the raw bands)
         **model_kwargs,
     ):
         super().__init__()
@@ -47,6 +50,7 @@ class GainDetectionTask(pl.LightningModule):
         )  # 'soft' -> validation metrics use the confidence weights (see metrics.py)
         self.sources = tuple(sources)  # stored so eval can rebuild the right dataset
         self.years = tuple(years) if years else tuple(YEARS)  # ditto (hparam `years`)
+        self.indices = tuple(indices) if indices else None  # ditto (hparam `indices`)
 
         self.model = build_model(
             model_type=model_type,

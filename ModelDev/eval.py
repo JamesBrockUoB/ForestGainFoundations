@@ -21,6 +21,21 @@ def _checkpoint_years(task):
     return tuple(years) if years else None
 
 
+def _checkpoint_indices(task) -> tuple[str, ...]:
+    """Derived spectral indices the checkpoint was trained with (old checkpoints = none)."""
+    return tuple(task.hparams.get("indices") or ())
+
+
+def _check_channels(task, ds) -> None:
+    """Fail early if the rebuilt dataset does not produce the channel count the model was trained with."""
+    expected = task.hparams.get("in_channels")
+    if expected is not None and expected != ds.num_channels:
+        raise ValueError(
+            f"Checkpoint expects {expected} input channels but the rebuilt dataset has {ds.num_channels} "
+            f"(sources={ds.sources}, indices={ds.indices})."
+        )
+
+
 def evaluate_checkpoint(
     checkpoint_path: str,
     test_dir: str | Path,
@@ -39,6 +54,9 @@ def evaluate_checkpoint(
 
     tile_dirs: evaluate exactly these tile directories (e.g. the validation split) instead of every tile_* folder of
     test_dir.
+
+    Sources, years and derived indices are read back from the checkpoint's hyperparameters, so the evaluated input
+    matches what the model was trained on. Index scaling comes from the index_stats.json present at eval time.
 
     If the checkpoint was trained with the soft loss, the main metrics use the gain confidences as pixel weights (see
     metrics.py); the plain binary numbers are returned as well, prefixed bin_ (comparable with hard-loss runs).
@@ -69,7 +87,10 @@ def evaluate_checkpoint(
     task.to(device)
 
     sources = _checkpoint_sources(task)
-    print(f"sources: {sources} | years: {_checkpoint_years(task) or 'all'}")
+    indices = _checkpoint_indices(task)
+    print(
+        f"sources: {sources} | years: {_checkpoint_years(task) or 'all'} | indices: {indices or None}"
+    )
 
     print(
         f"label cleaning: min_gain_px={min_gain_px} fill_holes_px={fill_holes_px} "
@@ -79,12 +100,14 @@ def evaluate_checkpoint(
         test_dirs,
         sources=sources,
         years=_checkpoint_years(task),
+        indices=indices,
         crop_size=crop_size,
         min_gain_px=min_gain_px,
         fill_holes_px=fill_holes_px,
         conf_filter=conf_filter,
         conf_harden=conf_harden,
     )
+    _check_channels(task, test_ds)
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
@@ -150,8 +173,10 @@ def generate_gain_map(
         [tile_dir],
         sources=_checkpoint_sources(task),
         years=_checkpoint_years(task),
+        indices=_checkpoint_indices(task),
         crop_size=crop_size,
     )
+    _check_channels(task, ds)
     pixels = (
         ds[0]["pixels"]
         .unsqueeze(0)

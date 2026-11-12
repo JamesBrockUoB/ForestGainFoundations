@@ -6,8 +6,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pytorch_lightning as pl
+from compute_index_stats import ensure_norm_stats
 from config import DEFAULT_IMAGE_SIZE, SOURCES, YEARS
-from datasets import MultiTemporalGainDataset
+from datasets import INDEX_NAMES, MultiTemporalGainDataset, load_index_stats
 from eval import evaluate_checkpoint
 from lightning_module import GainDetectionTask
 from losses import LOSS_NAMES, REWEIGHTS, LossConfig, parse_value
@@ -99,7 +100,7 @@ def parse_args(argv=None):
         "--loss_opt",
         nargs="+",
         metavar="KEY=VAL",
-        help="Fine-tune loss settings with dotted keys, e.g. tversky.alpha=0.7 focal.gamma=3 ohem.thresh=0.9 hardness.c=0.01 lovasz_per_image=True.",
+        help="Fine-tune loss settings with dotted keys, e.g. tversky.alpha=0.7 focal.gamma=3 ohem.thresh=0.9 hardness.c=0.01.",
     )
 
     g = p.add_argument_group("optimisation")
@@ -129,6 +130,18 @@ def parse_args(argv=None):
         default=["s1", "s2"],
         choices=list(SOURCES),
         help="Input products; channels are concatenated (e.g. alphaearth, tessera, s1 s2, s1 s2 alphaearth)",
+    )
+    g.add_argument(
+        "--indices",
+        nargs="+",
+        default=None,
+        choices=list(INDEX_NAMES),
+        help="Derived spectral indices appended as extra input channels (idx_<name>). 'di' needs forest_tc in index_stats.json.",
+    )
+    g.add_argument(
+        "--refit_norm_stats",
+        action="store_true",
+        help="Refit requested band and index p1/p99 stats from TRAINING tiles, even when entries already exist in index_stats.json.",
     )
     g.add_argument(
         "--years",
@@ -271,7 +284,6 @@ def build_loss_config(args, train_dirs) -> LossConfig:
         name=cfg.name,
         confidence=cfg.confidence,
         pos_weight=cfg.pos_weight,
-        lovasz_per_image=cfg.lovasz_per_image,
         reweight=reweight,
         tversky=cfg.tversky,
         focal=cfg.focal,
@@ -302,6 +314,7 @@ def run_name(args, loss_cfg, years) -> str:
     parts = [
         args.model_type,
         "+".join(args.sources),
+        *([f"idx-{'+'.join(args.indices)}"] if args.indices else []),
         loss_cfg.confidence,
         loss_cfg.name,
         *([f"rw-{loss_cfg.reweight}"] if loss_cfg.reweight != "none" else []),
@@ -337,12 +350,33 @@ def train(args):
     pl.seed_everything(args.seed, workers=True)
     sources = tuple(args.sources)
     years = tuple(sorted(args.years)) if args.years else None
+    indices = tuple(args.indices) if args.indices else ()
 
     train_dirs, val_dirs = split_tiles(
         args.data_dir, val_frac=args.val_frac, seed=args.split_seed
     )
     print(f"train tiles: {len(train_dirs)} | val tiles: {len(val_dirs)} ")
-    print(f"sources: {sources} | years: {years or tuple(YEARS)}")
+    print(
+        f"sources: {sources} | years: {years or tuple(YEARS)} | indices: {indices or None}"
+    )
+
+    # 'di' uses forest_tc as an input statistic, so fail before attempting to
+    # calculate the derived-index stats if that prerequisite is absent.
+    if "di" in indices and "forest_tc" not in load_index_stats().get("norm", {}):
+        raise SystemExit(
+            "The 'di' index requires a 'forest_tc' entry in the 'norm' block of "
+            "index_stats.json before it can be fitted. Add forest_tc and rerun."
+        )
+
+    # Fit only after splitting, and pass TRAINING tiles only to prevent validation
+    # leakage. Existing entries are retained; missing requested entries are added.
+    # --refit_norm_stats recomputes the requested entries in place.
+    ensure_norm_stats(
+        train_dirs,
+        sources,
+        indices=indices,
+        refit=args.refit_norm_stats,
+    )
 
     loss_cfg = build_loss_config(args, train_dirs)
     model_opts = parse_model_opts(args.model_opt)
@@ -387,6 +421,7 @@ def train(args):
         conf_filter=args.conf_filter,
         conf_harden=args.conf_harden,
         years=years,
+        indices=indices,
     )
     val_cleaning = (
         dict(
@@ -403,6 +438,7 @@ def train(args):
         sources=sources,
         crop_size=None,
         years=years,
+        indices=indices,
         **val_cleaning,
     )
 

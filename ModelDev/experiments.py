@@ -23,7 +23,7 @@ Suites
                 --loss, --model-opt; --source-index N runs only the N-th combination, for parallel SLURM tasks;
                 --top-sources-from GROUP --top-k K retrains the K best combinations of a finished sweep over the
                 seeds WITH holdout evaluation: the confirmation step)
-  losses        bce, dice, focal Tversky, BCE+Tversky, focal, focal+OHEM, Lovasz, BCE+Lovasz, OHEM
+  losses        bce, dice, focal Tversky, BCE+Tversky, focal, BCE + focal
   hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
   augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
@@ -816,89 +816,173 @@ def _run(args: argparse.Namespace, **extra) -> dict:
     }
 
 
-CARRY_CANDIDATES = ("bce_focal", "bce_focal_tversky")
+DEFAULT_LOSSES = (
+    "bce",
+    "dice",
+    "focal",
+    "bce_focal",
+    "focal_tversky",
+    "bce_focal_tversky",
+)
 
 
-def pick_carry(args: argparse.Namespace) -> dict:
-    """Better of the two BCE + focal-type losses (bce_focal, bce_focal_tversky) in a FINISHED base-stage sweep.
-
-    Ranked by mean validation AP over seeds among un-reweighted runs; the winner's best loss_opt / pos_weight are
-    returned too, so later stages (OHEM, hardness) build on its best setting. Deterministic (ties by variant name).
-    """
-    import statistics
-
+def best_default_loss(args: argparse.Namespace) -> tuple[str, dict]:
+    """Pick the best default-screen recipe by mean validation AP over the requested seeds."""
     import wandb
 
+    seeds = set(args.seeds or [args.seed])
     api = wandb.Api()
     project = args.wandb_project or "Forest-Gain-CD"
-    by: dict[str, dict] = {}
+    by_variant = {}
+
     for run in api.runs(
-        f"{api.default_entity}/{project}", filters={"group": args.carry_from}
+        f"{api.default_entity}/{project}", filters={"group": args.tune_from}
     ):
         if run.state != "finished":
             continue
-        cfg, summary = dict(run.config), dict(run.summary)
-        val = summary.get("val_ap.max", summary.get("val_ap"))
+
+        cfg = dict(run.config)
         variant = cfg.get("variant")
+        seed = cfg.get("seed")
+        val = run.summary.get("val_ap.max", run.summary.get("val_ap"))
+
         if (
-            val is None
+            cfg.get("suite") != "losses"
+            or cfg.get("model_type") != args.model
             or not variant
-            or cfg.get("loss_name") not in CARRY_CANDIDATES
-            or (cfg.get("reweight") or "none") != "none"
+            or not variant.startswith("default-")
+            or seed is None
+            or val is None
         ):
             continue
-        by.setdefault(variant, {"vals": [], "cfg": cfg})["vals"].append(float(val))
-    if not by:
+
+        entry = by_variant.setdefault(variant, {"scores": {}, "cfg": cfg})
+        seed = int(seed)
+        created_at = str(getattr(run, "created_at", "") or "")
+        old = entry["scores"].get(seed)
+
+        if old is None or created_at >= old[0]:
+            entry["scores"][seed] = (created_at, float(val), cfg)
+
+    complete = []
+    for variant, entry in by_variant.items():
+        scores = entry["scores"]
+        if seeds.issubset(scores):
+            vals = [scores[seed][1] for seed in sorted(seeds)]
+            complete.append(
+                (statistics.fmean(vals), variant, entry["scores"][min(seeds)][2])
+            )
+
+    if not complete:
         raise SystemExit(
-            f"No finished {CARRY_CANDIDATES} runs with a validation AP in W&B group '{args.carry_from}'."
+            f"No default-loss variant in W&B group '{args.tune_from}' has "
+            f"finished results for every seed {sorted(seeds)}."
         )
-    ranked = sorted(
-        ((statistics.fmean(v["vals"]), name, v["cfg"]) for name, v in by.items()),
-        key=lambda r: (-r[0], r[1]),
-    )
-    best: dict[str, tuple] = {}
-    for mean, variant, cfg in ranked:  # best configuration of each candidate loss
-        best.setdefault(cfg["loss_name"], (mean, variant, cfg))
+
+    complete.sort(key=lambda row: (-row[0], row[1]))
+    mean, variant, cfg = complete[0]
     print(
-        f"Carry-over candidates in '{args.carry_from}' (best configuration, mean validation AP over seeds):"
+        f"Default-screen winner: {cfg['loss_name']} ({variant}), "
+        f"mean val_ap={mean:.5f} over seeds {sorted(seeds)}"
     )
-    for name, (mean, variant, _) in best.items():
-        print(f"  {name:<20} val_ap={mean:.4f}  {variant}")
-    winner = max(best, key=lambda n: best[n][0])
-    cfg = best[winner][2]
-    print(f"-> carrying {winner} into the later stages")
-    carry = {"loss_name": winner}
-    if cfg.get("loss_opt"):
-        carry["loss_opt"] = list(cfg["loss_opt"])
-    if cfg.get("pos_weight") is not None:
-        carry["pos_weight"] = cfg["pos_weight"]
-    return carry
+    return cfg["loss_name"], cfg
 
 
-def resolve_carry(args: argparse.Namespace, required: bool) -> dict | None:
-    """The loss added to the later stages: --carry-loss (manual) or the winner of --carry-from (W&B)."""
-    if args.carry_loss:
-        return {
-            "loss_name": args.carry_loss,
-            **({"loss_opt": list(args.carry_opt)} if args.carry_opt else {}),
-        }
-    if args.carry_from:
-        return pick_carry(args)
-    if required:
+def default_loss_screen(args: argparse.Namespace) -> list[dict]:
+    """Compare the six default recipes only with no OHEM."""
+    cfg = load_confirmed_configs().get(args.model)
+    if cfg is None:
         raise SystemExit(
-            "--loss-stage reweight needs --carry-from BASE_GROUP (or --carry-loss NAME [--carry-opt ...])."
+            f"No confirmed model configuration for {args.model}. "
+            "Run benchmark confirmation first so the loss screen uses the tuned model."
         )
-    return None
+
+    tuned = {
+        "learning_rate": cfg["learning_rate"],
+        "weight_decay": cfg["weight_decay"],
+        "model_opt": cfg["model_opt"],
+        **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
+    }
+
+    rows = []
+    for name in DEFAULT_LOSSES:
+        rows.append(
+            _base(args, args.model, tuple(args.sources))
+            | tuned
+            | {"loss_name": name, "variant": f"default-{name}", "reweight": "none"}
+        )
+    return rows
+
+
+def tune_default_loss(args: argparse.Namespace, tuned: dict) -> list[dict]:
+    """Tiny one-factor-at-a-time tuning on the winning default-screen recipe."""
+    if not args.tune_from:
+        raise SystemExit("--loss-stage tune requires --tune-from DEFAULT_SCREEN_GROUP")
+
+    loss_name, _cfg = best_default_loss(args)
+
+    if loss_name == "bce":
+        points = [
+            ("pos-weight-auto", {"pos_weight": "auto"}),
+        ]
+    elif loss_name in ("focal", "bce_focal"):
+        points = [
+            ("gamma1", {"loss_opt": _opts(**{"focal.gamma": 1.0})}),
+            ("gamma3", {"loss_opt": _opts(**{"focal.gamma": 3.0})}),
+            ("alpha0.25", {"loss_opt": _opts(**{"focal.alpha": 0.25})}),
+            ("alpha0.75", {"loss_opt": _opts(**{"focal.alpha": 0.75})}),
+        ]
+    elif loss_name in ("focal_tversky", "bce_focal_tversky"):
+        points = [
+            (
+                "alpha0.4",
+                {"loss_opt": _opts(**{"tversky.alpha": 0.4, "tversky.beta": 0.6})},
+            ),
+            (
+                "alpha0.6",
+                {"loss_opt": _opts(**{"tversky.alpha": 0.6, "tversky.beta": 0.4})},
+            ),
+            (
+                "gamma0.75",
+                {"loss_opt": _opts(**{"tversky.gamma": 0.75})},
+            ),
+            (
+                "gamma1.33",
+                {"loss_opt": _opts(**{"tversky.gamma": 1.33})},
+            ),
+        ]
+    elif loss_name == "dice":
+        print(
+            "Dice has no exposed loss-specific tuning parameters; "
+            "keeping its default-screen result without a redundant tuning run."
+        )
+        return []
+    else:
+        raise SystemExit(f"No light-tuning settings are defined for {loss_name}.")
+
+    rows = []
+    for label, overrides in points:
+        rows.append(
+            _base(args, args.model, tuple(args.sources))
+            | tuned
+            | {"loss_name": loss_name}
+            | overrides
+            | {
+                "variant": f"tune-{loss_name}-{label}",
+                "skip_test_eval": True,
+                "val_metrics": True,
+            }
+        )
+
+    print(
+        f"Light-tuning {loss_name}: {len(rows)} configurations, "
+        f"{len(rows) * len(args.seeds or [args.seed])} runs."
+    )
+    return rows
 
 
 def losses(args: argparse.Namespace) -> list[dict]:
-    """Loss sweep with the model's confirmed configuration (or train.py defaults), in two stages.
-
-    base      un-reweighted families. Coordinate sweeps around each default (one parameter at a time) rather than the
-              full grid, so the space is wider at about the same cost. Includes bce_focal_tversky (the default loss).
-    reweight  OHEM on BCE, on Focal, and on the better of bce_focal / bce_focal_tversky from the finished base stage
-              (--carry-from BASE_GROUP, or --carry-loss), using that winner's best parameters.
-    """
+    """Focused loss comparison: screen six default recipes, then tune the winner."""
     cfg = load_confirmed_configs().get(args.model)
     if cfg is None:
         print(
@@ -914,87 +998,15 @@ def losses(args: argparse.Namespace) -> list[dict]:
             **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
         }
 
-    def run(**kwargs):
-        return _run(args, **(tuned | kwargs))
+    if args.loss_stage == "defaults":
+        return default_loss_screen(args)
 
-    def uniq(points):
-        return list(dict.fromkeys(points))
+    if args.loss_stage == "tune":
+        return tune_default_loss(args, tuned)
 
-    rows = []
-    if args.loss_stage in ("base", "all"):
-        # BCE / Dice; BCE positive-class weight (none vs sqrt(neg/pos))
-        rows += [
-            run(loss_name="bce"),
-            run(loss_name="bce", pos_weight="auto"),
-            run(loss_name="dice"),
-        ]
-
-        # Tversky-based: alpha at gamma 1, gamma at alpha 0.5 (beta = 1 - alpha)
-        tversky = uniq(
-            [(a, 1.0) for a in (0.3, 0.4, 0.5, 0.6, 0.7)]
-            + [(0.5, g) for g in (0.75, 1.33, 1.67, 2.0)]
-        )
-        for name in ("focal_tversky", "bce_focal_tversky"):
-            for alpha, gamma in tversky:
-                opts = _opts(
-                    **{
-                        "tversky.alpha": alpha,
-                        "tversky.beta": round(1 - alpha, 2),
-                        "tversky.gamma": gamma,
-                    }
-                )
-                rows.append(run(loss_name=name, loss_opt=opts))
-
-        # Focal and BCE + Focal: gamma with alpha unset, alpha at gamma 2
-        focal = uniq(
-            [(g, None) for g in (0.5, 1.0, 2.0, 3.0, 5.0)]
-            + [(2.0, a) for a in (0.25, 0.75)]
-        )
-        for name in ("focal", "bce_focal"):
-            for gamma, alpha in focal:
-                rows.append(
-                    run(
-                        loss_name=name,
-                        loss_opt=_opts(**{"focal.gamma": gamma, "focal.alpha": alpha}),
-                    )
-                )
-        rows.append(run(loss_name="bce_focal", pos_weight="auto"))
-
-        # Lovasz hinge: pooled / per tile, alone / added to BCE
-        for name, per_tile in itertools.product(
-            ("lovasz", "bce_lovasz"), (False, True)
-        ):
-            rows.append(
-                run(
-                    loss_name=name,
-                    loss_opt=_opts(lovasz_per_image=True) if per_tile else None,
-                )
-            )
-
-    if args.loss_stage in ("reweight", "all"):
-        carry = resolve_carry(args, required=True)
-        carry_opts = carry.get("loss_opt", [])
-        carry_extra = {
-            k: v for k, v in carry.items() if k != "loss_opt"
-        }  # loss_name (+ pos_weight)
-
-        # OHEM threshold at the default min_kept, then min_kept at threshold 0.9
-        ohem = [(t, 4096) for t in (0.6, 0.7, 0.8, 0.9)] + [(0.9, 1024), (0.9, 16384)]
-        for t, k in ohem:
-            o = _opts(**{"ohem.thresh": t, "ohem.min_kept": k})
-            rows.append(run(loss_name="bce", reweight="ohem", loss_opt=o))
-            rows.append(run(**carry_extra, reweight="ohem", loss_opt=carry_opts + o))
-
-        # Focal + OHEM: gamma and alpha at threshold 0.9, threshold at the default focal
-        pts = uniq(
-            [(g, None, 0.9) for g in (1.0, 2.0, 3.0)]
-            + [(2.0, a, 0.9) for a in (0.25, 0.75)]
-            + [(2.0, None, t) for t in (0.6, 0.7, 0.8, 0.9)]
-        )
-        for gamma, alpha, t in pts:
-            o = _opts(**{"focal.gamma": gamma, "focal.alpha": alpha, "ohem.thresh": t})
-            rows.append(run(loss_name="focal", reweight="ohem", loss_opt=o))
-    return rows
+    raise ValueError(
+        f"Unsupported loss stage {args.loss_stage!r}; expected 'defaults' or 'tune'."
+    )
 
 
 # Segmentation head the hardness branch mirrors, per model. TSViT's `decoder` is a multi-conv head, so the branch is a
@@ -1008,49 +1020,37 @@ HARDNESS_LAYERS = {
 
 
 def hardness(args: argparse.Namespace) -> list[dict]:
-    """Compare no reweighting, OHEM, and learned hardness on identical BCE-based recipes.
-    Sweeps hardness offset c, auxiliary-loss alpha and (TSViT only) the segmentation head the branch mirrors.
-    --hl-layer overrides the per-model layers above. The second loss is bce_focal, or the winner of the loss sweep
-    when --carry-from / --carry-loss is given (with that winner's best parameters).
-    """
+    """Compare no reweighting, OHEM, and learned hardness on BCE-based recipes."""
     layers = (args.hl_layer,) if args.hl_layer else HARDNESS_LAYERS[args.model]
-    carry = resolve_carry(args, required=False)
-    second = carry["loss_name"] if carry else "bce_focal"
-    carry_opts = carry.get("loss_opt", []) if carry else []
-    carry_extra = {
-        k: v for k, v in (carry or {}).items() if k not in ("loss_opt", "loss_name")
-    }
     rows = []
-    for name in ("bce", second):
-        pre = carry_opts if name == second else []
-        extra = carry_extra if name == second else {}
-        # Matched controls: same recipe, split, seed, model and optimiser.
-        rows.append(
-            _run(args, loss_name=name, reweight="none", loss_opt=pre or None, **extra)
-        )
-        for thresh in (0.7, 0.9):
+
+    for loss_name in ("bce", "bce_focal"):
+        # Matched controls: same recipe, split, seed, model, and optimiser.
+        rows.append(_run(args, loss_name=loss_name, reweight="none"))
+
+        for threshold in (0.7, 0.9):
             rows.append(
                 _run(
                     args,
-                    loss_name=name,
+                    loss_name=loss_name,
                     reweight="ohem",
-                    loss_opt=pre + _opts(**{"ohem.thresh": thresh}),
-                    **extra,
+                    loss_opt=_opts(**{"ohem.thresh": threshold}),
                 )
             )
+
         for layer, c, alpha in itertools.product(
             layers, (0.01, 0.1), (0.001, 0.01, 0.05)
         ):
             rows.append(
                 _run(
                     args,
-                    loss_name=name,
+                    loss_name=loss_name,
                     reweight="hardness",
                     hl_layer=layer,
-                    loss_opt=pre + _opts(**{"hardness.c": c, "hardness.alpha": alpha}),
-                    **extra,
+                    loss_opt=_opts(**{"hardness.c": c, "hardness.alpha": alpha}),
                 )
             )
+
     return rows
 
 
@@ -1415,35 +1415,17 @@ def main() -> None:
         help="Pass --loss_type to every run (default: train.py's default).",
     )
     p.add_argument(
-        "--loss",
-        default="bce_focal_tversky",
-        help="Loss for the temporal and data-sources suites (the losses and hardness suites set their own).",
-    )
-    p.add_argument(
         "--loss-stage",
-        choices=("base", "reweight", "all"),
-        default="base",
-        help="Losses suite: base = un-reweighted families (run first); reweight = OHEM stage built on the better of "
-        "bce_focal / bce_focal_tversky (needs --carry-from or --carry-loss); all = both.",
+        choices=("defaults", "tune", "base", "reweight", "all"),
+        default="defaults",
+        help="Loss suite: defaults = six default recipes only; tune = light tuning on the best default-screen winner; "
+        "base/reweight/all retain the legacy detailed sweeps.",
     )
     p.add_argument(
-        "--carry-from",
+        "--tune-from",
         default=None,
-        metavar="BASE_GROUP",
-        help="Losses (reweight stage) / hardness: W&B group of a FINISHED base-stage sweep; the better of bce_focal and "
-        "bce_focal_tversky (by mean validation AP) and its best parameters are used.",
-    )
-    p.add_argument(
-        "--carry-loss",
-        default=None,
-        help="Losses / hardness: name the carried loss manually.",
-    )
-    p.add_argument(
-        "--carry-opt",
-        nargs="+",
-        default=None,
-        metavar="KEY=VAL",
-        help="Loss options for --carry-loss.",
+        metavar="DEFAULT_SCREEN_GROUP",
+        help="Loss suite tune stage: W&B group containing a completed defaults screen.",
     )
     p.add_argument(
         "--models",

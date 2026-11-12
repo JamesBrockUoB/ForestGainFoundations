@@ -18,8 +18,6 @@ RECIPES: dict[str, tuple[str, ...]] = {
     "bce_focal_tversky": ("bce", "tversky"),
     "bce_focal": ("bce", "focal"),
     "focal": ("focal",),
-    "lovasz": ("lovasz",),
-    "bce_lovasz": ("bce", "lovasz"),
 }
 LOSS_NAMES = tuple(RECIPES)
 
@@ -84,9 +82,6 @@ class LossConfig:
         "hard"  # 'soft': gain pixels count with their confidence weight (validation metrics too)
     )
     pos_weight: float | None = None  # BCE positive-class weight
-    lovasz_per_image: bool = (
-        False  # Lovasz hinge per tile instead of pooled over the batch
-    )
     reweight: str = "none"  # none | ohem | hardness  (BCE term only)
     tversky: TverskyConfig = TverskyConfig()
     focal: FocalConfig = FocalConfig()
@@ -136,7 +131,7 @@ class LossConfig:
         return cls(**d)
 
     def with_overrides(self, opts: Iterable[str] | None) -> "LossConfig":
-        """Apply ['tversky.alpha=0.7', 'lovasz_per_image=True', ...]."""
+        """Apply ['tversky.alpha=0.7', 'focal.gamma=3', ...]."""
         cfg = self
         for opt in opts or ():
             key, eq, raw = opt.partition("=")

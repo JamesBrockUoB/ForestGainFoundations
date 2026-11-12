@@ -227,76 +227,39 @@ The 15 combinations are `SOURCE_SETS` in `experiments.py`, indexed 0-14 in this 
 - For the leading source sets and S1+S2, run a short tuning search (learning rate, weight decay, dropout) and confirm with 3 seeds. If the ranking holds, it is robust to tuning; if it changes, report both tables. This needs the benchmark's `("s1", "s2")` source set replaced by `args.sources` in `run_bayesian_benchmark` and a separate `--study-name` per source set.
 - State the limitation. If a source beats S1+S2 even though the configuration favours S1+S2, the result is conservative.
 
-## 3. Loss exploration
+## 3. Loss exploration and light tuning
+
+The default workflow first compares the eight supported loss recipes with their default loss-specific parameters. It then tunes a small set of parameters for only the best recipe. Keep the confirmed model configuration, source set, split and training options fixed throughout.
 
 ```bash
-# stage 1: un-reweighted families (40 configs)
-python experiments.py losses --model tsvit --seeds 0 1 2 --loss-stage base --execute
+# Stage 1: eight default recipes x three seeds = 24 runs.
+python experiments.py losses --model tsvit --seeds 0 1 2 \
+  --loss-stage defaults --group losses_tsvit_defaults --execute
 
-# stage 2: OHEM, built on the better of bce_focal / bce_focal_tversky from the finished stage 1 (20 configs)
-python experiments.py losses --model tsvit --seeds 0 1 2 --loss-stage reweight --carry-from losses_tsvit_<stage 1 group> --execute
+# Inspect validation AP, then tune the screen winner.
+# Use the same group so screen and tuning runs can be reported together.
+python report.py --group losses_tsvit_defaults --metric val_ap \
+  --out reports/losses_tsvit_defaults
+
+python experiments.py losses --model tsvit --seeds 0 1 2 \
+  --loss-stage tune --tune-from losses_tsvit_defaults \
+  --group losses_tsvit_defaults --execute
 ```
 
-The suite uses the **optimal TSViT**: learning rate, weight decay, architecture (`model_opt`) and batch size are read from `experiment_manifests/confirmed_configs.json`, i.e. the winner of the benchmark confirmation (section 1), exactly as in the temporal and maskclean suites. If the file is missing it warns and falls back to `train.py` defaults, which would make the whole comparison use an untuned model, so run the benchmark confirmation first. `--learning-rate`, `--weight-decay`, `--batch-size` and `--model-opt` are ignored by this suite.
+The default screen runs one configuration each for BCE, Dice, Focal, BCE + Focal, Focal Tversky, BCE + Focal Tversky. All loss-specific options, including positive-class weighting, use their defaults. The default screen is **6 configurations / 18 runs** with three seeds.
 
-The default training loss is **`bce_focal_tversky`** (BCE + focal_tversky, recipe `("bce", "focal_tversky")` in `losses/config.py`, also the `LossConfig` default). Parameters are varied **one at a time around their default**, not as a full grid, so the space is wider at a similar cost.
+The tune stage chooses the highest mean validation AP among default-screen variants that have finished for every requested seed. It tunes only the selected recipe:
 
-**Stage 1 (`--loss-stage base`): 40 configurations**
-
-| Family | Configurations |
+| Winning recipe | Light tuning configurations |
 |---|---|
-| BCE | positive weight none / auto (2) |
-| Dice | none (1) |
-| Focal | gamma {0.5,1,2,3,5} with alpha unset; alpha {0.25,0.75} at gamma 2 (7) |
-| BCE + Focal | the same 7, plus positive weight auto (8) |
-| Focal Tversky | alpha {0.3,0.4,0.5,0.6,0.7} at gamma 1 (beta = 1 - alpha); gamma {0.75,1.33,1.67,2.0} at alpha 0.5 (9) |
-| BCE + Focal Tversky | the same 9 |
-| Lovasz, BCE + Lovasz | pooled / per-image reduction (2 + 2) |
+| BCE | automatic positive-class weight |
+| Focal or BCE + Focal | gamma 1 and 3; alpha 0.25 and 0.75 |
+| Focal Tversky or BCE + Focal Tversky | alpha 0.4 and 0.6; gamma 0.75 and 1.33 |
+| Dice | no loss-specific parameter is exposed; proceed with its default configuration |
 
-**Stage 2 (`--loss-stage reweight`): 20 configurations.** `--carry-from <stage 1 group>` reads the finished stage 1 from W&B, picks the better of `bce_focal` and `bce_focal_tversky` (best configuration of each, by mean validation AP over seeds, un-reweighted runs only), prints both, and uses the winner **with its best loss options and positive weight** below. `--carry-loss NAME [--carry-opt KEY=VAL ...]` sets it manually instead. The stage 1 sweep must have finished first.
+The largest tune stage is **4 configurations / 12 runs**. Thus screening plus tuning is at most **36 runs**. If Dice wins, no redundant tuning run is generated.
 
-| Family | Configurations |
-|---|---|
-| BCE + OHEM | threshold {0.6,0.7,0.8,0.9} at `min_kept` 4096; `min_kept` {1024,16384} at threshold 0.9 (6) |
-| carried loss + OHEM | the same 6, on the stage 1 winner |
-| Focal + OHEM | gamma {1,2,3} and alpha {unset,0.25,0.75} at threshold 0.9; threshold {0.6,0.7,0.8,0.9} at gamma 2, alpha unset (8) |
-
-**Focal + OHEM is implemented, not just listed as a command.** The Focal term calculates unreduced per-pixel focal losses and passes them to the configured reweighter. OHEM selects hard pixels using the model's confidence in the true class (threshold-based mmsegmentation-style selection), then the selected pixels' focal losses are reduced. `SegmentationLoss` handles the focal term's `(loss, auxiliary_loss, stats)` result just as it does BCE. Make sure the updated `terms.py` and loss package `__init__.py` are installed in the actual `losses/` package before running this suite.
-
-**Cost with 3 seeds (0, 1, 2):**
-
-| Step | Configurations | Runs |
-|---|---|---|
-| Stage 1 sweep | 40 | 120 |
-| Stage 2 sweep | 20 | 60 |
-| Confirmation (best of each of 11 families, holdout evaluated) | 11 | 33 |
-| **Total** | | **213** |
-
-The 11 confirmed families are (loss, reweight): bce, dice, focal_tversky, bce_focal_tversky, focal, bce_focal, lovasz, bce_lovasz (stage 1), and bce + OHEM, the carried loss + OHEM and focal + OHEM (stage 2). `--confirm-top-k 2` doubles the confirmation. `hardness` (section 4) is separate; it accepts the same `--carry-from` / `--carry-loss`.
-
-It is a structured comparison, not a full Bayesian optimisation of every loss parameter. Use multiple seeds for shortlisted loss configurations.
-
-### Investigating the sweep and confirming the best of each loss
-
-```bash
-# 1. aggregate each stage over seeds (validation AP only), baseline = plain BCE
-python report.py --group losses_tsvit_<stage 1 job id> --baseline tsvit_s1+s2_bce --out reports/losses_tsvit_base
-python report.py --group losses_tsvit_<stage 2 job id> --baseline tsvit_s1+s2_bce --out reports/losses_tsvit_reweight
-
-# 2. preview the best configuration per loss family, then the exact confirmation commands
-#    (--confirm-from takes ONE group, so give the same --group to both stages, or confirm each stage separately)
-python experiments.py losses --model tsvit --confirm-from losses_tsvit_<sweep job id> --seeds 0 1 2 --dry-run
-
-# 3. confirm on SLURM: one task per (family, seed), holdout evaluated
-SUITE=losses SWEEP_GROUP=losses_tsvit_<sweep job id> sbatch run_fg_confirm_suite.sh
-python confirm_top_k.py aggregate --group losses-confirm_tsvit_<confirm job id> --out reports/losses_confirm_tsvit --no-confirmed-config
-```
-
-See "Confirmation and holdout" below for how this generalises to the other suites. A loss family is (loss, reweight): bce, dice, focal_tversky, bce_focal_tversky, focal, bce_focal, lovasz, bce_lovasz, and bce / the carried loss / focal with OHEM (11 families, so 33 tasks with 3 seeds). `--confirm-from` ranks every configuration in the sweep group by mean validation AP over its seeds (finished runs only), prints the full table per family with the selected one marked `*`, and retrains the winner with `--skip_test_eval` off, copying learning rate, weight decay, architecture and every loss option from the sweep run's own W&B config. Use `--confirm-top-k 2` to confirm the two best per family.
-
-Reading the sweep: treat differences smaller than the seed spread (about 0.005 validation AP for TSViT, more for several losses) as ties; check whether a family's best setting sits on the edge of its grid (e.g. Tversky alpha 0.7, gamma 2.0, OHEM threshold 0.9), in which case widen the grid and re-run that family; and compare families by their confirmed holdout numbers, not the sweep's best-of-many validation AP. AP is threshold-free, while precision, recall, F1 and IoU depend on the 0.5 threshold, which Tversky/Lovasz-type losses shift, so read the `test_*` threshold metrics alongside AP. Confirming with the sweep's seeds mostly replicates the sweep (same initialisation and sample order); pass other seeds (`SEEDS="3 4 5"`) for an independent estimate. As in section 1, choose on validation AP and report the holdout numbers without using them to choose.
-
-`aggregate` also writes `confirmed_configs.json` (best variant per model) unless `--no-confirmed-config` is given; use the flag for every group except the benchmark confirmation, otherwise it overwrites the confirmed TSViT entry with the best loss / data-source variant and drops `loss_opt` / `reweight`. The confirmed entry now also carries the searched `batch_size`; the temporal, losses and maskclean suites copy learning rate, weight decay, loss and `model_opt` from it, so check whether they should also pick up its batch size.
+Choose the final configuration using validation results only. Retrain the selected configuration on confirmation seeds with holdout evaluation enabled; do not use holdout results to choose between configurations. The former `--loss-stage base`, `reweight` and `all` detailed sweeps remain available, but are not part of this lower-cost default workflow.
 
 ### Confirmation and holdout (all suites)
 

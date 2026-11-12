@@ -4,7 +4,7 @@
     criterion = SegmentationLoss(cfg)
     loss = criterion(seg_logits, gain_mask, gain_weight, gain_valid)
 
-Layout: config.py (all options and defaults), terms.py (BCE / focal / Tversky / Dice / Lovasz),
+Layout: config.py (all options and defaults), terms.py (BCE / focal / Tversky / Dice),
 reweight.py (none / OHEM / learned hardness for the BCE term), this file (summing the terms).
 """
 
@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from .config import LOSS_NAMES, RECIPES, REWEIGHTS, LossConfig, parse_value
 from .reweight import LearnedHardness, NoReweight, Ohem
-from .terms import Bce, Dice, Focal, Lovasz, Pixels, Tversky, pixel_weights
+from .terms import Bce, Dice, Focal, Pixels, Tversky, pixel_weights
 
 __all__ = [
     "LOSS_NAMES",
@@ -42,8 +42,6 @@ def _term(name: str, cfg: LossConfig) -> nn.Module:
         return Tversky(cfg.tversky)
     if name == "dice":
         return Dice(cfg.tversky)
-    if name == "lovasz":
-        return Lovasz(cfg.lovasz_per_image)
     raise ValueError(name)
 
 

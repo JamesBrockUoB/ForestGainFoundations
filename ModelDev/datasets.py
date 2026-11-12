@@ -1,3 +1,6 @@
+import copy
+import json
+import os
 import random
 from pathlib import Path
 
@@ -10,7 +13,7 @@ from config import (
     EMBEDDING_SOURCES,
     NORM_CLIP,
     NORM_NAN_FILL,
-    NORM_STATS,
+    S1_BANDS,
     S2_BANDS,
     S2_SCALE,
     SOURCES,
@@ -19,6 +22,184 @@ from config import (
 )
 from mask_cleaning import clean_labels
 from torch.utils.data import Dataset
+
+# Derived spectral indices (optional extra input channels, requested with indices=(...))
+#
+# Computed per pixel and per frame in PHYSICAL units (S2 reflectance 0-1, S1 dB), AFTER augmentation and cropping and
+# BEFORE normalisation, so the augmented reflectance flows through to the indices. NaN inputs give NaN outputs, which
+# normalize() then fills like any other S2/S1 channel. The channels are appended after the source channels and are
+# named "idx_<name>". Dual-pol S1 only (VV, VH): RFDI needs HH, so it is not offered, and VH-VV is already the S1_VVVH channel.
+#
+#   ndvi   (B8 - B4) / (B8 + B4)
+#   evi2   2.5 (B8 - B4) / (B8 + 2.4 B4 + 1)
+#   nbr    (B8 - B12) / (B8 + B12)
+#   ndmi   (B8 - B11) / (B8 + B11)
+#   ndre   (B8 - B5) / (B8 + B5)
+#   tcb / tcg / tcw   Tasseled Cap brightness / greenness / wetness, linear in B2 B3 B4 B8 B11 B12 (TCT_COEFFS)
+#   rvi4s1 4 VH / (VV + VH) on linear power (S1 is stored in dB, converted here)
+#
+# Scaling: indices are not in NORM_STATS. normalize() uses (lo, hi) from index_stats.json ("norm") when present
+# (write it with compute_index_stats.py, which uses TRAINING tiles only) and otherwise the rough fixed defaults below.
+# ---------------------------------------------------------------------------------------------------------------------
+# Rows: brightness, greenness, wetness. Columns: B2 (blue), B3 (green), B4 (red), B8 (NIR), B11 (SWIR1), B12 (SWIR2).
+# Source: the tutorial at medium.com/@hee2013news (attributed there to Shi & Xu 2019). Reader reports say these do not
+# match the paper's six-band values (they resemble Landsat-8 OLI coefficients), so check them before relying on them.
+TCT_BANDS = ("B2", "B3", "B4", "B8", "B11", "B12")
+TCT_COEFFS = {
+    "tcb": (0.3037, 0.2793, 0.4743, 0.5585, 0.5082, 0.1863),
+    "tcg": (-0.2848, -0.2435, -0.5436, 0.7243, 0.0840, -0.1800),
+    "tcw": (0.1509, 0.1973, 0.3279, 0.3406, -0.7112, -0.4572),
+}
+
+INDEX_BANDS = {
+    "ndvi": ("B8", "B4"),
+    "evi2": ("B8", "B4"),
+    "nbr": ("B8", "B12"),
+    "ndmi": ("B8", "B11"),
+    "ndre": ("B8", "B5"),
+    "tcb": TCT_BANDS,
+    "tcg": TCT_BANDS,
+    "tcw": TCT_BANDS,
+    "di": TCT_BANDS,
+    "rvi4s1": ("VV", "VH"),
+}
+INDEX_NAMES = tuple(INDEX_BANDS)
+
+# Rough fixed (lo, hi) used only when index_stats.json has no "norm" entry for an index.
+DEFAULT_INDEX_NORM = {
+    "ndvi": (-0.1, 0.95),
+    "evi2": (-0.05, 0.9),
+    "nbr": (-0.2, 0.9),
+    "ndmi": (-0.3, 0.7),
+    "ndre": (-0.05, 0.6),
+    "tcb": (0.0, 0.6),
+    "tcg": (-0.2, 0.35),
+    "tcw": (-0.35, 0.15),
+    "di": (-3.0, 5.0),
+    "rvi4s1": (0.1, 0.9),
+}
+INDEX_STATS_PATH = Path(
+    os.environ.get("FG_INDEX_STATS", Path(__file__).with_name("index_stats.json"))
+)
+
+
+# Raw channels that get (x - lo) / (hi - lo) scaling from the stats file. Embeddings are not normalised.
+NORMALISED_BANDS = tuple(S2_BANDS) + tuple(S1_BANDS)
+
+_STATS_CACHE: dict = {}
+
+
+def load_index_stats(path: Path = INDEX_STATS_PATH) -> dict:
+    """{"bands": {name: [lo, hi]}, "norm": {index: [lo, hi]}, "forest_tc": {...}}; {} if the file is absent.
+    Re-read only when the file's mtime changes; callers get a private copy."""
+    path = Path(path)
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except FileNotFoundError:
+        return {}
+    if key not in _STATS_CACHE:
+        _STATS_CACHE.clear()
+        _STATS_CACHE[key] = json.loads(path.read_text())
+    return copy.deepcopy(_STATS_CACHE[key])
+
+
+def band_norm(name: str, stats: dict | None = None) -> tuple[float, float]:
+    stats = load_index_stats() if stats is None else stats
+    try:
+        lo, hi = stats["bands"][name]
+    except KeyError:
+        raise KeyError(
+            f"No normalisation stats for band {name!r} in {INDEX_STATS_PATH}. "
+            "train.py fits them automatically; or run compute_index_stats.py."
+        ) from None
+    return float(lo), float(hi)
+
+
+def index_norm(name: str, stats: dict | None = None) -> tuple[float, float]:
+    stats = load_index_stats() if stats is None else stats
+    lo, hi = stats.get("norm", {}).get(name, DEFAULT_INDEX_NORM[name])
+    return float(lo), float(hi)
+
+
+def resolve_index_channels(band_names, indices) -> dict[str, int]:
+    """Canonical band ('B8', 'VV', ...) -> channel position in band_names, for everything `indices` needs.
+    Matches the last '_'-separated token of the config band name (so 'B8', 's2_B8' and 'S2_b8' all work), VV/VH by
+    token anywhere in the name. Raises with the band list if something is missing."""
+    unknown = set(indices) - set(INDEX_BANDS)
+    if unknown:
+        raise ValueError(
+            f"Unknown indices {sorted(unknown)}; choose from {INDEX_NAMES}"
+        )
+    plan, missing = {}, []
+    for canon in sorted({b for n in indices for b in INDEX_BANDS[n]}):
+        if canon in ("VV", "VH"):
+            hits = [
+                i
+                for i, b in enumerate(band_names)
+                if b not in S2_BANDS and canon in b.upper().replace("-", "_").split("_")
+            ]
+        else:
+            hits = [
+                i
+                for i, b in enumerate(band_names)
+                if b in S2_BANDS and b.upper().split("_")[-1] == canon
+            ]
+        if len(hits) == 1:
+            plan[canon] = hits[0]
+        else:
+            missing.append(f"{canon} ({'none' if not hits else 'ambiguous'})")
+    if missing:
+        raise ValueError(
+            f"indices {tuple(indices)} need bands {', '.join(missing)} among the loaded channels {tuple(band_names)}. "
+            "Add the s1/s2 source or adjust resolve_index_channels() to your config's band names."
+        )
+    return plan
+
+
+def _ratio(num, den):
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(np.abs(den) > 1e-6, num / den, np.nan)
+
+
+def compute_indices(
+    pixels: np.ndarray, plan: dict[str, int], indices, stats=None
+) -> np.ndarray:
+    """pixels (T, C, H, W) in physical units -> (T, len(indices), H, W) float32."""
+    ch = lambda canon: pixels[:, plan[canon]]  # noqa: E731
+    stats = load_index_stats() if stats is None else stats
+    out = []
+    for n in indices:
+        if n == "ndvi":
+            v = _ratio(ch("B8") - ch("B4"), ch("B8") + ch("B4"))
+        elif n == "evi2":
+            v = 2.5 * _ratio(ch("B8") - ch("B4"), ch("B8") + 2.4 * ch("B4") + 1.0)
+        elif n == "nbr":
+            v = _ratio(ch("B8") - ch("B12"), ch("B8") + ch("B12"))
+        elif n == "ndmi":
+            v = _ratio(ch("B8") - ch("B11"), ch("B8") + ch("B11"))
+        elif n == "ndre":
+            v = _ratio(ch("B8") - ch("B5"), ch("B8") + ch("B5"))
+        elif n in ("tcb", "tcg", "tcw", "di"):
+
+            def tc(k):
+                return sum(c * ch(b) for c, b in zip(TCT_COEFFS[k], TCT_BANDS))
+
+            if n == "di":
+                ft = stats.get("forest_tc")
+                if not ft:
+                    raise ValueError(
+                        'index "di" needs mature-forest TC statistics: add a "forest_tc" entry with [mean, std] for '
+                        f'"tcb", "tcg" and "tcw" to {INDEX_STATS_PATH}'
+                    )
+                z = {k: (tc(k) - ft[k][0]) / ft[k][1] for k in ("tcb", "tcg", "tcw")}
+                v = z["tcb"] - (z["tcg"] + z["tcw"])
+            else:
+                v = tc(n)
+        elif n == "rvi4s1":
+            vv, vh = 10.0 ** (ch("VV") / 10.0), 10.0 ** (ch("VH") / 10.0)
+            v = 4.0 * _ratio(vh, vv + vh)
+        out.append(v.astype(np.float32))
+    return np.stack(out, axis=1)
 
 
 def split_tile_dirs(data_dir, val_frac=0.2, seed=0):
@@ -61,13 +242,22 @@ def read_physical(path: Path, band_names, mask_nodata: bool = False) -> np.ndarr
 
 
 def normalize(x: np.ndarray, band_names) -> np.ndarray:
-    """S1/S2: (x - p1) / (p99 - p1), clipped, NaN -> NORM_NAN_FILL.
-    Embeddings (no NORM_STATS entry): raw values, NaN -> 0."""
+    """S1/S2 bands and derived indices ("idx_*"): (x - lo) / (hi - lo) with (lo, hi) from the stats file, clipped,
+    NaN -> NORM_NAN_FILL. Embeddings: raw values, NaN -> 0."""
     out = x.astype(np.float32, copy=True)
+    stats = (
+        load_index_stats()
+        if any(b in NORMALISED_BANDS or b.startswith("idx_") for b in band_names)
+        else {}
+    )
     for i, b in enumerate(band_names):
         ch = out[..., i, :, :]
-        if b in NORM_STATS:
-            lo, hi = NORM_STATS[b]
+        if b in NORMALISED_BANDS or b.startswith("idx_"):
+            lo, hi = (
+                band_norm(b, stats)
+                if b in NORMALISED_BANDS
+                else index_norm(b[4:], stats)
+            )
             ch = np.clip((ch - lo) / (hi - lo), *NORM_CLIP)
             fill = NORM_NAN_FILL
         else:
@@ -94,8 +284,11 @@ class MultiTemporalGainDataset(Dataset):
         conf_filter: float | None = None,
         conf_harden: float | None = None,
         years: tuple[int, ...] | None = None,
+        indices: tuple[str, ...] = (),
     ):
         """
+        indices: derived spectral indices appended as extra channels ("idx_<name>"), see INDEX_NAMES. Computed after
+        augmentation, before normalisation; the sources they need (s1 for rvi4s1, s2 for the rest) must be loaded.
         years: frames fed to the model (default all of config.YEARS), e.g. (2017, 2024) for bi-temporal change detection.
         The valid-pixel mask is ALWAYS taken over every year in config.YEARS, so every year subset is trained and
         scored on exactly the same pixels.
@@ -143,12 +336,24 @@ class MultiTemporalGainDataset(Dataset):
         self.conf_filter = conf_filter
         self.conf_harden = conf_harden
 
-        self.band_names = tuple(band for s in sources for band in SOURCES[s][1])
+        source_bands = tuple(band for s in sources for band in SOURCES[s][1])
 
-        # Spectral augmentation only applies to S2 reflectance channels
+        # Spectral augmentation only applies to S2 reflectance channels (index channels are added after it)
         self.s2_channel_indices = [
-            i for i, b in enumerate(self.band_names) if b in S2_BANDS
+            i for i, b in enumerate(source_bands) if b in S2_BANDS
         ]
+
+        self.indices = tuple(indices)
+        self._index_plan = (
+            resolve_index_channels(source_bands, self.indices) if self.indices else {}
+        )
+        if "di" in self.indices:  # fail at construction, not inside a DataLoader worker
+            compute_indices(
+                np.zeros((1, len(source_bands), 1, 1), np.float32),
+                self._index_plan,
+                ("di",),
+            )
+        self.band_names = source_bands + tuple(f"idx_{n}" for n in self.indices)
 
     def __len__(self):
         return len(self.tile_dirs) * self.repeats
@@ -281,6 +486,11 @@ class MultiTemporalGainDataset(Dataset):
                 np.ascontiguousarray(pixels), gain_mask, gain_weight, combined_valid
             )
 
+        if self.indices:
+            pixels = np.concatenate(
+                [pixels, compute_indices(pixels, self._index_plan, self.indices)],
+                axis=1,
+            )
         pixels = normalize(pixels, self.band_names)
 
         return {
