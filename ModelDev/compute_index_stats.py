@@ -1,15 +1,15 @@
 """Fit the (lo, hi) = (p1, p99) scaling for the raw S1/S2 bands and the derived indices from TRAINING tiles only, and
 store it in index_stats.json ("bands" and "norm" blocks). "forest_tc" is preserved.
 
-    python compute_index_stats.py --data_dir ../DataCollection/data/test_tiles --val_frac 0.2 --split_seed 0
+    python compute_index_stats.py --data_dir ../DataCollection/data/forest_gain_tiles --val_frac 0.2 --split_seed 0
 
+Uses every training tile and every pixel (no subsampling).
 train.py calls ensure_norm_stats() and fits whatever is missing, so running this by hand is only needed to refit.
 "di" needs a "forest_tc" entry in the file before it can be fitted.
 """
 
 import argparse
 import json
-import random
 from pathlib import Path
 
 import numpy as np
@@ -27,38 +27,27 @@ from datasets import (
 from utils import split_tiles
 
 
-def _subsample(train_dirs, max_tiles):
-    train_dirs = list(train_dirs)
-    if max_tiles:
-        train_dirs = random.Random(0).sample(
-            train_dirs, min(max_tiles, len(train_dirs))
-        )
-    return train_dirs
-
-
 def fit_band_stats(
     train_dirs,
     bands,
-    stride: int = 2,
-    max_tiles: int = 0,
     pct=(1.0, 99.0),
     out=INDEX_STATS_PATH,
 ) -> dict:
     """p1/p99 of raw S1/S2 bands over valid pixels of all years, merged into the "bands" block of `out`."""
     bands = list(dict.fromkeys(bands))
-    train_dirs = _subsample(train_dirs, max_tiles)
+    train_dirs = list(train_dirs)
     template = SOURCES["s1"][0]  # S1 and S2 bands share one composite file
-    print(f"fitting band stats on {len(train_dirs)} training tiles: {bands}")
+    print(
+        f"fitting band stats on {len(train_dirs)} training tiles (all pixels): {bands}"
+    )
 
     samples = {b: [] for b in bands}
     for tile in train_dirs:
         for year in YEARS:  # pool all years: captures temporal variability
             path = tile / template.format(year=year)
-            x = read_physical(path, bands)[:, ::stride, ::stride]
+            x = read_physical(path, bands)
             with rasterio.open(path) as src:
-                valid = (
-                    src.read(VALID_MASK_BAND_INDEX)[::stride, ::stride] > 0
-                )  # NaN -> False
+                valid = src.read(VALID_MASK_BAND_INDEX) > 0  # NaN -> False
             for i, b in enumerate(bands):
                 v = x[i][valid]
                 samples[b].append(v[np.isfinite(v)])
@@ -66,9 +55,10 @@ def fit_band_stats(
     stats = load_index_stats(out)
     block = stats.setdefault("bands", {})
     for b in bands:
-        lo, hi = np.percentile(np.concatenate(samples[b]), pct)
+        allv = np.concatenate(samples[b])
+        lo, hi = np.percentile(allv, pct)
         block[b] = [float(lo), float(hi)]
-        print(f"{b:8s} p1={lo:11.6f} p99={hi:11.6f}")
+        print(f"{b:8s} p1={lo:11.6f} p99={hi:11.6f}  (n={allv.size})")
     Path(out).write_text(json.dumps(stats, indent=2))
     print(f"wrote {out}")
     return stats
@@ -78,21 +68,21 @@ def fit_index_stats(
     train_dirs,
     indices,
     sources=("s1", "s2"),
-    pixels_per_frame: int = 20000,
-    max_tiles: int = 0,
+    pct=(1.0, 99.0),
     out=INDEX_STATS_PATH,
 ) -> dict:
-    """p1/p99 of derived indices, merged into the "norm" block of `out`. Always reads the s1+s2 composites."""
+    """p1/p99 of derived indices over all pixels, merged into the "norm" block of `out`. Reads the s1+s2 composites."""
     indices = list(indices)
-    train_dirs = _subsample(train_dirs, max_tiles)
+    train_dirs = list(train_dirs)
     band_names = tuple(b for s in sources for b in SOURCES[s][1])
     plan = resolve_index_channels(band_names, indices)
     stats = load_index_stats(out)
 
-    print(f"fitting index stats on {len(train_dirs)} training tiles: {indices}")
+    print(
+        f"fitting index stats on {len(train_dirs)} training tiles (all pixels): {indices}"
+    )
 
     samples = {n: [] for n in indices}
-    nprng = np.random.default_rng(0)
     for tile in train_dirs:
         for year in YEARS:
             parts = [
@@ -102,16 +92,14 @@ def fit_index_stats(
             x = np.concatenate(parts, axis=0)[None]  # (1, C, H, W)
             v = compute_indices(x, plan, indices, stats=stats)[0]  # (K, H, W)
             flat = v.reshape(v.shape[0], -1)
-            k = min(pixels_per_frame, flat.shape[1])
-            cols = nprng.choice(flat.shape[1], size=k, replace=False)
             for i, n in enumerate(indices):
-                vals = flat[i, cols]
+                vals = flat[i]
                 samples[n].append(vals[np.isfinite(vals)])
 
     norm = stats.setdefault("norm", {})
     for n in indices:
         allv = np.concatenate(samples[n])
-        lo, hi = np.percentile(allv, [1, 99])
+        lo, hi = np.percentile(allv, pct)
         norm[n] = [float(lo), float(hi)]
         print(f"{n:7s} p1={lo:9.4f} p99={hi:9.4f}  (n={allv.size})")
     Path(out).write_text(json.dumps(stats, indent=2))
@@ -143,11 +131,13 @@ def ensure_norm_stats(
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data_dir", default="../DataCollection/data/test_tiles")
+    p.add_argument("--data_dir", default="../DataCollection/data/forest_gain_tiles")
     p.add_argument("--val_frac", type=float, default=0.2)
     p.add_argument("--split_seed", type=int, default=0)
     p.add_argument("--sources", nargs="+", default=["s1", "s2"])
-    p.add_argument("--indices", nargs="+", default=[i for i in INDEX_NAMES])
+    p.add_argument(
+        "--indices", nargs="+", default=[i for i in INDEX_NAMES if i != "di"]
+    )
     p.add_argument("--out", default=str(INDEX_STATS_PATH))
     args = p.parse_args()
 
