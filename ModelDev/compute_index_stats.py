@@ -27,13 +27,8 @@ from datasets import (
 from utils import split_tiles
 
 
-def fit_band_stats(
-    train_dirs,
-    bands,
-    pct=(1.0, 99.0),
-    out=INDEX_STATS_PATH,
-) -> dict:
-    """p1/p99 of raw S1/S2 bands over valid pixels of all years, merged into the "bands" block of `out`."""
+def fit_band_stats(train_dirs, bands, pct=(1.0, 99.0), out=INDEX_STATS_PATH) -> dict:
+    """Exact p1/p99 of raw S1/S2 bands over valid pixels of all years, one band at a time to bound memory."""
     bands = list(dict.fromkeys(bands))
     train_dirs = list(train_dirs)
     template = SOURCES["s1"][0]  # S1 and S2 bands share one composite file
@@ -41,24 +36,23 @@ def fit_band_stats(
         f"fitting band stats on {len(train_dirs)} training tiles (all pixels): {bands}"
     )
 
-    samples = {b: [] for b in bands}
-    for tile in train_dirs:
-        for year in YEARS:  # pool all years: captures temporal variability
-            path = tile / template.format(year=year)
-            x = read_physical(path, bands)
-            with rasterio.open(path) as src:
-                valid = src.read(VALID_MASK_BAND_INDEX) > 0  # NaN -> False
-            for i, b in enumerate(bands):
-                v = x[i][valid]
-                samples[b].append(v[np.isfinite(v)])
-
     stats = load_index_stats(out)
     block = stats.setdefault("bands", {})
     for b in bands:
-        allv = np.concatenate(samples[b])
+        vals = []
+        for tile in train_dirs:
+            for year in YEARS:
+                path = tile / template.format(year=year)
+                x = read_physical(path, [b])[0]  # reads only this band
+                with rasterio.open(path) as src:
+                    valid = src.read(VALID_MASK_BAND_INDEX) > 0
+                v = x[valid]
+                vals.append(v[np.isfinite(v)])
+        allv = np.concatenate(vals)
         lo, hi = np.percentile(allv, pct)
         block[b] = [float(lo), float(hi)]
-        print(f"{b:8s} p1={lo:11.6f} p99={hi:11.6f}  (n={allv.size})")
+        print(f"{b:8s} p1={lo:11.6f} p99={hi:11.6f}  (n={allv.size})", flush=True)
+        del vals, allv
     Path(out).write_text(json.dumps(stats, indent=2))
     print(f"wrote {out}")
     return stats
