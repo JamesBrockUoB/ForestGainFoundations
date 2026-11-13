@@ -824,159 +824,53 @@ DEFAULT_LOSSES = (
     "focal_tversky",
     "bce_focal_tversky",
 )
+_FOCAL_GRID = {"focal.gamma": [1.0, 2.0, 3.0], "focal.alpha": [None, 0.25, 0.75]}
+_TVERSKY_GRID = {
+    "tversky.alpha": [0.3, 0.4, 0.5, 0.6, 0.7],
+    "tversky.gamma": [0.75, 1.0, 1.33],
+}
+LOSS_GRIDS = {
+    "bce": {"pos_weight": [None, "auto", 2.0, 5.0]},
+    "dice": {},
+    "focal": _FOCAL_GRID,
+    "bce_focal": _FOCAL_GRID,
+    "focal_tversky": _TVERSKY_GRID,
+    "bce_focal_tversky": _TVERSKY_GRID,
+}
 
 
-def best_default_loss(args: argparse.Namespace) -> tuple[str, dict]:
-    """Pick the best default-screen recipe by mean validation AP over the requested seeds."""
-    import wandb
-
-    seeds = set(args.seeds or [args.seed])
-    api = wandb.Api()
-    project = args.wandb_project or "Forest-Gain-CD"
-    by_variant = {}
-
-    for run in api.runs(
-        f"{api.default_entity}/{project}", filters={"group": args.tune_from}
-    ):
-        if run.state != "finished":
-            continue
-
-        cfg = dict(run.config)
-        variant = cfg.get("variant")
-        seed = cfg.get("seed")
-        val = run.summary.get("val_ap.max", run.summary.get("val_ap"))
-
-        if (
-            cfg.get("suite") != "losses"
-            or cfg.get("model_type") != args.model
-            or not variant
-            or not variant.startswith("default-")
-            or seed is None
-            or val is None
-        ):
-            continue
-
-        entry = by_variant.setdefault(variant, {"scores": {}, "cfg": cfg})
-        seed = int(seed)
-        created_at = str(getattr(run, "created_at", "") or "")
-        old = entry["scores"].get(seed)
-
-        if old is None or created_at >= old[0]:
-            entry["scores"][seed] = (created_at, float(val), cfg)
-
-    complete = []
-    for variant, entry in by_variant.items():
-        scores = entry["scores"]
-        if seeds.issubset(scores):
-            vals = [scores[seed][1] for seed in sorted(seeds)]
-            complete.append(
-                (statistics.fmean(vals), variant, entry["scores"][min(seeds)][2])
+def loss_grid(args: argparse.Namespace, tuned: dict) -> list[dict]:
+    """Every recipe over its own parameter grid, so no recipe is judged only at its defaults."""
+    rows = []
+    for loss_name in DEFAULT_LOSSES:
+        grid = LOSS_GRIDS[loss_name]
+        keys = list(grid)
+        for combo in itertools.product(*(grid[k] for k in keys)):
+            point = dict(zip(keys, combo))
+            label = (
+                "-".join(
+                    f"{k.split('.')[-1]}{'unset' if v is None else v}"
+                    for k, v in point.items()
+                )
+                or "default"
             )
-
-    if not complete:
-        raise SystemExit(
-            f"No default-loss variant in W&B group '{args.tune_from}' has "
-            f"finished results for every seed {sorted(seeds)}."
-        )
-
-    complete.sort(key=lambda row: (-row[0], row[1]))
-    mean, variant, cfg = complete[0]
+            pos_weight = point.pop("pos_weight", None)
+            if "tversky.alpha" in point:
+                point["tversky.beta"] = round(1 - point["tversky.alpha"], 2)
+            loss_opt = _opts(**point)
+            rows.append(
+                _base(args, args.model, tuple(args.sources))
+                | tuned
+                | {
+                    "loss_name": loss_name,
+                    "reweight": "none",
+                    "variant": f"grid-{loss_name}-{label}",
+                    **({"pos_weight": pos_weight} if pos_weight is not None else {}),
+                    **({"loss_opt": loss_opt} if loss_opt else {}),
+                }
+            )
     print(
-        f"Default-screen winner: {cfg['loss_name']} ({variant}), "
-        f"mean val_ap={mean:.5f} over seeds {sorted(seeds)}"
-    )
-    return cfg["loss_name"], cfg
-
-
-def default_loss_screen(args: argparse.Namespace) -> list[dict]:
-    """Compare the six default recipes only with no OHEM."""
-    cfg = load_confirmed_configs().get(args.model)
-    if cfg is None:
-        raise SystemExit(
-            f"No confirmed model configuration for {args.model}. "
-            "Run benchmark confirmation first so the loss screen uses the tuned model."
-        )
-
-    tuned = {
-        "learning_rate": cfg["learning_rate"],
-        "weight_decay": cfg["weight_decay"],
-        "model_opt": cfg["model_opt"],
-        **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
-    }
-
-    rows = []
-    for name in DEFAULT_LOSSES:
-        rows.append(
-            _base(args, args.model, tuple(args.sources))
-            | tuned
-            | {"loss_name": name, "variant": f"default-{name}", "reweight": "none"}
-        )
-    return rows
-
-
-def tune_default_loss(args: argparse.Namespace, tuned: dict) -> list[dict]:
-    """Tiny one-factor-at-a-time tuning on the winning default-screen recipe."""
-    if not args.tune_from:
-        raise SystemExit("--loss-stage tune requires --tune-from DEFAULT_SCREEN_GROUP")
-
-    loss_name, _cfg = best_default_loss(args)
-
-    if loss_name == "bce":
-        points = [
-            ("pos-weight-auto", {"pos_weight": "auto"}),
-        ]
-    elif loss_name in ("focal", "bce_focal"):
-        points = [
-            ("gamma1", {"loss_opt": _opts(**{"focal.gamma": 1.0})}),
-            ("gamma3", {"loss_opt": _opts(**{"focal.gamma": 3.0})}),
-            ("alpha0.25", {"loss_opt": _opts(**{"focal.alpha": 0.25})}),
-            ("alpha0.75", {"loss_opt": _opts(**{"focal.alpha": 0.75})}),
-        ]
-    elif loss_name in ("focal_tversky", "bce_focal_tversky"):
-        points = [
-            (
-                "alpha0.4",
-                {"loss_opt": _opts(**{"tversky.alpha": 0.4, "tversky.beta": 0.6})},
-            ),
-            (
-                "alpha0.6",
-                {"loss_opt": _opts(**{"tversky.alpha": 0.6, "tversky.beta": 0.4})},
-            ),
-            (
-                "gamma0.75",
-                {"loss_opt": _opts(**{"tversky.gamma": 0.75})},
-            ),
-            (
-                "gamma1.33",
-                {"loss_opt": _opts(**{"tversky.gamma": 1.33})},
-            ),
-        ]
-    elif loss_name == "dice":
-        print(
-            "Dice has no exposed loss-specific tuning parameters; "
-            "keeping its default-screen result without a redundant tuning run."
-        )
-        return []
-    else:
-        raise SystemExit(f"No light-tuning settings are defined for {loss_name}.")
-
-    rows = []
-    for label, overrides in points:
-        rows.append(
-            _base(args, args.model, tuple(args.sources))
-            | tuned
-            | {"loss_name": loss_name}
-            | overrides
-            | {
-                "variant": f"tune-{loss_name}-{label}",
-                "skip_test_eval": True,
-                "val_metrics": True,
-            }
-        )
-
-    print(
-        f"Light-tuning {loss_name}: {len(rows)} configurations, "
-        f"{len(rows) * len(args.seeds or [args.seed])} runs."
+        f"Loss grid: {len(rows)} configurations, {len(rows) * len(args.seeds or [args.seed])} runs."
     )
     return rows
 
@@ -998,15 +892,7 @@ def losses(args: argparse.Namespace) -> list[dict]:
             **({"batch_size": cfg["batch_size"]} if cfg.get("batch_size") else {}),
         }
 
-    if args.loss_stage == "defaults":
-        return default_loss_screen(args)
-
-    if args.loss_stage == "tune":
-        return tune_default_loss(args, tuned)
-
-    raise ValueError(
-        f"Unsupported loss stage {args.loss_stage!r}; expected 'defaults' or 'tune'."
-    )
+    return loss_grid(args, tuned)
 
 
 # Segmentation head the hardness branch mirrors, per model. TSViT's `decoder` is a multi-conv head, so the branch is a
@@ -1413,19 +1299,6 @@ def main() -> None:
         choices=("hard", "soft"),
         default=None,
         help="Pass --loss_type to every run (default: train.py's default).",
-    )
-    p.add_argument(
-        "--loss-stage",
-        choices=("defaults", "tune", "base", "reweight", "all"),
-        default="defaults",
-        help="Loss suite: defaults = six default recipes only; tune = light tuning on the best default-screen winner; "
-        "base/reweight/all retain the legacy detailed sweeps.",
-    )
-    p.add_argument(
-        "--tune-from",
-        default=None,
-        metavar="DEFAULT_SCREEN_GROUP",
-        help="Loss suite tune stage: W&B group containing a completed defaults screen.",
     )
     p.add_argument(
         "--models",

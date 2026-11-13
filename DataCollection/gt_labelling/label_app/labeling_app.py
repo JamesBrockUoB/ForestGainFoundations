@@ -870,6 +870,9 @@ if new_queue:
 
 basemap_name = st.sidebar.selectbox("Map background", list(BASEMAPS), index=0)
 
+# NEW: side-by-side labelling view (2017 read-only on the left, 2024 drawing canvas on the right)
+compare_view = st.sidebar.checkbox("Side-by-side 2017 | 2024", key="compare_view")
+
 tile_id = st.session_state.selected_tile_id
 tile_row = gdf_projected[gdf_projected["tile_id"] == tile_id].iloc[0]
 BOUNDS = tuple(float(tile_row[k]) for k in ("x_min_m", "y_min_m", "x_max_m", "y_max_m"))
@@ -981,6 +984,22 @@ def build_composite_layer(enabled, op):
 
     img = Image.fromarray((np.clip(canvas, 0, 1) * 255).astype(np.uint8))
     return img.resize((CANVAS, CANVAS), Image.NEAREST), errors, (s_gain, s_ign)
+
+
+# NEW: plain S2 RGB for the read-only 2017 pane
+def build_s2_image(layer):
+    """Plain S2 RGB of one year at PAINT_RES. Returns (PIL image or None, error or None)."""
+    arr, err = get_layer(tile_id, layer, *BOUNDS)
+    if arr is None:
+        return None, err
+    raw = np.moveaxis(arr, 0, -1).astype(np.float32)
+    valid = np.isfinite(raw).all(axis=-1)
+    rgb = np.clip(
+        (np.nan_to_num(raw, nan=S2_VMIN) - S2_VMIN) / (S2_VMAX - S2_VMIN), 0, 1
+    )
+    rgb[~valid] = 0.0
+    img = Image.fromarray((rgb * 255).astype(np.uint8))
+    return img.resize((PAINT_RES, PAINT_RES), Image.NEAREST), err
 
 
 def _png_from_masks(green_mask, yellow_mask):
@@ -1175,19 +1194,12 @@ with st.expander("🎛️ Layer compositor", expanded=False):
             st.rerun()
 
 st.subheader("🛠️ Segmentation tools")
-tool_cols = st.columns([1.2, 1, 1, 1.5, 1, 1])
+st.caption(
+    "Tool and brush size are in the canvas toolbar. Shortcuts: B P R F E, [ ] for size, Ctrl+Z."
+)
+tool_cols = st.columns([1.5, 1, 1])
 
 with tool_cols[0]:
-    drawing_mode = st.selectbox(
-        "Tool",
-        ["brush", "polygon", "rect", "fill", "eraser"],
-        key="tool",
-    )
-
-with tool_cols[1]:
-    stroke_width = st.slider("Brush", 1, 25, 6, key="brush")
-
-with tool_cols[2]:
     CANVAS = st.select_slider(
         "Canvas scale (pixels)",
         options=[512, 768, 1024, 1280],
@@ -1197,14 +1209,14 @@ with tool_cols[2]:
 state = _canvas_state(tile_id)
 empty_mask = np.zeros((PAINT_RES, PAINT_RES), dtype=bool)
 
-with tool_cols[3]:
+with tool_cols[1]:
     if st.button("Refresh DW", key=f"refresh_dw_{tile_id}", use_container_width=True):
         state["dw_original"] = build_dw_overlay(tile_id)
         state["dw"] = state["dw_original"]
         state["canvas_revision"] = state.get("canvas_revision", 0) + 1
         st.rerun()
 
-with tool_cols[4]:
+with tool_cols[2]:
     if st.button("Remove DW", key=f"remove_dw_{tile_id}", use_container_width=True):
         state["dw"] = _png_from_masks(empty_mask, empty_mask)
         state["canvas_revision"] = state.get("canvas_revision", 0) + 1
@@ -1243,6 +1255,13 @@ def canvas_panel():
     for err in errors:
         st.warning("Could not generate " + err)
 
+    # NEW: 2017 reference pane for the side-by-side view
+    left_img = None
+    if compare_view:
+        left_img, left_err = build_s2_image(S2_A)
+        if left_err:
+            st.warning("Could not generate " + left_err)
+
     state = _canvas_state(tile_id)
     empty = np.zeros((PAINT_RES, PAINT_RES), dtype=bool)
 
@@ -1259,10 +1278,9 @@ def canvas_panel():
 
     result = paint_canvas(
         background=bg_img,
+        background_left=left_img,  # NEW
         display_px=CANVAS,
-        tool=drawing_mode,
         color="#00C800",
-        brush=stroke_width,
         token=canvas_token,
         initial_paint=initial_canvas,
         key=f"paint_{tile_id}",

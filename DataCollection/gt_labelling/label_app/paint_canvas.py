@@ -29,21 +29,20 @@ def _to_data_url(img):
 def paint_canvas(
     background,
     display_px,
-    tool,
-    color,
-    brush,
-    token,
+    tool="brush",
+    color="#00C800",
+    brush=6,
+    token="canvas",
     initial_paint=None,
     key=None,
     layer="paint",
+    background_left=None,
 ):
-    """Render the canvas. Returns {paint: PNG data URL, n: int} after each edit, else None.
-
-    layer: "paint" | "dw"
-    color should be green for paint and yellow for DW, but the frontend decides from layer.
-    """
     return _component(
         background=_to_data_url(background),
+        background_left=(
+            _to_data_url(background_left) if background_left is not None else None
+        ),
         display_px=int(display_px),
         tool=tool,
         color=color,

@@ -15,11 +15,23 @@
 
         #bar {
             display: flex;
-            gap: 10px;
+            gap: 6px 12px;
             align-items: center;
             justify-content: center;
             padding: 4px 0 6px;
             flex-wrap: wrap;
+        }
+
+        .grp {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+
+        label {
+            display: inline-flex;
+            gap: 6px;
+            align-items: center;
         }
 
         button {
@@ -29,10 +41,17 @@
             color: inherit;
             border-radius: 6px;
             padding: 3px 10px;
+            font: inherit;
         }
 
         button:hover {
             background: rgba(128, 128, 128, .25);
+        }
+
+        button.tool.active {
+            background: rgba(0, 200, 0, .3);
+            border-color: #00C800;
+            font-weight: 700;
         }
 
         #msg {
@@ -40,15 +59,21 @@
             min-height: 1em;
         }
 
-        #wrap {
+        #panes {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            align-items: flex-start;
+        }
+
+        .pane {
             position: relative;
-            margin: 0 auto;
             aspect-ratio: 1 / 1;
             touch-action: none;
             user-select: none;
         }
 
-        #wrap canvas {
+        .pane canvas {
             position: absolute;
             left: 0;
             top: 0;
@@ -56,7 +81,20 @@
             height: 100%;
         }
 
-        #bg {
+        .tag {
+            position: absolute;
+            left: 6px;
+            top: 6px;
+            padding: 1px 7px;
+            border-radius: 4px;
+            background: rgba(0, 0, 0, .55);
+            color: #fff;
+            font-weight: 600;
+            pointer-events: none;
+        }
+
+        #bg,
+        #bg2 {
             image-rendering: pixelated;
         }
 
@@ -64,43 +102,126 @@
             opacity: .9;
         }
 
-        #ov {
+        #ov,
+        #ov2 {
             cursor: crosshair;
+        }
+
+        #cur,
+        #cur2,
+        #mask2 {
+            pointer-events: none;
         }
     </style>
 </head>
 
 <body tabindex="0">
     <div id="bar">
+        <div class="grp" id="tools">
+            <button class="tool" data-tool="brush" title="Brush (B)">Brush</button>
+            <button class="tool" data-tool="polygon"
+                title="Polygon (P): click points, then click the first point, double-click or press Enter to close">Polygon</button>
+            <button class="tool" data-tool="rect" title="Rectangle (R)">Rect</button>
+            <button class="tool" data-tool="fill" title="Paint bucket (F): click inside a closed outline">Fill</button>
+            <button class="tool" data-tool="eraser" title="Eraser (E)">Eraser</button>
+        </div>
+        <label title="Brush size ( [ and ] )">Size
+            <input type="range" id="size" min="1" max="25" value="6"><span id="sizev">6</span>
+        </label>
         <button id="undo" title="Ctrl+Z">↶ Undo</button>
         <button id="clear">Clear paint</button>
         <label><input type="checkbox" id="fillshapes" checked> fill polygons / rectangles</label>
+        <label id="mirrorctl" style="display:none">mask on 2017
+            <input type="range" id="mop" min="0" max="100" value="35">
+        </label>
         <span id="msg"></span>
     </div>
 
-    <div id="wrap">
-        <canvas id="bg"></canvas>
-        <canvas id="paint"></canvas>
-        <canvas id="ov"></canvas>
+    <div id="panes">
+        <div id="wrap2" class="pane" style="display:none">
+            <canvas id="bg2"></canvas>
+            <canvas id="mask2"></canvas>
+            <canvas id="cur2"></canvas>
+            <canvas id="ov2"></canvas>
+            <div class="tag">2017</div>
+        </div>
+        <div id="wrap" class="pane">
+            <canvas id="bg"></canvas>
+            <canvas id="paint"></canvas>
+            <canvas id="ov"></canvas>
+            <canvas id="cur"></canvas>
+            <div class="tag">2024</div>
+        </div>
     </div>
 
     <script>
-        const RES = 768;
-        const EDGE = 128;
-        const MAX_FILL = 0.6;
+        const RES = 768;          // must match PAINT_RES in paint_canvas.py
+        const EDGE = 128;         // alpha >= EDGE counts as "painted"
+        const MAX_FILL = 0.6;     // refuse empty-area fills bigger than this share of the tile (outline has a gap)
         const UNDO_MAX = 20;
+
+        const TOOLS = ['brush', 'polygon', 'rect', 'fill', 'eraser'];
+        const KEYS = { b: 'brush', p: 'polygon', r: 'rect', f: 'fill', e: 'eraser' };
+        const UI_KEY = 'paintCanvasUI';
 
         const $ = id => document.getElementById(id);
         const bg = $('bg'), paint = $('paint'), ov = $('ov'), wrap = $('wrap');
-        [bg, paint, ov].forEach(c => { c.width = RES; c.height = RES; });
+        const bg2 = $('bg2'), mask2 = $('mask2'), cur = $('cur'), cur2 = $('cur2'), ov2 = $('ov2'), wrap2 = $('wrap2');
+        [bg, paint, ov, bg2, mask2, cur, cur2, ov2].forEach(c => { c.width = RES; c.height = RES; });
         const bctx = bg.getContext('2d');
+        const b2ctx = bg2.getContext('2d');
+        const mctx = mask2.getContext('2d');
+        const cctx = cur.getContext('2d'), c2ctx = cur2.getContext('2d');
         const pctx = paint.getContext('2d', { willReadFrequently: true });
         const octx = ov.getContext('2d');
         bctx.imageSmoothingEnabled = false;
+        b2ctx.imageSmoothingEnabled = false;
 
-        let args = {}, token = null, bgSrc = null;
+        let args = {}, token = null, bgSrc = null, bgLeftSrc = null;
         let undoStack = [], poly = [], drag = null, drawing = false, last = null, cursor = null, nChange = 0;
-        let lastTool = null, lastLayer = null;
+
+        // ---- tool + brush size live HERE, not in Streamlit --------------------------------------------
+        // Streamlit only tells this iframe about widget changes after a full script rerun, so a tool kept in
+        // Python is stale for the first click or two after switching. The toolbar owns the state instead; the
+        // Python tool/brush arguments are used once, as defaults. sessionStorage keeps the choice if the
+        // iframe is ever remounted (e.g. a new tile gets a new component key).
+        let stored = null;
+        try { stored = JSON.parse(sessionStorage.getItem(UI_KEY) || 'null'); } catch (e) { }
+        const ui = Object.assign({ tool: 'brush', brush: 6 }, stored || {});
+        let seeded = !!stored;
+        function saveUI() { try { sessionStorage.setItem(UI_KEY, JSON.stringify(ui)); } catch (e) { } }
+
+        function syncToolbar() {
+            document.querySelectorAll('button.tool').forEach(b => {
+                const on = b.dataset.tool === ui.tool;
+                b.classList.toggle('active', on);
+                b.setAttribute('aria-pressed', on ? 'true' : 'false');
+            });
+            $('size').value = ui.brush;
+            $('sizev').textContent = ui.brush;
+        }
+
+        function setTool(t) {
+            if (!TOOLS.includes(t) || t === ui.tool) return;
+            ui.tool = t;
+            saveUI();
+            // abandon any half-finished gesture of the previous tool
+            if (drawing) { drawing = false; publish(); }
+            poly = []; drag = null; cursor = null;
+            syncToolbar();
+            redrawOverlay();
+        }
+
+        function setSize(v) {
+            ui.brush = Math.max(1, Math.min(25, Math.round(+v) || 6));
+            saveUI();
+            syncToolbar();
+        }
+
+        document.querySelectorAll('button.tool').forEach(b =>
+            b.addEventListener('click', () => { setTool(b.dataset.tool); b.blur(); }));
+        $('size').addEventListener('input', e => setSize(e.target.value));
+        // -------------------------------------------------------------------------------------------------
 
         function currentColor() {
             return (args.layer === 'dw') ? '#FFD000' : '#00C800';
@@ -111,36 +232,49 @@
         }
 
         function setHeight() {
-            send("streamlit:setFrameHeight", { height: Math.ceil($('bar').offsetHeight + wrap.offsetHeight + 12) });
+            send("streamlit:setFrameHeight", { height: Math.ceil($('bar').offsetHeight + $('panes').offsetHeight + 12) });
         }
 
-        function publish(token = args.token) {
+        function publish(tok = args.token) {
+            syncMirror();
             nChange++;
             send("streamlit:setComponentValue", {
-                value: {
-                    paint: paint.toDataURL("image/png"),
-                    n: nChange,
-                    token
-                },
+                value: { paint: paint.toDataURL("image/png"), n: nChange, token: tok },
                 dataType: "json"
             });
-        }
-
-        function updateToolState() {
-            const t = args.tool || 'brush';
-            const l = args.layer || 'paint';
-            if (t !== lastTool || l !== lastLayer) {
-                lastTool = t;
-                lastLayer = l;
-                redrawOverlay();
-            }
         }
 
         window.addEventListener("message", ev => {
             if (!ev.data || ev.data.type !== "streamlit:render") return;
             args = ev.data.args || {};
             if (ev.data.theme) document.body.style.color = ev.data.theme.textColor;
-            wrap.style.width = "min(" + (args.display_px || 512) + "px, 100%)";
+
+            if (!seeded) {        // first ever render: take Python's defaults, after that the toolbar owns them
+                seeded = true;
+                if (TOOLS.includes(args.tool)) ui.tool = args.tool;
+                if (args.brush) ui.brush = Math.max(1, Math.min(25, Math.round(+args.brush) || 6));
+                saveUI();
+            }
+            syncToolbar();
+
+            const cmp = !!args.background_left;
+            const paneW = cmp
+                ? "min(" + (args.display_px || 512) + "px, calc(50% - 4px))"
+                : "min(" + (args.display_px || 512) + "px, 100%)";
+            wrap.style.width = paneW;
+            wrap2.style.width = paneW;
+            wrap2.style.display = cmp ? '' : 'none';
+            $('mirrorctl').style.display = cmp ? '' : 'none';
+
+            if (cmp && args.background_left !== bgLeftSrc) {
+                bgLeftSrc = args.background_left;
+                const im2 = new Image();
+                im2.onload = () => {
+                    b2ctx.clearRect(0, 0, RES, RES);
+                    b2ctx.drawImage(im2, 0, 0, RES, RES);
+                };
+                im2.src = bgLeftSrc;
+            }
 
             if (args.token !== token) {
                 token = args.token;
@@ -162,16 +296,14 @@
                 im.src = bgSrc;
             }
 
-            if ((args.tool || 'brush') !== 'polygon' && poly.length) {
-                poly = [];
-            }
-
-            updateToolState();
+            redrawOverlay();
+            syncMirror();
             setHeight();
         });
 
         window.addEventListener("resize", setHeight);
         send("streamlit:componentReady", { apiVersion: 1 });
+        syncToolbar();
         setHeight();
 
         function loadPaint(src) {
@@ -179,6 +311,7 @@
             im.onload = () => {
                 pctx.clearRect(0, 0, RES, RES);
                 pctx.drawImage(im, 0, 0, RES, RES);
+                syncMirror();
             };
             im.src = src;
         }
@@ -195,11 +328,56 @@
         }
 
         function scale() { return RES / wrap.clientWidth; }
-        function lineW() { return Math.max(1, (args.brush || 6) * scale()); }
+        function lineW() { return Math.max(1, ui.brush * scale()); }
         function pos(e) {
             const r = ov.getBoundingClientRect();
             return [(e.clientX - r.left) * RES / r.width, (e.clientY - r.top) * RES / r.height];
         }
+
+        // ---- 2017 mirror: faded copy of the paint layer + linked hover cursor --------------------------
+        function syncMirror() {
+            mctx.clearRect(0, 0, RES, RES);
+            if (wrap2.style.display === 'none') return;
+            mctx.globalAlpha = $('mop').value / 100;
+            mctx.drawImage(paint, 0, 0);
+            mctx.globalAlpha = 1;
+        }
+        $('mop').addEventListener('input', syncMirror);
+
+        function ring(ctx, p) {
+            const s = scale();
+            const r = (ui.tool === 'brush' || ui.tool === 'eraser') ? lineW() / 2 : 6 * s;
+            ctx.clearRect(0, 0, RES, RES);
+            for (const [col, w] of [['rgba(0,0,0,.8)', 3 * s], ['#fff', 1.5 * s]]) {
+                ctx.strokeStyle = col;
+                ctx.lineWidth = w;
+                ctx.beginPath();
+                ctx.arc(p[0], p[1], r, 0, 2 * Math.PI);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(p[0] - 5 * s, p[1]); ctx.lineTo(p[0] + 5 * s, p[1]);
+                ctx.moveTo(p[0], p[1] - 5 * s); ctx.lineTo(p[0], p[1] + 5 * s);
+                ctx.stroke();
+            }
+        }
+        function showCursor(p) {
+            ring(cctx, p);
+            if (wrap2.style.display !== 'none') ring(c2ctx, p);
+        }
+        function clearCursor() {
+            cctx.clearRect(0, 0, RES, RES);
+            c2ctx.clearRect(0, 0, RES, RES);
+        }
+        function posOn(el, e) {
+            const r = el.getBoundingClientRect();
+            return [(e.clientX - r.left) * RES / r.width, (e.clientY - r.top) * RES / r.height];
+        }
+        ov.addEventListener('pointermove', e => showCursor(posOn(ov, e)));
+        ov2.addEventListener('pointermove', e => showCursor(posOn(ov2, e)));
+        ov.addEventListener('pointerleave', clearCursor);
+        ov2.addEventListener('pointerleave', clearCursor);
+        // -------------------------------------------------------------------------------------------------
+
         function pushUndo() {
             undoStack.push(pctx.getImageData(0, 0, RES, RES));
             if (undoStack.length > UNDO_MAX) undoStack.shift();
@@ -226,6 +404,7 @@
             pctx.arc(p[0], p[1], pctx.lineWidth / 2, 0, 2 * Math.PI);
             pctx.fill();
             pctx.restore();
+            syncMirror();
         }
 
         function seg(a, b, erase) {
@@ -235,8 +414,11 @@
             pctx.lineTo(b[0], b[1]);
             pctx.stroke();
             pctx.restore();
+            syncMirror();
         }
 
+        // Paint bucket: empty area -> bounded by anything painted (your outline);
+        // painted area -> recolours the contiguous patch of similar colour.
         function floodFill(x, y, rgb) {
             x = Math.max(0, Math.min(RES - 1, Math.floor(x)));
             y = Math.max(0, Math.min(RES - 1, Math.floor(y)));
@@ -262,7 +444,7 @@
             q[tail++] = y * w + x;
             seen[y * w + x] = 1;
 
-            while (head < tail) {
+            while (head < tail) {          // 4-connected, so thin lines block it
                 const p = q[head++];
                 const px = p % w;
 
@@ -354,8 +536,9 @@
         }
 
         ov.addEventListener('pointerdown', e => {
+            if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
             const p = pos(e);
-            const t = args.tool || 'brush';
+            const t = ui.tool;
 
             if (t === 'fill') {
                 pushUndo();
@@ -389,7 +572,7 @@
 
         ov.addEventListener('pointermove', e => {
             const p = pos(e);
-            const t = args.tool || 'brush';
+            const t = ui.tool;
 
             if (drawing) {
                 seg(last, p, t === 'eraser');
@@ -417,16 +600,21 @@
 
         ov.addEventListener('pointerup', endStroke);
         ov.addEventListener('pointercancel', endStroke);
-        ov.addEventListener('dblclick', () => { if ((args.tool || 'brush') === 'polygon') closePoly(); });
+        ov.addEventListener('dblclick', () => { if (ui.tool === 'polygon') closePoly(); });
 
         document.addEventListener('keydown', e => {
-            if (e.key === 'Enter' && poly.length) closePoly();
-            else if (e.key === 'Escape') { poly = []; drag = null; redrawOverlay(); }
-            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); doUndo(); }
+            const k = e.key;
+            if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'z') { e.preventDefault(); doUndo(); return; }
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (k === 'Enter' && poly.length) closePoly();
+            else if (k === 'Escape') { poly = []; drag = null; redrawOverlay(); }
+            else if (k === '[') setSize(ui.brush - 1);
+            else if (k === ']') setSize(ui.brush + 1);
+            else if (KEYS[k.toLowerCase()]) setTool(KEYS[k.toLowerCase()]);
         });
 
-        $('undo').onclick = doUndo;
-        $('clear').onclick = () => { pushUndo(); pctx.clearRect(0, 0, RES, RES); publish(); };
+        $('undo').onclick = () => { doUndo(); $('undo').blur(); };
+        $('clear').onclick = () => { pushUndo(); pctx.clearRect(0, 0, RES, RES); publish(); $('clear').blur(); };
     </script>
 </body>
 
