@@ -227,39 +227,37 @@ The 15 combinations are `SOURCE_SETS` in `experiments.py`, indexed 0-14 in this 
 - For the leading source sets and S1+S2, run a short tuning search (learning rate, weight decay, dropout) and confirm with 3 seeds. If the ranking holds, it is robust to tuning; if it changes, report both tables. This needs the benchmark's `("s1", "s2")` source set replaced by `args.sources` in `run_bayesian_benchmark` and a separate `--study-name` per source set.
 - State the limitation. If a source beats S1+S2 even though the configuration favours S1+S2, the result is conservative.
 
-## 3. Loss exploration and light tuning
+## 3. Loss exploration
 
-The default workflow first compares the eight supported loss recipes with their default loss-specific parameters. It then tunes a small set of parameters for only the best recipe. Keep the confirmed model configuration, source set, split and training options fixed throughout.
+Each of the six loss recipes is tuned over its own small parameter grid (`LOSS_GRIDS` in `experiments.py`), so a loss that is poor at its defaults but strong when tuned cannot be missed. Model, sources, split and optimiser stay fixed (the confirmed configuration from `confirmed_configs.json`).
+
+| Recipe | Grid | Points |
+|---|---|---|
+| BCE | `pos_weight` in {unset, auto, 2, 5} | 4 |
+| Dice | none | 1 |
+| Focal | `focal.gamma` in {1, 2, 3} x `focal.alpha` in {unset, 0.25, 0.75} | 9 |
+| BCE + Focal | same as Focal | 9 |
+| Focal Tversky | `tversky.alpha` in {0.3, 0.4, 0.5, 0.6, 0.7} (`tversky.beta` = 1 - alpha) x `tversky.gamma` in {0.75, 1, 1.33} | 15 |
+| BCE + Focal Tversky | same as Focal Tversky | 15 |
+
+That is 53 configurations x 3 seeds = **159 grid runs** (validation only), then **18 confirmation runs**: the best configuration of each recipe, retrained over 3 seeds with holdout evaluation. Grid runs are labelled `grid-<loss>-<parameters>`.
 
 ```bash
-# Stage 1: eight default recipes x three seeds = 24 runs.
-python experiments.py losses --model tsvit --seeds 0 1 2 \
-  --loss-stage defaults --group losses_tsvit_defaults --execute
-
-# Inspect validation AP, then tune the screen winner.
-# Use the same group so screen and tuning runs can be reported together.
-python report.py --group losses_tsvit_defaults --metric val_ap \
-  --out reports/losses_tsvit_defaults
-
-python experiments.py losses --model tsvit --seeds 0 1 2 \
-  --loss-stage tune --tune-from losses_tsvit_defaults \
-  --group losses_tsvit_defaults --execute
+mkdir -p logs
+bash run_fg_loss_grid.sh      # grid array -> planner -> confirmation array (or: sbatch run_fg_loss_grid.sh)
 ```
 
-The default screen runs one configuration each for BCE, Dice, Focal, BCE + Focal, Focal Tversky, BCE + Focal Tversky. All loss-specific options, including positive-class weighting, use their defaults. The default screen is **6 configurations / 18 runs** with three seeds.
+`run_fg_loss_grid.sh` uses a fresh W&B group per launch (`losses_grid_<timestamp>`) and refuses to submit unless `experiments.py` produces exactly 159 commands and 53 distinct `grid-` configurations. The planner only considers configurations whose seeds all finished (`--confirm-min-seeds 3`) and warns if fewer than 18 confirmation runs result. To re-plan after fixing crashed runs: `GROUP=<group> MODE=plan bash run_fg_loss_grid.sh`.
 
-The tune stage chooses the highest mean validation AP among default-screen variants that have finished for every requested seed. It tunes only the selected recipe:
+By hand:
 
-| Winning recipe | Light tuning configurations |
-|---|---|
-| BCE | automatic positive-class weight |
-| Focal or BCE + Focal | gamma 1 and 3; alpha 0.25 and 0.75 |
-| Focal Tversky or BCE + Focal Tversky | alpha 0.4 and 0.6; gamma 0.75 and 1.33 |
-| Dice | no loss-specific parameter is exposed; proceed with its default configuration |
+```bash
+python experiments.py losses --model tsvit --seeds 0 1 2 --batch-size 8 --group losses_grid_tsvit --dry-run
+python experiments.py losses --model tsvit --confirm-from losses_grid_tsvit --confirm-min-seeds 3 \
+  --seeds 0 1 2 --group losses_grid_tsvit_confirm --dry-run
+```
 
-The largest tune stage is **4 configurations / 12 runs**. Thus screening plus tuning is at most **36 runs**. If Dice wins, no redundant tuning run is generated.
-
-Choose the final configuration using validation results only. Retrain the selected configuration on confirmation seeds with holdout evaluation enabled; do not use holdout results to choose between configurations. The former `--loss-stage base`, `reweight` and `all` detailed sweeps remain available, but are not part of this lower-cost default workflow.
+Choose configurations on validation AP only; holdout numbers are reported next to it. Picking the best of up to 15 grid points on a 3-seed mean is optimistic, so use `--confirm-top-k 2` if two points of a recipe are within one seed std.
 
 ### Confirmation and holdout (all suites)
 

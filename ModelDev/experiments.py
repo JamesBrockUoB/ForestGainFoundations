@@ -12,7 +12,7 @@ python experiments.py losses --model tsvit --execute --max-runs 12
 python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
 python experiments.py maskclean --model tsvit --seeds 0 1 2 --loss-type soft --dry-run
-python experiments.py losses --model tsvit --confirm-from losses_tsvit_<job id> --seeds 0 1 2 --dry-run
+python experiments.py losses --model tsvit --confirm-from <grid group> --confirm-min-seeds 3 --seeds 0 1 2 --dry-run
 python experiments.py benchmark --confirm --studies tsvit,fg_tsvit,j1.log sits_scd,fg_sits,j2.log unet_lstm,fg_unet,j3.log \
     --top-k 1 --stratify-by model --seeds 0 1 2 --dry-run
 
@@ -23,7 +23,9 @@ Suites
                 --loss, --model-opt; --source-index N runs only the N-th combination, for parallel SLURM tasks;
                 --top-sources-from GROUP --top-k K retrains the K best combinations of a finished sweep over the
                 seeds WITH holdout evaluation: the confirmation step)
-  losses        bce, dice, focal Tversky, BCE+Tversky, focal, BCE + focal
+  losses        every loss recipe (bce, dice, focal, bce_focal, focal_tversky, bce_focal_tversky) over its own
+                parameter grid (LOSS_GRIDS: 53 configurations; x 3 seeds = 159 runs). --confirm-from then retrains
+                the best grid point of each recipe with holdout evaluation (6 x 3 = 18 runs).
   hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
   augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
@@ -37,9 +39,7 @@ suite compares several models, so it does not use it).
 Confirmation and holdout
   Suites that sweep hyperparameter values select on validation AP, so their best configuration is retrained with
   holdout evaluation (the holdout stays untouched during the sweep):
-    losses / hardness / maskclean   --confirm-from SWEEP_GROUP [--confirm-top-k K] [--confirm-index N]
-                                    best configuration of every family (e.g. loss + reweight) of a finished sweep
-    benchmark                       benchmark --confirm --studies MODEL,STUDY,JOURNAL ... [--top-k K --stratify-by model]
+        losses / hardness / maskclean   --confirm-from SWEEP_GROUP [--confirm-top-k K] [--confirm-min-seeds N] [--confirm-index N]
                                     [--confirm-index N]   best Optuna trials (by mean val AP), retrained over --seeds
                                     (one winner per architecture: --top-k 1 --stratify-by model)
     data-sources                    --top-sources-from SWEEP_GROUP --top-k K
@@ -542,7 +542,9 @@ def top_wandb_configs(args: argparse.Namespace, family) -> list[tuple]:
     """Best configuration(s) of every family of a FINISHED sweep, by mean validation AP over its seeds.
 
     Reads the sweep's W&B group (--confirm-from; finished runs only). The ranking is deterministic (ties by variant
-    name), so every SLURM array task derives the same selection. Returns (variant, mean, std, n, config) tuples.
+    name), so every SLURM array task derives the same selection. Configurations with fewer than --confirm-min-seeds
+    finished seeds (a seed crashed, was cancelled or hit the time limit) are skipped, so nothing can win on a partial
+    set of seeds. Returns (variant, mean, std, n, config) tuples.
     """
     import statistics
 
@@ -569,6 +571,20 @@ def top_wandb_configs(args: argparse.Namespace, family) -> list[tuple]:
         raise SystemExit(
             f"No finished runs with a validation AP in W&B group '{args.confirm_from}'."
         )
+    min_seeds = getattr(args, "confirm_min_seeds", 1)
+    incomplete = sorted(v for v, e in by_variant.items() if len(e["vals"]) < min_seeds)
+    if incomplete:
+        print(
+            f"Skipped {len(incomplete)} configuration(s) with fewer than {min_seeds} finished seeds "
+            "(crashed, cancelled or still running):"
+        )
+        for v in incomplete:
+            print(f"  n={len(by_variant[v]['vals'])}  {v}")
+        by_variant = {v: e for v, e in by_variant.items() if v not in incomplete}
+        if not by_variant:
+            raise SystemExit(
+                f"No configuration in W&B group '{args.confirm_from}' has {min_seeds} finished seeds."
+            )
     families: dict[tuple, list] = {}
     for variant, e in by_variant.items():
         vals = e["vals"]
@@ -876,7 +892,9 @@ def loss_grid(args: argparse.Namespace, tuned: dict) -> list[dict]:
 
 
 def losses(args: argparse.Namespace) -> list[dict]:
-    """Focused loss comparison: screen six default recipes, then tune the winner."""
+    """Every loss recipe over its own parameter grid (LOSS_GRIDS): 53 configurations with the model's confirmed
+    configuration, so no recipe is judged only at its defaults. Select the best point of each recipe with
+    --confirm-from (retrained with holdout evaluation)."""
     cfg = load_confirmed_configs().get(args.model)
     if cfg is None:
         print(
@@ -1200,6 +1218,13 @@ def main() -> None:
         type=int,
         default=1,
         help="Configurations per family for --confirm-from (default 1).",
+    )
+    p.add_argument(
+        "--confirm-min-seeds",
+        type=int,
+        default=1,
+        help="Confirmation: ignore configurations with fewer finished seeds than this in the swept group "
+        "(default 1 = keep all). Use the sweep's seed count so a configuration cannot win on a partial set of seeds.",
     )
     p.add_argument(
         "--confirm-index",
