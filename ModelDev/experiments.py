@@ -26,7 +26,7 @@ Suites
   losses        every loss recipe (bce, dice, focal, bce_focal, focal_tversky, bce_focal_tversky) over its own
                 parameter grid (LOSS_GRIDS: 53 configurations; x 3 seeds = 159 runs). --confirm-from then retrains
                 the best grid point of each recipe with holdout evaluation (6 x 3 = 18 runs).
-  hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE-based losses
+  hardness      learned pixel hardness (offset c) vs no re-weighting vs OHEM, on BCE loss
   temporal      bi-temporal (first + last year) vs more frames vs the whole sequence; same scored pixels for all
   augmentation  repeats (compute-matched), augmentation families / strengths, frame dropout, crop size, label jitter
   maskclean     training-label cleaning (small-component removal, hole filling, confidence filtering / hardening)
@@ -913,48 +913,46 @@ def losses(args: argparse.Namespace) -> list[dict]:
     return loss_grid(args, tuned)
 
 
-# Segmentation head the hardness branch mirrors, per model. TSViT's `decoder` is a multi-conv head, so the branch is a
-# copy of it ("auto" -> copy); `decoder.final_head` is a lone 1x1 classifier, so the small default head is used.
-# SITS-SCD / U-Net-LSTM only have a lone classifier (their decoder is several modules), so only the default head.
-HARDNESS_LAYERS = {
-    "tsvit": ("decoder", "decoder.final_head"),
-    "sits_scd": ("final_head",),
-    "unet_lstm": ("out_head",),
-}
+HARDNESS_LAYERS = (
+    "decoder",
+    "decoder.final_head",
+)  # TSViT: multi-conv head copy vs lone 1x1 classifier
+HARDNESS_C = (0.01, 0.1)
+HARDNESS_ALPHAS = (0.01, 0.05)
+OHEM_THRESH = (0.5, 0.7, 0.9)
+OHEM_MIN_KEPT = (1024, 4096, 16384)
 
 
 def hardness(args: argparse.Namespace) -> list[dict]:
-    """Compare no reweighting, OHEM, and learned hardness on BCE-based recipes."""
-    layers = (args.hl_layer,) if args.hl_layer else HARDNESS_LAYERS[args.model]
-    rows = []
+    """TSViT only: control vs OHEM vs learned pixel hardness on BCE with pos_weight 5."""
+    if args.model != "tsvit":
+        raise SystemExit("The hardness suite is TSViT-only.")
+    layers = (args.hl_layer,) if args.hl_layer else HARDNESS_LAYERS
+    base = dict(loss_name="bce", pos_weight=5.0)
+    rows = [_run(args, **base, reweight="none", variant="hardness-ctrl-bce-pw5")]
 
-    for loss_name in ("bce", "bce_focal"):
-        # Matched controls: same recipe, split, seed, model, and optimiser.
-        rows.append(_run(args, loss_name=loss_name, reweight="none"))
-
-        for threshold in (0.7, 0.9):
-            rows.append(
-                _run(
-                    args,
-                    loss_name=loss_name,
-                    reweight="ohem",
-                    loss_opt=_opts(**{"ohem.thresh": threshold}),
-                )
+    for thresh, min_kept in itertools.product(OHEM_THRESH, OHEM_MIN_KEPT):
+        rows.append(
+            _run(
+                args,
+                **base,
+                reweight="ohem",
+                variant=f"hardness-ohem-t{thresh}-k{min_kept}",
+                loss_opt=_opts(**{"ohem.thresh": thresh, "ohem.min_kept": min_kept}),
             )
+        )
 
-        for layer, c, alpha in itertools.product(
-            layers, (0.01, 0.1), (0.001, 0.01, 0.05)
-        ):
-            rows.append(
-                _run(
-                    args,
-                    loss_name=loss_name,
-                    reweight="hardness",
-                    hl_layer=layer,
-                    loss_opt=_opts(**{"hardness.c": c, "hardness.alpha": alpha}),
-                )
+    for layer, c, alpha in itertools.product(layers, HARDNESS_C, HARDNESS_ALPHAS):
+        rows.append(
+            _run(
+                args,
+                **base,
+                reweight="hardness",
+                hl_layer=layer,
+                variant=f"hardness-{layer}-c{c}-a{alpha}",
+                loss_opt=_opts(**{"hardness.c": c, "hardness.alpha": alpha}),
             )
-
+        )
     return rows
 
 

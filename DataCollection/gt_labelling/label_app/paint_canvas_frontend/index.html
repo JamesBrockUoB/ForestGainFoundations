@@ -112,6 +112,23 @@
         #mask2 {
             pointer-events: none;
         }
+
+        #pane-labels {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            align-items: flex-start;
+            margin-bottom: 5px;
+        }
+
+        .pane-label {
+            box-sizing: border-box;
+            flex: 0 0 auto;
+            text-align: center;
+            font-weight: 600;
+            color: #ddd;
+            padding: 2px 0;
+        }
     </style>
 </head>
 
@@ -137,20 +154,23 @@
         <span id="msg"></span>
     </div>
 
+    <div id="pane-labels">
+        <div id="label2" class="pane-label" style="display:none">2017</div>
+        <div id="label1" class="pane-label">2024</div>
+    </div>
+
     <div id="panes">
         <div id="wrap2" class="pane" style="display:none">
             <canvas id="bg2"></canvas>
             <canvas id="mask2"></canvas>
             <canvas id="cur2"></canvas>
             <canvas id="ov2"></canvas>
-            <div class="tag">2017</div>
         </div>
         <div id="wrap" class="pane">
             <canvas id="bg"></canvas>
             <canvas id="paint"></canvas>
             <canvas id="ov"></canvas>
             <canvas id="cur"></canvas>
-            <div class="tag">2024</div>
         </div>
     </div>
 
@@ -232,7 +252,13 @@
         }
 
         function setHeight() {
-            send("streamlit:setFrameHeight", { height: Math.ceil($('bar').offsetHeight + $('panes').offsetHeight + 12) });
+            send("streamlit:setFrameHeight", {
+                height: Math.ceil(
+                    $('bar').offsetHeight +
+                    $('pane-labels').offsetHeight +
+                    $('panes').offsetHeight + 17
+                )
+            });
         }
 
         function publish(tok = args.token) {
@@ -263,7 +289,10 @@
                 : "min(" + (args.display_px || 512) + "px, 100%)";
             wrap.style.width = paneW;
             wrap2.style.width = paneW;
+            $('label1').style.width = paneW;
+            $('label2').style.width = paneW;
             wrap2.style.display = cmp ? '' : 'none';
+            $('label2').style.display = cmp ? '' : 'none';
             $('mirrorctl').style.display = cmp ? '' : 'none';
 
             if (cmp && args.background_left !== bgLeftSrc) {

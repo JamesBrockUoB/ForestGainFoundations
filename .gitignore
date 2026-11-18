@@ -57,3 +57,7 @@ ground_truth_masks/
 *analysis_results*
 
 index_stats.json
+
+shap_out/
+
+shap_analysis/
