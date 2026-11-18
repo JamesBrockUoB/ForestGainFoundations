@@ -152,6 +152,7 @@ def filter_candidates(
     if logger:
         logger.info(f"Found {len(candidates):,} candidate tiles after filtering")
 
+    random.Random(42).shuffle(candidates)
     return candidates
 
 

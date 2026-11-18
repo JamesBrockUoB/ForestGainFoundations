@@ -19,3 +19,5 @@ pytest
 wandb
 optuna
 umap-learn
+shap
+plotly
