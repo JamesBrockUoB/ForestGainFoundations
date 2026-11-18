@@ -115,7 +115,13 @@ def parse_args(argv=None):
     g.add_argument("--seed", type=int, default=0)
 
     g = p.add_argument_group("data")
-    g.add_argument("--data_dir", default="../DataCollection/data/test_tiles")
+    g.add_argument(
+        "--data_dir",
+        nargs="+",
+        default=["../DataCollection/data/test_tiles"],
+        help="One or more tile directories. Every tile in all of them is used; each directory is split "
+        "train/val separately with --val_frac, then the pieces are pooled.",
+    )
     g.add_argument("--holdout_dir", default="../DataCollection/data/holdout_tiles")
     g.add_argument("--val_frac", type=float, default=0.2)
     g.add_argument(

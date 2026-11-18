@@ -40,19 +40,37 @@ def _positive_fraction(tile_dir) -> float:
 
 
 def split_tiles(data_dir, val_frac=0.2, seed=0, n_bins=3):
-    """Random train/val split, stratified by each tile's positive-pixel fraction
-    (binned into n_bins quantile groups) so validation prevalence stays similar
-    across seeds. Returns (train_dirs, val_dirs)."""
-    dirs = sorted(
-        p for p in Path(data_dir).iterdir() if p.is_dir() and p.name.startswith("tile_")
-    )
+    """Random train/val split over one directory or a list of them, stratified by each tile's
+    positive-pixel fraction (binned into n_bins quantile groups, computed over all tiles pooled).
+    With several directories the strata are also split per directory, so every dataset appears
+    in both train and val. Returns (train_dirs, val_dirs)."""
+    data_dirs = [data_dir] if isinstance(data_dir, (str, Path)) else list(data_dir)
+    data_dirs = list(
+        dict.fromkeys(str(Path(d).resolve()) for d in data_dirs)
+    )  # drop repeats
+
+    dirs, origin = [], []
+    for i, root in enumerate(data_dirs):
+        found = sorted(
+            p for p in Path(root).iterdir() if p.is_dir() and p.name.startswith("tile_")
+        )
+        print(f"  {root}: {len(found)} tiles")
+        dirs += found
+        origin += [i] * len(found)
+    if not dirs:
+        raise ValueError(f"No tile_* directories found in {data_dirs}")
+
     frac = np.array([_positive_fraction(d) for d in dirs])
     edges = np.unique(np.quantile(frac, np.linspace(0, 1, n_bins + 1)[1:-1]))
     bins = np.digitize(frac, edges)
-    try:
-        train, val = train_test_split(
-            dirs, test_size=val_frac, random_state=seed, stratify=bins
-        )
-    except ValueError:  # a bin too small to stratify: fall back to a plain split
-        train, val = train_test_split(dirs, test_size=val_frac, random_state=seed)
-    return train, val
+    # one dataset: identical to the old behaviour; several: stratify by (dataset, bin) first
+    strata = [bins + (n_bins + 1) * np.array(origin), bins, None]
+    if len(data_dirs) == 1:
+        strata = strata[1:]
+    for s in strata:
+        try:
+            return train_test_split(
+                dirs, test_size=val_frac, random_state=seed, stratify=s
+            )
+        except ValueError:  # a stratum too small: try the coarser one
+            continue

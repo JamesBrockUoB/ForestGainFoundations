@@ -1307,7 +1307,9 @@ def main() -> None:
         help="Architecture options passed as --model_opt to every run of the data-sources, losses, hardness and "
         "augmentation suites, e.g. embed_dim=160 num_heads=4 (use the best benchmark configuration).",
     )
-    p.add_argument("--data-dir", default="../DataCollection/data/forest_gain_tiles")
+    p.add_argument(
+        "--data-dir", nargs="+", default=["../DataCollection/data/forest_gain_tiles"]
+    )
     p.add_argument("--holdout-dir", default="../DataCollection/data/holdout_tiles")
     p.add_argument("--split-seed", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
