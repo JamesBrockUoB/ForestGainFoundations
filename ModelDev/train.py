@@ -31,8 +31,8 @@ DEFAULT_MODEL_OPTS = {
     "depth_spatial": 4,
     "dropout": 0.1,
     "skip_channels": 32,
-    "convs_per_block": 2,  # sits_scd / unet_lstm
-    "lstm_kernel": 3,  # unet_lstm
+    "convs_per_block": 2,  # sits_scd / unet_convlstm
+    "lstm_kernel": 3,  # unet_convlstm
 }
 
 
@@ -58,7 +58,7 @@ def parse_args(argv=None):
 
     g = p.add_argument_group("model")
     g.add_argument(
-        "--model_type", default="tsvit", choices=["sits_scd", "unet_lstm", "tsvit"]
+        "--model_type", default="tsvit", choices=["sits_scd", "unet_convlstm", "tsvit"]
     )
     g.add_argument(
         "--model_opt",

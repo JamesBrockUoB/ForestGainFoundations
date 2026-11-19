@@ -29,7 +29,7 @@ aggregate  read the finished runs from Weights & Biases: mean +/- std over seeds
 Examples
 --------
 python confirm_top_k.py select --studies tsvit,forestgain_tsvit_1,j1.log sits_scd,forestgain_sits_scd_2,j2.log \
-    unet_lstm,forestgain_unet_lstm_3,j3.log --group confirm_demo --stratify-by model --top-k 1
+    unet_convlstm,forestgain_unet_convlstm_3,j3.log --group confirm_demo --stratify-by model --top-k 1
 python confirm_top_k.py run --studies ... --group confirm_demo --stratify-by model --top-k 1 --index 4 --execute
 python confirm_top_k.py aggregate --group confirm_demo --out reports/confirm_demo
 

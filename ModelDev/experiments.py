@@ -13,7 +13,7 @@ python experiments.py hardness --model tsvit --dry-run
 python experiments.py temporal --models tsvit sits_scd --seeds 0 1 2 --dry-run
 python experiments.py maskclean --model tsvit --seeds 0 1 2 --loss-type soft --dry-run
 python experiments.py losses --model tsvit --confirm-from <grid group> --confirm-min-seeds 3 --seeds 0 1 2 --dry-run
-python experiments.py benchmark --confirm --studies tsvit,fg_tsvit,j1.log sits_scd,fg_sits,j2.log unet_lstm,fg_unet,j3.log \
+python experiments.py benchmark --confirm --studies tsvit,fg_tsvit,j1.log sits_scd,fg_sits,j2.log unet_convlstm,fg_unet_convlstm,j3.log \
     --top-k 1 --stratify-by model --seeds 0 1 2 --dry-run
 
 Suites
@@ -95,7 +95,7 @@ SOURCE_SETS = (
     ("s2", "alphaearth", "tessera"),
 )
 
-BENCHMARK_MODELS = ("tsvit", "sits_scd", "unet_lstm")
+BENCHMARK_MODELS = ("tsvit", "sits_scd", "unet_convlstm")
 BENCHMARK_LOSS = "bce_focal_tversky"  # must exist in losses.LOSS_NAMES
 
 
@@ -206,7 +206,7 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
         )
         batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
 
-    elif model == "unet_lstm":
+    elif model == "unet_convlstm":
         structure = dict(
             base_features=trial.suggest_categorical("base_features", [24, 32, 48, 64]),
             dropout=dropout,
@@ -1172,7 +1172,7 @@ def main() -> None:
     )
     p.add_argument("--output-dir", default="experiment_manifests")
     p.add_argument(
-        "--model", default="tsvit", choices=("tsvit", "sits_scd", "unet_lstm")
+        "--model", default="tsvit", choices=("tsvit", "sits_scd", "unet_convlstm")
     )
     p.add_argument(
         "--sources",
@@ -1328,7 +1328,7 @@ def main() -> None:
     p.add_argument(
         "--models",
         nargs="+",
-        choices=("tsvit", "sits_scd", "unet_lstm"),
+        choices=("tsvit", "sits_scd", "unet_convlstm"),
         help="Temporal suite: models to compare (default: --model).",
     )
     p.add_argument(
@@ -1480,7 +1480,7 @@ def main() -> None:
                     "convs_per_block": [1, 2],
                     "batch_size": [2, 4, 8],
                 },
-                "unet_lstm": {
+                "unet_convlstm": {
                     "base_features": [24, 32, 48, 64],
                     "depth_temporal": [1, 3],
                     "lstm_kernel": [3, 5],

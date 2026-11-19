@@ -147,7 +147,7 @@ Studies are passed as `MODEL,STUDY_NAME,JOURNAL_PATH`, one per study. To run it 
 
 ```bash
 P=/projects/b6be/jamesbrock.b6be/ForestGainFoundations/ModelDev/experiment_manifests
-export CONFIRM_STUDIES="tsvit,forestgain_tsvit_<id1>,$P/benchmark_tsvit_<id1>/optuna_journal.log sits_scd,forestgain_sits_scd_<id2>,$P/benchmark_sits_scd_<id2>/optuna_journal.log unet_lstm,forestgain_unet_lstm_<id3>,$P/benchmark_unet_lstm_<id3>/optuna_journal.log"
+export CONFIRM_STUDIES="tsvit,forestgain_tsvit_<id1>,$P/benchmark_tsvit_<id1>/optuna_journal.log sits_scd,forestgain_sits_scd_<id2>,$P/benchmark_sits_scd_<id2>/optuna_journal.log unet_convlstm,forestgain_unet_convlstm_<id3>,$P/benchmark_unet_convlstm_<id3>/optuna_journal.log"
 export CONFIRM_GROUP=confirm_manual TOP_K=1 CONFIRM_SEEDS="0 1 2"
 # run_fg_confirm.sh passes --stratify-by "$CONFIRM_STRATIFY" if your copy has that line; export CONFIRM_STRATIFY=model
 
@@ -180,7 +180,7 @@ Use one selected/frozen model and training configuration for all 15 source combi
 ```bash
 # 1. sweep: 15 source sets x 3 seeds = 45 runs, one per array task, at most 20 at once
 sbatch run_fg_data_sources.sh                                  # tsvit, best benchmark trial
-sbatch --export=ALL,MODEL=unet_lstm run_fg_data_sources.sh     # unet_lstm
+sbatch --export=ALL,MODEL=unet_convlstm run_fg_data_sources.sh     # unet_convlstm
 sbatch --export=ALL,MODEL=sits_scd run_fg_data_sources.sh      # sits_scd
 
 # when the sweep has finished: rank the sources (validation AP, mean over seeds)
@@ -223,7 +223,7 @@ The 15 combinations are `SOURCE_SETS` in `experiments.py`, indexed 0-14 in this 
 **Source bias.** The benchmark was run on S1 + S2, so the configuration is tuned for that input and may under-serve the others (especially the embedding sources, which have different channel statistics). To limit this:
 
 - Use the same seeds for every source set and compare differences against the S1+S2 baseline, not only means. Treat differences smaller than the seed spread (about 0.005 validation AP for TSViT) as ties.
-- Repeat the sweep with a second architecture (`MODEL=unet_lstm`). If the source ranking agrees across architectures, it is not an artefact of one model's hyperparameters.
+- Repeat the sweep with a second architecture (`MODEL=unet_convlstm`). If the source ranking agrees across architectures, it is not an artefact of one model's hyperparameters.
 - For the leading source sets and S1+S2, run a short tuning search (learning rate, weight decay, dropout) and confirm with 3 seeds. If the ranking holds, it is robust to tuning; if it changes, report both tables. This needs the benchmark's `("s1", "s2")` source set replaced by `args.sources` in `run_bayesian_benchmark` and a separate `--study-name` per source set.
 - State the limitation. If a source beats S1+S2 even though the configuration favours S1+S2, the result is conservative.
 
@@ -278,20 +278,19 @@ Families: losses and hardness group by (loss, reweight), maskclean by cleaning m
 python experiments.py hardness --model tsvit --execute
 ```
 
-The suite compares matched versions of BCE and BCE + Focal (`bce_focal`) under:
+The suite compares BCE (pos_class_weight = 5) under:
 
 - no reweighting;
-- OHEM at thresholds `0.7` and `0.9`;
+- OHEM at thresholds `0.5`, `0.7` and `0.9` and minimum kept pixels per tile `{1024, 4096, 16384}` (1.6\%, 6.25\% and 25\% of a 256x256 tile)
 - learned hardness, sweeping `hardness.c` `{0.01,0.1}` and auxiliary loss scale `hardness.alpha` `{0.001,0.01,0.05}`.
 
-The hardness branch mirrors the model's segmentation head on detached inputs, so the layer is the head module: TSViT `decoder` (a copy of the multi-conv decoder) and `decoder.final_head` (small default head on the fused features), SITS-SCD `final_head` and U-Net-LSTM `out_head` (small default head). `experiments.py` picks these per model (`HARDNESS_LAYERS`); override with `--hl-layer`, or pass `--hl_layer` to `train.py`. Run the suite once per model. That gives 12 (TSViT) or 6 (others) hardness configurations per loss family, plus 3 controls (no reweighting, OHEM 0.7, OHEM 0.9), i.e. 15 or 9 runs per loss family. The hardness branch consumes detached features, and the learned hardness weighting applies to the per-pixel BCE term. In `bce_focal` both terms are per-pixel; check in `SegmentationLoss` that the reweighter and its auxiliary hardness loss are applied once, not once per term, before trusting the `bce_focal` hardness rows. `--model-opt`, `--learning-rate` and `--weight-decay` apply as in section 3.
+The hardness branch mirrors the model's segmentation head on detached inputs, so the layer is the head module: TSViT `decoder` (a copy of the multi-conv decoder) and `decoder.final_head` (small default head on the fused features). Run the suite once with TSViT. The hardness branch consumes detached features, and the learned hardness weighting applies to the per-pixel BCE term. `--model-opt`, `--learning-rate` and `--weight-decay` apply as in section 3.
 
-This is a parameter sweep rather than a full Bayesian search. After the initial sweep, compare the strongest hardness settings against the matched no-reweighting and OHEM controls over multiple seeds.
 
 ## 5. Temporal ablation
 
 ```bash
-python experiments.py temporal --models tsvit sits_scd unet_lstm --seeds 0 1 2 --execute
+python experiments.py temporal --models tsvit sits_scd unet_convlstm --seeds 0 1 2 --execute
 ```
 
 Compares first+last year (2017, 2024), 2017/2021/2024, 2017/2020/2022/2024, and the whole sequence (`--year-sets` overrides). The valid-pixel mask is taken over all years so the scored pixels stay consistent across frame subsets. This suite compares several models, taking the optimal configurations for these models from the benchmarking experiments. If no configuration is found it uses the defaults of `train.py`.

@@ -1,110 +1,12 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class _TemporalAttentionLayer(nn.Module):
-    """Pre-norm residual multi-head self-attention over the T axis of (N, T, C)."""
-
-    def __init__(self, channels: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.dropout = dropout
-        self.norm = nn.LayerNorm(channels)
-        self.q = nn.Linear(channels, channels)
-        self.k = nn.Linear(channels, channels)
-        self.v = nn.Linear(channels, channels)
-        self.out_proj = nn.Linear(channels, channels)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        n, t, c = x.shape
-        y = self.norm(x)
-
-        def split(z):
-            return z.view(n, t, self.num_heads, self.head_dim).transpose(1, 2)
-
-        out = F.scaled_dot_product_attention(
-            split(self.q(y)),
-            split(self.k(y)),
-            split(self.v(y)),
-            dropout_p=self.dropout if self.training else 0.0,
-        )  # (N, heads, T, head_dim)
-        out = out.transpose(1, 2).reshape(n, t, c)
-        return x + self.drop(self.out_proj(out))
-
-
-class TemporalAttentionModule(nn.Module):
-    """Multi-Head Temporal Attention Module for Satellite Image Time Series.
-
-    Aggregates features across T timesteps per pixel/location with stacked
-    attention layers followed by attention-weighted pooling over T.
-
-    Spatial sequences are processed in chunks to avoid oversized
-    efficient-attention kernel batch dimensions.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        num_heads: int = 4,
-        depth: int = 1,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        if num_heads < 1 or in_channels % num_heads:
-            raise ValueError(
-                f"in_channels ({in_channels}) must be divisible by "
-                f"num_heads ({num_heads})"
-            )
-        if depth < 1:
-            raise ValueError("depth (temporal) must be at least 1")
-
-        self.num_heads = num_heads
-
-        self.layers = nn.ModuleList(
-            _TemporalAttentionLayer(in_channels, num_heads, dropout)
-            for _ in range(depth)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C, H, W)
-        b, t, c, h, w = x.shape
-
-        # One independent temporal sequence per spatial location.
-        # (B, T, C, H, W) -> (B*H*W, T, C)
-        out = x.permute(0, 3, 4, 1, 2).reshape(b * h * w, t, c)
-
-        n = out.shape[0]
-
-        # Bound the effective attention batch, accounting for head count.
-        # The margin also avoids operating exactly at the kernel limit.
-        max_sequences = min(8192, 65535 // self.num_heads)
-
-        chunks = []
-
-        for start in range(0, n, max_sequences):
-            chunk = out[start : start + max_sequences]
-
-            for layer in self.layers:
-                chunk = layer(chunk)
-
-            chunks.append(chunk)
-
-        out = torch.cat(chunks, dim=0)
-
-        # Attention-weighted temporal pooling.
-        attn_weights = F.softmax(out.mean(dim=-1), dim=-1).unsqueeze(-1)
-
-        pooled = (out * attn_weights).sum(dim=1)
-
-        return pooled.view(b, h, w, c).permute(0, 3, 1, 2)
-
-
 class ConvBlock(nn.Module):
-    """`n_convs` x (Conv2D -> BatchNorm -> GELU), then optional Dropout2d."""
+    """Conv2D -> BatchNorm -> GELU, repeated n_convs times, then optional Dropout2d."""
 
     def __init__(
         self,
@@ -116,25 +18,26 @@ class ConvBlock(nn.Module):
         super().__init__()
         if n_convs < 1:
             raise ValueError("n_convs must be at least 1")
+
         layers = []
-        c = in_channels
+        channels = in_channels
         for _ in range(n_convs):
             layers += [
-                nn.Conv2d(c, out_channels, kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(channels, out_channels, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.GELU(),
             ]
-            c = out_channels
+            channels = out_channels
         if dropout > 0:
             layers.append(nn.Dropout2d(dropout))
         self.conv = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.conv(x)
 
 
 class UpBlock(nn.Module):
-    """Bilinear Upsampling -> Skip connection concat -> ConvBlock."""
+    """Bilinear upsampling to the skip's size -> skip concatenation -> ConvBlock."""
 
     def __init__(
         self,
@@ -145,115 +48,173 @@ class UpBlock(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.conv = ConvBlock(
             in_channels + skip_channels, out_channels, n_convs, dropout
         )
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return self.conv(torch.cat([x, skip], dim=1))
 
 
 class SitsSCD(nn.Module):
-    """SITS-SCD Architecture for N-timestep single binary change/gain mask output.
+    """Multi-temporal U-Net with bottleneck temporal attention shared across scales.
 
-    Tunable: base_features (width), num_heads, depth_temporal (stacked temporal attention
-    layers per scale), convs_per_block (convs in every encoder/decoder block), dropout
-    (Dropout2d in conv blocks, attention/residual dropout in temporal layers).
+    A shared encoder runs on every frame. Temporal attention is computed once at the
+    bottleneck (per location, over T, with ordinal position encoding), upsampled, and used
+    to mix the frame features at every scale. Only the first and last frame are decoded
+    (they are all the output head uses), and their features are fused as
+    [first, last, last - first].
 
-    Input:  (B, T, C, H, W)
-    Output: (B, H, W) binary change logits
+    Input:  (B, T, C, H, W), T >= 2, H and W divisible by 16
+    Output: (B, H, W) change logits
+
+    num_heads and depth_temporal are accepted for config compatibility and ignored.
     """
 
     def __init__(
         self,
         in_channels: int = 10,
         base_features: int = 64,
-        num_heads: int = 4,
         dropout: float = 0.0,
-        depth_temporal: int = 1,
         convs_per_block: int = 2,
+        attention_channels: int = 64,
         **kwargs,
     ):
         super().__init__()
         if base_features < 1:
             raise ValueError("base_features must be positive")
+
         f = base_features
         n, p = convs_per_block, dropout
 
-        # 1. Multi-scale Shared Spatial Encoder
+        # Shared spatial encoder
         self.enc1 = ConvBlock(in_channels, f, n, p)
         self.pool1 = nn.MaxPool2d(2)
-
         self.enc2 = ConvBlock(f, f * 2, n, p)
         self.pool2 = nn.MaxPool2d(2)
-
         self.enc3 = ConvBlock(f * 2, f * 4, n, p)
         self.pool3 = nn.MaxPool2d(2)
-
         self.enc4 = ConvBlock(f * 4, f * 8, n, p)
         self.pool4 = nn.MaxPool2d(2)
-
-        # 2. Multi-scale Temporal Attention Modules
-        def tae(c):
-            return TemporalAttentionModule(c, num_heads, depth_temporal, dropout)
-
-        self.tae1 = tae(f)
-        self.tae2 = tae(f * 2)
-        self.tae3 = tae(f * 4)
-        self.tae4 = tae(f * 8)
-
-        # Bottleneck
         self.bottleneck = ConvBlock(f * 8, f * 16, n, p)
-        self.tae_bottleneck = tae(f * 16)
 
-        # 3. Progressive Decoder
+        # Bottleneck temporal query / key projections
+        self.query = nn.Conv2d(f * 16, attention_channels, kernel_size=1)
+        self.key = nn.Conv2d(f * 16, attention_channels, kernel_size=1)
+
+        # Shared decoder
         self.dec4 = UpBlock(f * 16, f * 8, f * 8, n, p)
         self.dec3 = UpBlock(f * 8, f * 4, f * 4, n, p)
         self.dec2 = UpBlock(f * 4, f * 2, f * 2, n, p)
         self.dec1 = UpBlock(f * 2, f, f, n, p)
 
-        self.final_head = nn.Conv2d(f, 1, kernel_size=1)
+        # Ordered endpoint fusion
+        self.output_head = nn.Sequential(
+            ConvBlock(f * 3, f, n, p),
+            nn.Conv2d(f, 1, kernel_size=1),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, T, C, H, W)
-        b, t, c, h, w = x.shape
+    def positional_encoding(self, x, positions=None):
+        """Sinusoidal encoding of frame positions, added to (B, T, C, H, W).
 
-        e1_seq, e2_seq, e3_seq, e4_seq, btn_seq = [], [], [], [], []
+        positions: optional (T,) tensor, e.g. acquisition day offsets as in the paper.
+        Defaults to ordinal indices 0..T-1.
+        """
+        _, T, C, _, _ = x.shape
+        if positions is None:
+            position = torch.arange(T, device=x.device, dtype=x.dtype)
+        else:
+            position = positions.to(device=x.device, dtype=x.dtype)
+        div_term = torch.exp(
+            torch.arange(0, C, 2, device=x.device, dtype=x.dtype)
+            * (-math.log(10000.0) / C)
+        )
+        encoding = torch.zeros(T, C, device=x.device, dtype=x.dtype)
+        encoding[:, 0::2] = torch.sin(position[:, None] * div_term)
+        if C > 1:
+            n_cos = encoding[:, 1::2].shape[1]
+            encoding[:, 1::2] = torch.cos(position[:, None] * div_term[:n_cos])
+        return x + encoding[None, :, :, None, None]
 
-        for step in range(t):
-            frame = x[:, step]
+    def compute_attention(self, x):
+        """Temporal attention at every bottleneck location. x: (B, T, C, h, w) -> (B, h*w, T, T)."""
+        B, T, C, h, w = x.shape
+        flat = x.reshape(B * T, C, h, w)
+        q = self.query(flat)
+        k = self.key(flat)
+        d = q.shape[1]
+        q = q.reshape(B, T, d, h * w).permute(0, 3, 1, 2)  # (B, hw, T, d)
+        k = k.reshape(B, T, d, h * w).permute(0, 3, 1, 2)
+        attention = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(d)
+        return torch.softmax(attention, dim=-1)
 
-            e1 = self.enc1(frame)  # (B, f, H, W)
-            e2 = self.enc2(self.pool1(e1))  # (B, f*2, H/2, W/2)
-            e3 = self.enc3(self.pool2(e2))  # (B, f*4, H/4, W/4)
-            e4 = self.enc4(self.pool3(e3))  # (B, f*8, H/8, W/8)
-            btn = self.bottleneck(self.pool4(e4))  # (B, f*16, H/16, W/16)
+    @staticmethod
+    def resize_attention(attention, source_size, target_size):
+        """Bilinearly resample (B, h*w, Tq, Tk) attention to a new spatial size.
+        Rows stay convex combinations, so they still sum to 1."""
+        B, _, Tq, Tk = attention.shape
+        sh, sw = source_size
+        th, tw = target_size
+        if (sh, sw) == (th, tw):
+            return attention
+        a = attention.permute(0, 2, 3, 1).reshape(B * Tq * Tk, 1, sh, sw)
+        a = F.interpolate(a, size=(th, tw), mode="bilinear", align_corners=False)
+        return a.reshape(B, Tq, Tk, th * tw).permute(0, 3, 1, 2)
 
-            e1_seq.append(e1)
-            e2_seq.append(e2)
-            e3_seq.append(e3)
-            e4_seq.append(e4)
-            btn_seq.append(btn)
+    @staticmethod
+    def mix(features, attention):
+        """features (B, T, C, h, w), attention (B, h*w, Tq, T) -> (B, Tq, C, h, w)."""
+        B, T, C, h, w = features.shape
+        f = features.reshape(B, T, C, h * w).permute(0, 3, 1, 2)  # (B, hw, T, C)
+        out = torch.matmul(attention, f)  # (B, hw, Tq, C)
+        Tq = out.shape[2]
+        return out.permute(0, 2, 3, 1).reshape(B, Tq, C, h, w)
 
-        e1_stack = torch.stack(e1_seq, dim=1)
-        e2_stack = torch.stack(e2_seq, dim=1)
-        e3_stack = torch.stack(e3_seq, dim=1)
-        e4_stack = torch.stack(e4_seq, dim=1)
-        btn_stack = torch.stack(btn_seq, dim=1)
+    def forward(self, x, positions=None):
+        B, T, C, H, W = x.shape
+        if T < 2:
+            raise ValueError("SitsSCD needs at least 2 frames")
+        if H % 16 or W % 16:
+            raise ValueError(f"H, W ({H}, {W}) must be divisible by 16")
 
-        s1 = self.tae1(e1_stack)
-        s2 = self.tae2(e2_stack)
-        s3 = self.tae3(e3_stack)
-        s4 = self.tae4(e4_stack)
-        b_fused = self.tae_bottleneck(btn_stack)
+        # Shared encoder over all frames
+        frames = x.reshape(B * T, C, H, W)
+        e1 = self.enc1(frames)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+        btn = self.bottleneck(self.pool4(e4))
 
-        d4 = self.dec4(b_fused, s4)
-        d3 = self.dec3(d4, s3)
-        d2 = self.dec2(d3, s2)
-        d1 = self.dec1(d2, s1)
+        def restore(z):
+            return z.reshape(B, T, z.shape[1], z.shape[2], z.shape[3])
 
-        logits = self.final_head(d1)  # (B, 1, H, W)
-        return logits.squeeze(1)  # (B, H, W)
+        e1, e2, e3, e4, btn = map(restore, (e1, e2, e3, e4, btn))
+
+        btn = self.positional_encoding(btn, positions)
+
+        # Attention from position-encoded bottleneck features; values stay unencoded
+        source_size = btn.shape[-2:]
+        attention = self.compute_attention(btn)
+        attention = attention[
+            :, :, [0, T - 1], :
+        ]  # rows for the first and last frame only
+
+        def fuse(features):
+            att = self.resize_attention(attention, source_size, features.shape[-2:])
+            return self.mix(features, att)  # (B, 2, C, h, w)
+
+        def flat(z):
+            return z.reshape(B * 2, z.shape[2], z.shape[3], z.shape[4])
+
+        b, s4, s3, s2, s1 = (fuse(z) for z in (btn, e4, e3, e2, e1))
+
+        d = self.dec4(flat(b), flat(s4))
+        d = self.dec3(d, flat(s3))
+        d = self.dec2(d, flat(s2))
+        d = self.dec1(d, flat(s1))
+        d = d.reshape(B, 2, d.shape[1], H, W)
+
+        first, last = d[:, 0], d[:, 1]
+        features = torch.cat([first, last, last - first], dim=1)
+        return self.output_head(features).squeeze(1)

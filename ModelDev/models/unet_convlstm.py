@@ -90,7 +90,7 @@ class UpBlock(nn.Module):
         return self.conv(x)
 
 
-class UNetLSTM(nn.Module):
+class UNetConvLSMT(nn.Module):
     """U-Net with a (stacked) ConvLSTM bottleneck for N-timestep single binary gain mask output.
 
     Tunable: base_features (width), depth_temporal (stacked ConvLSTM layers), lstm_kernel

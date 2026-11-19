@@ -61,3 +61,7 @@ index_stats.json
 shap_out/
 
 shap_analysis/
+
+holdout_visualisations/
+
+feature_space_exploration/

@@ -2,7 +2,7 @@ import torch.nn as nn
 
 from .sits_scd import SitsSCD
 from .tsvit import TSViT
-from .unet_lstm import UNetLSTM
+from .unet_convlstm import UNetConvLSMT
 
 
 def build_model(
@@ -27,8 +27,8 @@ def build_model(
             dropout=kwargs.get("dropout", 0.1),
             skip_channels=kwargs.get("skip_channels", 32),
         )
-    elif model_type == "unet_lstm":
-        return UNetLSTM(
+    elif model_type == "unet_convlstm":
+        return UNetConvLSMT(
             in_channels=in_channels,
             base_features=kwargs.get("base_features", 64),
             dropout=kwargs.get("dropout", 0.0),
@@ -47,8 +47,8 @@ def build_model(
         )
     else:
         raise ValueError(
-            f"Unknown model_type: '{model_type}'. Supported options: ['tsvit', 'unet_lstm', 'sits_scd']"
+            f"Unknown model_type: '{model_type}'. Supported options: ['tsvit', 'unet_convlstm', 'sits_scd']"
         )
 
 
-__all__ = ["TSViT", "UNetLSTM", "SitsSCD", "build_model"]
+__all__ = ["TSViT", "UNetConvLSMT", "SitsSCD", "build_model"]
