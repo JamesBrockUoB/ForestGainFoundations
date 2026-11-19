@@ -199,9 +199,10 @@ def _suggest_benchmark_trial(trial, model: str) -> dict:
     elif model == "sits_scd":
         structure = dict(
             base_features=trial.suggest_categorical("base_features", [24, 32, 48, 64]),
-            num_heads=trial.suggest_categorical("num_heads", [2, 4, 8]),
+            attention_chhannels=trial.suggest_categorical(
+                "attention_channels", [32, 64, 128]
+            ),
             dropout=dropout,
-            depth_temporal=trial.suggest_int("depth_temporal", 1, 3),
             convs_per_block=trial.suggest_int("convs_per_block", 1, 2),
         )
         batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
@@ -1475,8 +1476,7 @@ def main() -> None:
                 },
                 "sits_scd": {
                     "base_features": [24, 32, 48, 64],
-                    "num_heads": [2, 4, 8],
-                    "depth_temporal": [1, 3],
+                    "attention_channels": [32, 64, 128],
                     "convs_per_block": [1, 2],
                     "batch_size": [2, 4, 8],
                 },

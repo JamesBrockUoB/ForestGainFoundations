@@ -40,9 +40,8 @@ def build_model(
         return SitsSCD(
             in_channels=in_channels,
             base_features=kwargs.get("base_features", 64),
-            num_heads=kwargs.get("num_heads", 4),
+            attention_channels=kwargs.get("attention_channels", 64),
             dropout=kwargs.get("dropout", 0.0),
-            depth_temporal=kwargs.get("depth_temporal", 1),
             convs_per_block=kwargs.get("convs_per_block", 2),
         )
     else:

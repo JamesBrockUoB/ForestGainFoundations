@@ -79,7 +79,6 @@ class SitsSCD(nn.Module):
         dropout: float = 0.0,
         convs_per_block: int = 2,
         attention_channels: int = 64,
-        **kwargs,
     ):
         super().__init__()
         if base_features < 1:
