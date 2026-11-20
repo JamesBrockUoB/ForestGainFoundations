@@ -58,9 +58,11 @@ ground_truth_masks/
 
 index_stats.json
 
+shap_analysis/
+
 shap_out/
 
-shap_analysis/
+shap_grouped_results/
 
 holdout_visualisations/
 
